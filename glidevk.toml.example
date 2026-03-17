@@ -1,0 +1,65 @@
+# GlideVK Wrapper Configuration
+# Copy this file to 'glidevk.toml' in the game directory and customize as needed
+
+[window]
+# Run in windowed mode instead of fullscreen
+# Overrides the "-w" command-line parameter
+# Note: Using "-w" parameter is recommended for proper mouse behavior in inventory
+windowed = false
+
+# Keep 4:3 aspect ratio when running in windowed mode or at desktop resolution
+# Additional space is filled with black bars
+keep_aspect_ratio = true
+
+# Static size preset for the window/display
+# Options: "none", "vga" (640x480), "svga" (800x600), "xga" (1024x768),
+#          "sxga" (1280x960), "uxga" (1600x1200), "qxga" (1920x1440), "desktop"
+# Or use custom: { Custom = { width = 1920, height = 1080 } }
+# In fullscreen mode, surrounding area is filled black
+static_size = "none"
+
+# Allow resizing the window in windowed mode
+# Window content will be scaled to fit (doesn't improve graphics quality)
+resizable = false
+
+# Center the window on the desktop (only in windowed mode)
+centered = true
+
+[texture]
+# Amount of texture memory to report to the game
+# Options: "mb2", "mb4", "mb8", "mb16", "mb32", "mb64", "mb128", "mb256"
+# Or use custom value: { Custom = 24 } for 24 MB
+#
+# WARNING: Setting this too high may cause:
+# - Texture glitches
+# - Driver issues
+# - Textures being swapped to system memory
+#
+# The optimal value depends on your graphics card and driver.
+# Start with the default (8 MB) and increase if needed.
+memory = "mb8"
+
+# Size of buffer textures used internally
+# Options: "Size256", "Size512", "Size1024", "Size2048", "Size4096"
+#
+# Trade-offs:
+# - Smaller = more game textures fit on GPU, but more draw calls
+# - Larger = fewer draw calls, but less efficient memory usage
+#
+# 1024x1024 is recommended for most hardware
+buffer_size = "Size1024"
+
+[render]
+# Enable bilinear filtering
+# Renders scene to texture first, then to screen
+# Reduces framerate but increases image quality at desktop resolution
+bilinear_filtering = true
+
+# Enable VSync (vertical synchronization)
+# Prevents screen tearing but may increase input latency
+vsync = true
+
+# Supersampling factor (anti-aliasing)
+# 1 = disabled, 2 = 2x, 4 = 4x
+# Higher values improve quality but reduce performance
+supersampling = 1

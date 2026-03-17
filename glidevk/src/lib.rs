@@ -1,0 +1,4106 @@
+#![allow(non_snake_case, dead_code)]
+
+pub mod api;
+pub mod config;
+pub mod glidesys;
+pub mod utility;
+
+use ash::vk;
+use std::ffi::CStr;
+use std::os::raw::c_char;
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use winit::window::Window;
+
+use glidesys::*;
+use utility::vulkan::{VulkanApp, VulkanInstance};
+#[cfg(target_os = "linux")]
+use utility::window::WindowInteraction;
+
+use crate::utility::vulkan;
+
+const GLIDE_NUM_TMU: usize = 2;
+const EXTENSION: &[u8] = b" \0";
+const HARDWARE: &[u8] = b"Banshee\0";
+const RENDERER: &[u8] = b"Glide\0";
+const VENDOR: &[u8] = b"3Dfx Interactive\0";
+const VERSION: &[u8] = b"3.0\0";
+
+//  error management
+extern "C" fn error_callback(string: *const c_char, fatal: FxBool) {
+    let qualifier = if fatal == FxBool::True {
+        "Fatal"
+    } else {
+        "Recoverable"
+    };
+    // Safety: we are always the producer of this string, so it’s always UTF-8 encoded.
+    let string = unsafe { CStr::from_ptr(string) }.to_str().unwrap();
+    eprintln!("{qualifier} error: {string}");
+}
+
+#[derive(Debug)]
+pub struct State {
+    // Buffer configuration
+    num_buffers: i32,
+    num_aux_buffers: i32,
+    color_format: ColorFormat,
+
+    // Clip window
+    clipwindowf_xmin: f32,
+    clipwindowf_ymin: f32,
+    clipwindowf_xmax: f32,
+    clipwindowf_ymax: f32,
+    /// Game's requested resolution (what the game thinks is the screen size)
+    screen_width: u32,
+    screen_height: u32,
+    /// Actual window/surface size (may differ from screen_width/height due to static_size config)
+    window_width: u32,
+    window_height: u32,
+    /// Viewport offset and size for letterboxing (when keep_aspect_ratio is enabled)
+    viewport_x: u32,
+    viewport_y: u32,
+    viewport_width: u32,
+    viewport_height: u32,
+
+    // Clear color (RGBA floats)
+    clear_r: f32,
+    clear_g: f32,
+    clear_b: f32,
+    clear_a: f32,
+    clear_depth: f32,
+
+    // Depth buffer state
+    depth_buffer_mode: DepthBufferMode,
+    depth_buffer_function: CmpFnc,
+    depth_mask: bool,
+
+    // Color mask state
+    color_mask_rgb: bool,
+    color_mask_alpha: bool,
+
+    // Alpha blend state
+    alpha_blend_rgb_src: AlphaBlendFnc,
+    alpha_blend_rgb_dst: AlphaBlendFnc,
+    alpha_blend_alpha_src: AlphaBlendFnc,
+    alpha_blend_alpha_dst: AlphaBlendFnc,
+
+    // Culling state
+    cull_mode: CullMode,
+
+    // Dither state
+    dither_mode: DitherMode,
+
+    // Render buffer
+    render_buffer: Buffer,
+
+    // Y origin (upper-left or lower-left)
+    origin: OriginLocation,
+
+    // Constant color
+    constant_color: Color,
+
+    // Fog state
+    fog_mode: FogMode,
+    fog_color: Color,
+
+    // Chromakey state
+    chromakey_mode: ChromakeyMode,
+    chromakey_value: Color,
+
+    // Alpha test state
+    alpha_test_function: CmpFnc,
+    alpha_test_reference: Alpha,
+
+    // Enable/disable state
+    aa_ordered: bool,
+    allow_mipmap_dither: bool,
+    passthru: bool,
+    shameless_plug: bool,
+    video_smoothing: bool,
+
+    // Texture state per TMU
+    tex_source: [FxU32; GLIDE_NUM_TMU],
+    tex_filter_mode_min: [TextureFilterMode; GLIDE_NUM_TMU],
+    tex_filter_mode_mag: [TextureFilterMode; GLIDE_NUM_TMU],
+    tex_clamp_mode_s: [TextureClampMode; GLIDE_NUM_TMU],
+    tex_clamp_mode_t: [TextureClampMode; GLIDE_NUM_TMU],
+    tex_mipmap_mode: [MipMapMode; GLIDE_NUM_TMU],
+    tex_lod_bias: [f32; GLIDE_NUM_TMU],
+    tex_combine_function: [TextureCombineFnc; GLIDE_NUM_TMU],
+    tex_combine_factor: [CombineFactor; GLIDE_NUM_TMU],
+
+    // Texture table state
+    tex_table_type: TextureTableType,
+
+    // Vertex layout configuration
+    vertex_layout: VertexLayout,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            num_buffers: 0,
+            num_aux_buffers: 0,
+            color_format: ColorFormat::default(),
+            clipwindowf_xmin: 0.0,
+            clipwindowf_ymin: 0.0,
+            clipwindowf_xmax: 0.0,
+            clipwindowf_ymax: 0.0,
+            screen_width: 0,
+            screen_height: 0,
+            window_width: 0,
+            window_height: 0,
+            viewport_x: 0,
+            viewport_y: 0,
+            viewport_width: 0,
+            viewport_height: 0,
+            clear_r: 0.0,
+            clear_g: 0.0,
+            clear_b: 0.0,
+            clear_a: 1.0,
+            clear_depth: 1.0,
+            // Default depth state: disabled, less-or-equal compare, writes enabled
+            depth_buffer_mode: DepthBufferMode::Disable,
+            depth_buffer_function: CmpFnc::LEqual,
+            depth_mask: true,
+            // Default color mask: all enabled
+            color_mask_rgb: true,
+            color_mask_alpha: true,
+            // Default alpha blend: one, zero (no blending)
+            alpha_blend_rgb_src: AlphaBlendFnc::One,
+            alpha_blend_rgb_dst: AlphaBlendFnc::Zero,
+            alpha_blend_alpha_src: AlphaBlendFnc::One,
+            alpha_blend_alpha_dst: AlphaBlendFnc::Zero,
+            // Default culling: disabled
+            cull_mode: CullMode::Disable,
+            // Default dithering: disabled
+            dither_mode: DitherMode::Disable,
+            // Default render buffer: back buffer
+            render_buffer: Buffer::Back,
+            // Default origin: upper-left
+            origin: OriginLocation::UpperLeft,
+            // Default constant color: opaque white
+            constant_color: Color(0xFFFFFFFF),
+            // Default fog: disabled
+            fog_mode: FogMode::Disable,
+            fog_color: Color(0x00000000),
+            // Default chromakey: disabled
+            chromakey_mode: ChromakeyMode::Disable,
+            chromakey_value: Color(0x00000000),
+            // Default alpha test: always pass
+            alpha_test_function: CmpFnc::Always,
+            alpha_test_reference: Alpha(0),
+            // Default enable/disable state: all disabled
+            aa_ordered: false,
+            allow_mipmap_dither: false,
+            passthru: false,
+            shameless_plug: false,
+            video_smoothing: false,
+            // Default texture state
+            tex_source: [0; GLIDE_NUM_TMU],
+            tex_filter_mode_min: [TextureFilterMode::PointSampled; GLIDE_NUM_TMU],
+            tex_filter_mode_mag: [TextureFilterMode::PointSampled; GLIDE_NUM_TMU],
+            tex_clamp_mode_s: [TextureClampMode::Wrap; GLIDE_NUM_TMU],
+            tex_clamp_mode_t: [TextureClampMode::Wrap; GLIDE_NUM_TMU],
+            tex_mipmap_mode: [MipMapMode::Disable; GLIDE_NUM_TMU],
+            tex_lod_bias: [0.0; GLIDE_NUM_TMU],
+            tex_combine_function: [TextureCombineFnc::Zero; GLIDE_NUM_TMU],
+            tex_combine_factor: [CombineFactor::Zero; GLIDE_NUM_TMU],
+            // Default texture table type
+            tex_table_type: TextureTableType::Palette,
+            // Default vertex layout: all disabled
+            vertex_layout: VertexLayout::default(),
+        }
+    }
+}
+/// State for LFB (Linear Frame Buffer) lock
+struct LfbLockState {
+    /// Whether a buffer is currently locked
+    is_locked: bool,
+    /// The lock type (read/write)
+    lock_type: glidesys::LfbLock,
+    /// The locked buffer
+    buffer: glidesys::Buffer,
+    /// The write mode (pixel format)
+    write_mode: glidesys::LfbWriteMode,
+    /// The origin location (upper-left or lower-left)
+    origin: glidesys::OriginLocation,
+    /// The allocated buffer data
+    data: Vec<u8>,
+    /// Width of the locked buffer
+    width: u32,
+    /// Height of the locked buffer
+    height: u32,
+    /// Stride in bytes
+    stride: u32,
+    /// Whether LFB write was performed this frame (skip render in buffer_swap)
+    lfb_written: bool,
+}
+
+impl Default for LfbLockState {
+    fn default() -> Self {
+        LfbLockState {
+            is_locked: false,
+            lock_type: glidesys::LfbLock::ReadOnly,
+            buffer: glidesys::Buffer::Back,
+            write_mode: glidesys::LfbWriteMode::Rgb565,
+            origin: glidesys::OriginLocation::UpperLeft,
+            data: Vec::new(),
+            width: 0,
+            height: 0,
+            stride: 0,
+            lfb_written: false,
+        }
+    }
+}
+
+pub struct Gr {
+    /// Wrapper configuration loaded from glidevk.toml
+    config: config::Config,
+    error_callback: unsafe extern "C" fn(*const c_char, FxBool),
+    vulkan_instance: VulkanInstance,
+    vulkan_app: Option<VulkanApp>,
+    window: Option<Window>,
+    surface: vk::SurfaceKHR,
+    state: State,
+    is_framebuffer_resized: bool,
+    /// Vertex batch for collecting triangles between buffer_clear and buffer_swap
+    vertex_batch: utility::vertex::VertexBatch,
+    /// Texture memory for storing Glide textures
+    texture_memory: [utility::texture::TextureMemory; GLIDE_NUM_TMU],
+    /// LFB lock state
+    lfb_lock_state: LfbLockState,
+}
+
+/// Maximum vertices per frame (enough for ~21k triangles)
+const MAX_VERTICES: usize = 65536;
+
+impl Gr {
+    pub fn init(window: Option<Window>) -> Gr {
+        // Load configuration from glidevk.toml (or use defaults)
+        let config = config::Config::load();
+        let texture_memory_bytes = config.texture.memory.bytes() as usize;
+        log::info!(
+            "GlideVK config: windowed={}, keep_aspect_ratio={}, texture_memory={}MB",
+            config.window.windowed,
+            config.window.keep_aspect_ratio,
+            texture_memory_bytes / (1024 * 1024)
+        );
+
+        let vulkan_instance = VulkanInstance::new(cfg!(target_os = "linux"));
+        Gr {
+            config,
+            error_callback,
+            vulkan_instance,
+            vulkan_app: None,
+            window,
+            surface: vk::SurfaceKHR::null(),
+            state: Default::default(),
+            is_framebuffer_resized: false,
+            vertex_batch: utility::vertex::VertexBatch::new(MAX_VERTICES),
+            texture_memory: [
+                utility::texture::TextureMemory::new(texture_memory_bytes),
+                utility::texture::TextureMemory::new(texture_memory_bytes),
+            ],
+            lfb_lock_state: LfbLockState::default(),
+        }
+    }
+
+    /// Get a reference to the configuration
+    pub fn config(&self) -> &config::Config {
+        &self.config
+    }
+
+    /// Calculate the actual window size based on config and game resolution
+    fn calculate_window_size(&self) -> (u32, u32) {
+        let game_width = self.state.screen_width;
+        let game_height = self.state.screen_height;
+
+        // If static_size is configured, use it
+        if self.config.window.static_size.is_set() {
+            // Get desktop size for Desktop mode
+            let desktop_size = self.get_desktop_size().unwrap_or((1920, 1080));
+
+            if let Some((w, h)) = self.config.window.static_size.resolve(desktop_size) {
+                return (w, h);
+            }
+        }
+
+        // Default: use game's requested resolution
+        (game_width, game_height)
+    }
+
+    /// Get the current desktop/monitor size
+    fn get_desktop_size(&self) -> Option<(u32, u32)> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if let Some(window) = &self.window {
+                if let Some(monitor) = window.current_monitor() {
+                    let size = monitor.size();
+                    return Some((size.width, size.height));
+                }
+            }
+        }
+        // Default fallback
+        None
+    }
+
+    /// Calculate the viewport for letterboxing (maintains 4:3 aspect ratio if configured)
+    fn calculate_viewport(&self) -> (u32, u32, u32, u32) {
+        let game_width = self.state.screen_width;
+        let game_height = self.state.screen_height;
+        let window_width = self.state.window_width;
+        let window_height = self.state.window_height;
+
+        // If window matches game size or keep_aspect_ratio is disabled, use full window
+        if !self.config.window.keep_aspect_ratio
+            || (window_width == game_width && window_height == game_height)
+        {
+            return (0, 0, window_width, window_height);
+        }
+
+        // Calculate letterbox to maintain game's aspect ratio
+        let game_aspect = game_width as f32 / game_height as f32;
+        let window_aspect = window_width as f32 / window_height as f32;
+
+        if window_aspect > game_aspect {
+            // Window is wider than game - pillarbox (black bars on sides)
+            let viewport_height = window_height;
+            let viewport_width = (window_height as f32 * game_aspect) as u32;
+            let viewport_x = (window_width - viewport_width) / 2;
+            (viewport_x, 0, viewport_width, viewport_height)
+        } else {
+            // Window is taller than game - letterbox (black bars on top/bottom)
+            let viewport_width = window_width;
+            let viewport_height = (window_width as f32 / game_aspect) as u32;
+            let viewport_y = (window_height - viewport_height) / 2;
+            (0, viewport_y, viewport_width, viewport_height)
+        }
+    }
+
+    // FX_ENTRY void FX_CALL grErrorSetCallback( GrErrorCallbackFnc_t fnc );
+    pub fn error_set_callback(
+        &mut self,
+        func: extern "C" fn(string: *const c_char, fatal: FxBool),
+    ) {
+        self.error_callback = func;
+    }
+
+    // FX_ENTRY const char * FX_CALL grGetString( FxU32 pname );
+    pub fn get_string(&mut self, sid: EnvironmentInfo) -> *const i8 {
+        let str = match sid {
+            EnvironmentInfo::Extension => EXTENSION,
+            EnvironmentInfo::Hardware => HARDWARE,
+            EnvironmentInfo::Renderer => RENDERER,
+            EnvironmentInfo::Vendor => VENDOR,
+            EnvironmentInfo::Version => VERSION,
+        };
+        return str.as_ptr() as *const i8;
+    }
+
+    // FX_ENTRY FxU32 FX_CALL grGet( FxU32 pname, FxU32 plength, FxI32 *params );
+    pub fn get(
+        &mut self,
+        param_name: EnvironmentParameters,
+        _param_len: FxU32,
+        params: &mut FxI32,
+    ) -> FxU32 {
+        match param_name {
+            EnvironmentParameters::NumBoards => *params = 1,
+            EnvironmentParameters::MaxTextureSize => *params = 256,
+            EnvironmentParameters::NumFb => *params = 1,
+            _ => return 0,
+        }
+        return 1;
+    }
+
+    // FX_ENTRY FxBool FX_CALL grSelectContext( GrContext_t context );
+    pub fn select_context(&mut self, _ctx: GrContext) -> FxBool {
+        FxBool::True
+    }
+
+    // FX_ENTRY void FX_CALL grSstSelect(int which_sst)
+    pub fn sst_select(&mut self, which_sst: i32) -> Option<()> {
+        // check number of devices
+        let instance = &self.vulkan_instance.instance;
+        let physical_devices = unsafe {
+            instance
+                .enumerate_physical_devices()
+                .expect("Failed to enumerate Physical Devices!")
+        };
+        let num_devices = physical_devices.len();
+        log::debug!("{} devices (GPU) found with vulkan support.", num_devices);
+        log::debug!("Found devices:");
+        for &physical_device in physical_devices.iter() {
+            let device_properties =
+                unsafe { instance.get_physical_device_properties(physical_device) };
+            let device_name = utility::tools::vk_to_string(&device_properties.device_name);
+            log::debug!("\t{}", device_name);
+        }
+        if which_sst as usize >= num_devices {
+            panic!("grSstSelect() must be lower than the number of devices.");
+        }
+        Some(())
+    }
+
+    pub fn sst_win_open(
+        &mut self,
+        hwnd: FxU32,
+        res: ScreenResolution,
+        refresh: ScreenRefresh,
+        cformat: ColorFormat,
+        origin: OriginLocation,
+        num_buffers: i32,
+        num_aux_buffers: i32,
+    ) -> GrContext {
+        unsafe {
+            assert_eq!(refresh, ScreenRefresh::R60Hz);
+
+            // Get game's requested resolution
+            let (game_width, game_height) = res.into();
+            self.state.screen_width = game_width as u32;
+            self.state.screen_height = game_height as u32;
+            self.state.color_format = cformat;
+            self.state.num_buffers = num_buffers;
+            self.state.num_aux_buffers = num_aux_buffers;
+
+            // Determine actual window size based on config
+            let (window_width, window_height) = self.calculate_window_size();
+            self.state.window_width = window_width;
+            self.state.window_height = window_height;
+
+            // Calculate viewport for letterboxing if keep_aspect_ratio is enabled
+            let (vp_x, vp_y, vp_w, vp_h) = self.calculate_viewport();
+            self.state.viewport_x = vp_x;
+            self.state.viewport_y = vp_y;
+            self.state.viewport_width = vp_w;
+            self.state.viewport_height = vp_h;
+
+            log::info!(
+                "sst_win_open: game={}x{}, window={}x{}, viewport=({},{} {}x{})",
+                self.state.screen_width, self.state.screen_height,
+                window_width, window_height,
+                vp_x, vp_y, vp_w, vp_h
+            );
+
+            let _flip = match origin {
+                OriginLocation::UpperLeft => false,
+                OriginLocation::LowerLeft => true,
+                OriginLocation::Any => panic!("OriginLocation::Any is currently unsupported."),
+            };
+
+            let _entry = &self.vulkan_instance.entry;
+            let instance = &self.vulkan_instance.instance;
+            let surface_loader = &self.vulkan_instance.surface_loader;
+
+            // Create a surface
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                assert_eq!(hwnd, 0); // no hwnd for linux/macos app
+                assert!(self.window.is_some()); // and window is already created
+                let window = self.window.as_ref().unwrap();
+
+                // Create a surface
+                self.surface = ash_window::create_surface(
+                    _entry,
+                    instance,
+                    window.display_handle().unwrap().as_raw(),
+                    window.window_handle().unwrap().as_raw(),
+                    None,
+                )
+                .unwrap();
+
+                // Resize the window to configured size
+                let new_size = winit::dpi::PhysicalSize::new(window_width, window_height);
+                window.set_min_inner_size(Some(new_size));
+                let _ = window.request_inner_size(new_size);
+
+                // Center window if configured
+                if self.config.window.centered {
+                    if let Some(monitor) = window.current_monitor() {
+                        let monitor_size = monitor.size();
+                        let monitor_pos = monitor.position();
+                        let x = monitor_pos.x + ((monitor_size.width as i32 - window_width as i32) / 2);
+                        let y = monitor_pos.y + ((monitor_size.height as i32 - window_height as i32) / 2);
+                        window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                    }
+                }
+
+                // Set resizable based on config
+                window.set_resizable(self.config.window.resizable);
+            }
+            #[cfg(target_os = "windows")]
+            {
+                assert_ne!(hwnd, 0); // must have hwnd for windows app
+                self.surface = utility::platforms::create_surface(
+                    &self.vulkan_instance.entry,
+                    &self.vulkan_instance.instance,
+                    hwnd,
+                )
+                .expect("Failed to create surface.");
+            }
+
+            // Select physical device
+            log::debug!("Selecting physical device...");
+            let physical_device =
+                vulkan::pick_physical_device(instance, surface_loader, &self.surface);
+            log::debug!("Physical device selected, creating logical device...");
+            // Select logical device
+            let (logical_device, family_indices) = vulkan::create_logical_device(
+                instance,
+                surface_loader,
+                &self.surface,
+                physical_device,
+            );
+            log::debug!("Logical device created");
+            // and get its queues
+            let graphics_queue =
+                logical_device.get_device_queue(family_indices.graphics_family.unwrap(), 0);
+            let present_queue =
+                logical_device.get_device_queue(family_indices.present_family.unwrap(), 0);
+            log::debug!("Queues obtained");
+
+            // Create a swapchain
+            log::debug!("Querying swapchain support...");
+            let swapchain_support =
+                vulkan::query_swapchain_support(surface_loader, physical_device, &self.surface);
+            log::debug!("Swapchain support queried");
+            let surface_format = utility::choose_swapchain_format(&swapchain_support.formats);
+            let present_mode =
+                utility::choose_swapchain_present_mode(&swapchain_support.present_modes);
+            // Use window dimensions for swapchain (may differ from game resolution due to static_size)
+            let extent = utility::choose_swapchain_extent_size(
+                &swapchain_support.capabilities,
+                self.state.window_width,
+                self.state.window_height,
+            );
+
+            let swapchain_loader = ash::khr::swapchain::Device::new(instance, &logical_device);
+            // let swapchain_create_info = vulkan::get_swapchain_info(
+            //     swapchain_support,
+            //     &self.surface,
+            //     surface_format,
+            //     present_mode,
+            //     &family_indices,
+            //     width as u32,
+            //     height as u32,
+            // );
+
+            let surface_capabilities = surface_loader
+                .get_physical_device_surface_capabilities(physical_device, self.surface)
+                .expect("Failed to query for surface capabilities.");
+
+            let mut desired_image_count = surface_capabilities.min_image_count + 1;
+            if surface_capabilities.max_image_count > 0
+                && desired_image_count > surface_capabilities.max_image_count
+            {
+                desired_image_count = surface_capabilities.max_image_count;
+            }
+            let (image_sharing_mode, queue_family_indices) =
+                if family_indices.graphics_family != family_indices.present_family {
+                    (
+                        vk::SharingMode::CONCURRENT,
+                        vec![
+                            family_indices.graphics_family.unwrap(),
+                            family_indices.present_family.unwrap(),
+                        ],
+                    )
+                } else {
+                    (vk::SharingMode::EXCLUSIVE, vec![])
+                };
+            let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
+                .surface(self.surface)
+                .min_image_count(desired_image_count)
+                .image_color_space(surface_format.color_space)
+                .image_format(surface_format.format)
+                .image_extent(extent)
+                .image_usage(
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                )
+                .image_sharing_mode(image_sharing_mode)
+                .queue_family_indices(&queue_family_indices)
+                .pre_transform(swapchain_support.capabilities.current_transform)
+                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                .present_mode(present_mode)
+                .clipped(true)
+                .old_swapchain(vk::SwapchainKHR::null())
+                .image_array_layers(1);
+
+            log::debug!("Creating swapchain...");
+            let swapchain = swapchain_loader
+                .create_swapchain(&swapchain_create_info, None)
+                .expect("Failed to create Swapchain!");
+            log::debug!("Swapchain created");
+            let swapchain_images = swapchain_loader
+                .get_swapchain_images(swapchain)
+                .expect("Failed to get Swapchain Images.");
+            log::debug!("Got {} swapchain images", swapchain_images.len());
+            let swapchain_imageviews = utility::create_image_views(
+                &logical_device,
+                swapchain_create_info.image_format,
+                &swapchain_images,
+            );
+            log::debug!("Created image views");
+
+            // Create depth resources
+            let depth_format = utility::find_depth_format(instance, physical_device);
+            log::debug!("Depth format: {:?}", depth_format);
+            let (depth_image, depth_image_memory, depth_image_view) =
+                utility::create_depth_resources(
+                    &logical_device,
+                    instance,
+                    physical_device,
+                    extent,
+                    depth_format,
+                );
+            log::debug!("Created depth resources");
+
+            let render_pass: vk::RenderPass =
+                utility::create_render_pass(&logical_device, surface_format.format, depth_format);
+            log::debug!("Created render pass");
+
+            // Create texture cache (needed for pipeline layout)
+            let mut texture_cache = utility::texture::TextureCache::new(&logical_device);
+            log::debug!("Created texture cache");
+
+            let (graphics_pipeline, pipeline_layout) = utility::create_glide_graphics_pipeline(
+                &logical_device,
+                render_pass,
+                extent,
+                texture_cache.descriptor_set_layout(),
+            );
+            log::debug!("Created graphics pipeline");
+            let swapchain_framebuffers = utility::create_framebuffers(
+                &logical_device,
+                render_pass,
+                &swapchain_imageviews,
+                depth_image_view,
+                &extent,
+            );
+            log::debug!("Created framebuffers");
+            // Create the command pool
+            let family_indices =
+                vulkan::find_queue_family(instance, physical_device, surface_loader, &self.surface);
+            let command_pool = vulkan::create_command_pool(&logical_device, &family_indices);
+            log::debug!("Created command pool");
+
+            // Create command buffers
+            let command_buffers = vulkan::create_command_buffers(
+                &logical_device,
+                command_pool,
+                graphics_pipeline,
+                &swapchain_framebuffers,
+                render_pass,
+                extent,
+            );
+            log::debug!("Created command buffers");
+
+            // Create synchronization objects
+            let semaphore_info = vk::SemaphoreCreateInfo::default();
+            let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED); // Start signaled so first frame works
+
+            let image_available_semaphore = logical_device
+                .create_semaphore(&semaphore_info, None)
+                .expect("Failed to create image available semaphore");
+            let render_finished_semaphore = logical_device
+                .create_semaphore(&semaphore_info, None)
+                .expect("Failed to create render finished semaphore");
+            let in_flight_fence = logical_device
+                .create_fence(&fence_info, None)
+                .expect("Failed to create in-flight fence");
+            log::debug!("Created synchronization objects");
+
+            // Create vertex buffer for dynamic geometry
+            let vertex_buffer_size = (MAX_VERTICES
+                * std::mem::size_of::<utility::vertex::GpuVertex>())
+                as vk::DeviceSize;
+            let vertex_buffer = utility::vertex::VertexBuffer::new(
+                &logical_device,
+                instance,
+                physical_device,
+                vertex_buffer_size,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+            log::debug!("Created vertex buffer ({} bytes)", vertex_buffer_size);
+
+            // Create placeholder texture for the texture cache
+            texture_cache.create_placeholder(
+                &logical_device,
+                instance,
+                physical_device,
+                command_pool,
+                graphics_queue,
+            );
+            log::debug!("Created placeholder texture");
+
+            self.vulkan_app = Some(VulkanApp {
+                device: logical_device,
+                graphics_queue,
+                present_queue,
+                swapchain_loader,
+                swapchain,
+
+                render_pass,
+                pipeline_layout,
+                graphics_pipeline,
+
+                swapchain_format: swapchain_create_info.image_format,
+                swapchain_extent: swapchain_create_info.image_extent,
+                swapchain_images,
+                swapchain_imageviews,
+                swapchain_framebuffers,
+                command_pool,
+                command_buffers,
+
+                image_available_semaphore,
+                render_finished_semaphore,
+                in_flight_fence,
+                current_image_index: 0,
+
+                vertex_buffer: Some(vertex_buffer),
+                physical_device,
+
+                depth_image,
+                depth_image_memory,
+                depth_image_view,
+                depth_format,
+
+                texture_cache,
+            });
+            log::debug!("Vulkan app initialized successfully");
+        }
+
+        log::debug!("sst_win_open completed");
+        return FxBool::True as u32; // context
+    }
+
+    /*
+    NAME
+        grSstWinClose – close a graphics context
+    C SPECIFICATION
+        FxBool grSstWinClose( GrContext_t context )
+    PARAMETERS
+        context
+            The graphics context to close.
+    DESCRIPTION
+        grSstWinClose closes a graphics context. It will fail, returning FXFALSE , if context is not a valid handle
+        to a graphics context. Otherwise, it returns the state of Glide to the one following grGlideInit , so that
+        grSstWinOpen can be called to open a new context.
+    NOTES
+        Glide 3.0 is the first release to require the context parameter for grSstWinClose.
+    */
+    ///
+    /// Close graphics context and reset state to post-grGlideInit
+    ///
+    pub fn sst_win_close(&mut self, ctx: GrContext) -> FxBool {
+        if ctx == 0 {
+            return FxBool::False;
+        }
+
+        // Delete vulkan app (swapchain, device, etc.)
+        self.vulkan_app = None;
+
+        // Delete window (only for Linux/macOS where we manage the window)
+        self.window = None;
+
+        // Destroy surface if valid
+        if self.surface != vk::SurfaceKHR::null() {
+            unsafe {
+                self.vulkan_instance
+                    .surface_loader
+                    .destroy_surface(self.surface, None);
+            }
+            self.surface = vk::SurfaceKHR::null();
+        }
+
+        // Reset state to post-grGlideInit (as per Glide spec)
+        self.state = State::default();
+
+        // Clear texture memory
+        for tmu in &mut self.texture_memory {
+            tmu.clear();
+        }
+
+        // Clear vertex buffer
+        self.vertex_batch.clear();
+
+        // Clear LFB state
+        self.lfb_lock_state = LfbLockState::default();
+
+        FxBool::True
+    }
+
+    /*
+    NAME
+        grClipWindow – set the size and location of the hardware clipping window
+    C SPECIFICATION
+        void grClipWindow(FxU32 minx, FxU32 miny, FxU32 maxx, FxU32 maxy )
+    PARAMETERS
+        minx The lower x screen coordinate of the clipping window.
+        miny The lower y screen coordinate of the clipping window.
+        maxx The upper x screen coordinate of the clipping window.
+        maxy The upper y screen coordinate of the clipping window.
+    DESCRIPTION
+        grClipWindow specifies the hardware clipping window. Any pixels outside the clipping window are
+        rejected. Values are inclusive for minimum x and y values and exclusive for maximum x and y values. The
+        clipping window also specifies the area grBufferClear clears.
+        At startup the default values for the clip window are the full size of the screen, e.g. (0,0,640,480) for
+        640×480 mode and (0,0,800,600) for 800×600 mode. To disable clipping simply sets the size of the clip
+        window to the screen size. The clipping window should not be used for general purpose primitive clipping;
+        since clipped pixels are processed but discarded; proper geometric clipping should be done by the
+        application for best performance. The clipping window should be used to prevent stray pixels that appear
+        from imprecise geometric clipping. Note that if the pixel pipeline is disabled (see grLfbLock), clipping is
+        not performed on linear frame buffer writes.
+     */
+    pub fn clip_window(&mut self, minx: FxU32, miny: FxU32, maxx: FxU32, maxy: FxU32) {
+        self.state.clipwindowf_xmin = minx as f32;
+        self.state.clipwindowf_xmax = maxx as f32;
+        self.state.clipwindowf_ymin = miny as f32;
+        self.state.clipwindowf_ymax = maxy as f32;
+    }
+
+    pub fn buffer_swap(&mut self, _interval: i32) -> Option<()> {
+        // Check if LFB write was performed - if so, just present (image already acquired and written)
+        let lfb_written = self.lfb_lock_state.lfb_written;
+        if lfb_written {
+            self.lfb_lock_state.lfb_written = false;
+            return self.buffer_swap_lfb();
+        }
+
+        // Finalize vertex batch and get draw calls (copy to avoid borrow issues)
+        let draw_calls: Vec<utility::vertex::DrawCall> = self.vertex_batch.finalize().to_vec();
+
+        // Ensure all textures referenced in draw calls are uploaded to Vulkan
+        for draw_call in &draw_calls {
+            self.ensure_texture_uploaded_by_addr(draw_call.texture_addr);
+        }
+
+        log::trace!(
+            "buffer_swap: {} draw calls, {} vertices",
+            draw_calls.len(),
+            self.vertex_batch.vertex_count()
+        );
+
+        let vertex_count = self.vertex_batch.vertex_count();
+        let vertex_data = self.vertex_batch.as_bytes().to_vec();
+        let clear_r = self.state.clear_r;
+        let clear_g = self.state.clear_g;
+        let clear_b = self.state.clear_b;
+        let clear_a = self.state.clear_a;
+        let clear_depth = self.state.clear_depth;
+        let screen_width = self.state.screen_width;
+        let screen_height = self.state.screen_height;
+
+        // Capture chromakey color (enabled state is now per-draw-call)
+        let (ck_r, ck_g, ck_b, _) = self
+            .state
+            .chromakey_value
+            .to_rgba_f(self.state.color_format);
+
+        if let Some(app) = &mut self.vulkan_app {
+            unsafe {
+                // Wait for previous frame to complete
+                app.device
+                    .wait_for_fences(&[app.in_flight_fence], true, u64::MAX)
+                    .expect("Failed to wait for fence");
+                app.device
+                    .reset_fences(&[app.in_flight_fence])
+                    .expect("Failed to reset fence");
+
+                // Acquire next swapchain image with retry loop for NOT_READY
+                let image_index: u32 = loop {
+                    match app.swapchain_loader.acquire_next_image(
+                        app.swapchain,
+                        u64::MAX,
+                        app.image_available_semaphore,
+                        vk::Fence::null(),
+                    ) {
+                        Ok((idx, _)) => {
+                            app.current_image_index = idx;
+                            break idx;
+                        }
+                        Err(vk::Result::NOT_READY) => {
+                            // Image not ready yet, wait a bit and retry
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => panic!("Failed to acquire next image: {:?}", e),
+                    }
+                };
+
+                // Upload vertex data to GPU buffer
+                if vertex_count > 0 {
+                    if let Some(ref vertex_buffer) = app.vertex_buffer {
+                        utility::vertex::upload_to_buffer(&app.device, vertex_buffer, &vertex_data);
+                    }
+                }
+
+                // Record command buffer for this frame
+                let cmd = app.command_buffers[image_index as usize];
+
+                // Reset and begin command buffer
+                app.device
+                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                    .expect("Failed to reset command buffer");
+
+                let begin_info = vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                app.device
+                    .begin_command_buffer(cmd, &begin_info)
+                    .expect("Failed to begin command buffer");
+
+                // Begin render pass with clear values
+                let clear_values = [
+                    vk::ClearValue {
+                        color: vk::ClearColorValue {
+                            float32: [clear_r, clear_g, clear_b, clear_a],
+                        },
+                    },
+                    vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue {
+                            depth: clear_depth,
+                            stencil: 0,
+                        },
+                    },
+                ];
+
+                let render_pass_info = vk::RenderPassBeginInfo::default()
+                    .render_pass(app.render_pass)
+                    .framebuffer(app.swapchain_framebuffers[image_index as usize])
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: app.swapchain_extent,
+                    })
+                    .clear_values(&clear_values);
+
+                app.device.cmd_begin_render_pass(
+                    cmd,
+                    &render_pass_info,
+                    vk::SubpassContents::INLINE,
+                );
+
+                // Bind pipeline
+                app.device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    app.graphics_pipeline,
+                );
+
+                // Set viewport and scissor
+                let viewport = vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: app.swapchain_extent.width as f32,
+                    height: app.swapchain_extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                app.device.cmd_set_viewport(cmd, 0, &[viewport]);
+
+                let scissor = vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: app.swapchain_extent,
+                };
+                app.device.cmd_set_scissor(cmd, 0, &[scissor]);
+
+                // Draw triangles if we have any
+                if vertex_count > 0 && !draw_calls.is_empty() {
+                    if let Some(ref vertex_buffer) = app.vertex_buffer {
+                        // Bind vertex buffer
+                        app.device
+                            .cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer.buffer], &[0]);
+
+                        // Issue draw calls with per-draw texture binding and push constants
+                        for draw_call in &draw_calls {
+                            // Get texture size for this draw call
+                            let (tex_width, tex_height) =
+                                app.texture_cache.get_texture_size(draw_call.texture_addr);
+
+                            // Calculate base texture size (for UV normalization)
+                            // Glide textures have a max dimension of 256, scaled by aspect ratio
+                            let (base_width, base_height) = if tex_width >= tex_height {
+                                (256.0, 256.0 * tex_height as f32 / tex_width as f32)
+                            } else {
+                                (256.0 * tex_width as f32 / tex_height as f32, 256.0)
+                            };
+
+                            // Push constants with screen size, texture size, and per-draw chromakey
+                            let push_constants = utility::vertex::PushConstants {
+                                screen_size: [screen_width as f32, screen_height as f32],
+                                texture_size: [base_width, base_height],
+                                chromakey_color: [ck_r, ck_g, ck_b],
+                                chromakey_enabled: if draw_call.chromakey_enabled {
+                                    1.0
+                                } else {
+                                    0.0
+                                },
+                            };
+                            let push_data = std::slice::from_raw_parts(
+                                &push_constants as *const _ as *const u8,
+                                std::mem::size_of::<utility::vertex::PushConstants>(),
+                            );
+                            app.device.cmd_push_constants(
+                                cmd,
+                                app.pipeline_layout,
+                                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                                0,
+                                push_data,
+                            );
+
+                            // Bind texture descriptor set for this draw call
+                            let descriptor_set =
+                                app.texture_cache.get_descriptor_set(draw_call.texture_addr);
+                            app.device.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                app.pipeline_layout,
+                                0,
+                                &[descriptor_set],
+                                &[],
+                            );
+
+                            // Draw this batch
+                            app.device.cmd_draw(
+                                cmd,
+                                draw_call.vertex_count,
+                                1,
+                                draw_call.start_vertex,
+                                0,
+                            );
+                            log::trace!(
+                                "buffer_swap: drew {} vertices with texture {:#x} ({}x{})",
+                                draw_call.vertex_count,
+                                draw_call.texture_addr,
+                                tex_width,
+                                tex_height
+                            );
+                        }
+                        log::trace!("buffer_swap: completed {} draw calls", draw_calls.len());
+                    }
+                }
+
+                // End render pass and command buffer
+                app.device.cmd_end_render_pass(cmd);
+                app.device
+                    .end_command_buffer(cmd)
+                    .expect("Failed to end command buffer");
+
+                // Submit command buffer
+                let wait_semaphores = [app.image_available_semaphore];
+                let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                let signal_semaphores = [app.render_finished_semaphore];
+                let command_buffers = [cmd];
+
+                let submit_info = vk::SubmitInfo::default()
+                    .wait_semaphores(&wait_semaphores)
+                    .wait_dst_stage_mask(&wait_stages)
+                    .command_buffers(&command_buffers)
+                    .signal_semaphores(&signal_semaphores);
+
+                app.device
+                    .queue_submit(app.graphics_queue, &[submit_info], app.in_flight_fence)
+                    .expect("Failed to submit draw command buffer");
+
+                // Present the image
+                let swapchains = [app.swapchain];
+                let image_indices = [image_index];
+                let present_info = vk::PresentInfoKHR::default()
+                    .wait_semaphores(&signal_semaphores)
+                    .swapchains(&swapchains)
+                    .image_indices(&image_indices);
+
+                app.swapchain_loader
+                    .queue_present(app.present_queue, &present_info)
+                    .expect("Failed to present");
+            }
+            Some(())
+        } else {
+            log::error!("Vulkan application is not initialized. Cannot swap buffers.");
+            None
+        }
+    }
+
+    /// Buffer swap for LFB write case - image already acquired and written, just present
+    fn buffer_swap_lfb(&mut self) -> Option<()> {
+        if let Some(app) = &mut self.vulkan_app {
+            unsafe {
+                let image_index = app.current_image_index;
+                log::trace!(
+                    "buffer_swap_lfb: presenting LFB-written image {}",
+                    image_index
+                );
+
+                // Wait for the image_available semaphore (from acquire in lfb_upload)
+                // and present directly
+                let wait_semaphores = [app.image_available_semaphore];
+                let swapchains = [app.swapchain];
+                let image_indices = [image_index];
+                let present_info = vk::PresentInfoKHR::default()
+                    .wait_semaphores(&wait_semaphores)
+                    .swapchains(&swapchains)
+                    .image_indices(&image_indices);
+
+                app.swapchain_loader
+                    .queue_present(app.present_queue, &present_info)
+                    .expect("Failed to present");
+
+                // Wait for present to complete so next frame's fence wait doesn't hang
+                app.device
+                    .queue_wait_idle(app.present_queue)
+                    .expect("Failed to wait for present queue");
+            }
+            Some(())
+        } else {
+            log::error!("Vulkan application is not initialized. Cannot swap buffers.");
+            None
+        }
+    }
+
+    /*
+    NAME
+        grBufferClear – clear the buffers to the specified values
+    C SPECIFICATION
+        void grBufferClear( GrColor_t color, GrAlpha_t alpha, FxU32 depth )
+    PARAMETERS
+        colorThe color value used for clearing the draw buffer.
+        alphaThe alpha value used for clearing the alpha buffer (ignored if alpha buffering is not
+        enabled, i.e. a destination alpha is not specified in grAlphaBlendFunction).
+        depthAn unsigned value used for clearing the depth buffer (ignored if depth buffering is
+        not enabled).
+    DESCRIPTION
+        Clears the appropriate buffers with the given values. grClipWindow defines the area within the buffer to
+        be cleared. Any buffers that are enabled are cleared by grBufferClear. For example, if depth buffering is
+        enabled, the depth buffer will be cleared. If an application does not want a buffer to be cleared, then it
+        should mask off writes to the buffer using grDepthMask and/or grColorMask as appropriate.
+    */
+    pub fn buffer_clear(&mut self, color: Color, _alpha: Alpha, depth: FxU32) -> Option<()> {
+        // Convert color to RGBA float values based on the current color format
+        let (r, g, b, _a) = color.to_rgba_f(self.state.color_format);
+        let a = 1.0; // Alpha is ignored as per the description
+
+        // Normalize depth value to Vulkan's [0.0, 1.0] range
+        // In Glide, 0xFFFF = "farthest" to allow all fragments to pass initially
+        // Our shader inverts oow so: depth = 1.0 - oow, meaning closer = smaller depth
+        // Clearing to 1.0 (farthest in Vulkan) allows LESS_OR_EQUAL to pass all fragments initially
+        let normalized_depth = (depth as f32) / 65535.0;
+
+        // Store clear values in state for use in buffer_swap
+        self.state.clear_r = r;
+        self.state.clear_g = g;
+        self.state.clear_b = b;
+        self.state.clear_a = a;
+        self.state.clear_depth = normalized_depth;
+
+        // Clear the vertex batch for the new frame
+        self.vertex_batch.clear();
+
+        log::trace!(
+            "Buffer clear values set: color=[{}, {}, {}, {}], depth={}",
+            r,
+            g,
+            b,
+            a,
+            normalized_depth
+        );
+
+        Some(())
+    }
+
+    // ==================== Depth Buffer Functions ====================
+
+    /// grDepthBufferMode - specify the depth buffering mode
+    pub fn depth_buffer_mode(&mut self, mode: DepthBufferMode) {
+        self.state.depth_buffer_mode = mode;
+        log::debug!("Depth buffer mode set to: {:?}", mode);
+    }
+
+    /// grDepthBufferFunction - specify the depth buffer comparison function
+    pub fn depth_buffer_function(&mut self, function: CmpFnc) {
+        self.state.depth_buffer_function = function;
+        log::debug!("Depth buffer function set to: {:?}", function);
+    }
+
+    /// grDepthMask - enable/disable writes to the depth buffer
+    pub fn depth_mask(&mut self, mask: FxBool) {
+        self.state.depth_mask = mask == FxBool::True;
+        log::debug!("Depth mask set to: {}", self.state.depth_mask);
+    }
+
+    // ==================== Color Mask Functions ====================
+
+    /// grDitherMode - specify the dither mode
+    pub fn dither_mode(&mut self, mode: DitherMode) {
+        self.state.dither_mode = mode;
+        log::debug!("Dither mode set to: {:?}", mode);
+    }
+
+    /// grColorMask - enable/disable writing to the color and alpha buffers
+    pub fn color_mask(&mut self, rgb: FxBool, alpha: FxBool) {
+        self.state.color_mask_rgb = rgb == FxBool::True;
+        self.state.color_mask_alpha = alpha == FxBool::True;
+        log::debug!(
+            "Color mask set to RGB: {}, Alpha: {}",
+            self.state.color_mask_rgb,
+            self.state.color_mask_alpha
+        );
+    }
+
+    // ==================== Alpha Blend Functions ====================
+
+    /// grAlphaBlendFunction - specify the alpha blending function
+    pub fn alpha_blend_function(
+        &mut self,
+        rgb_sf: AlphaBlendFnc,
+        rgb_df: AlphaBlendFnc,
+        alpha_sf: AlphaBlendFnc,
+        alpha_df: AlphaBlendFnc,
+    ) {
+        self.state.alpha_blend_rgb_src = rgb_sf;
+        self.state.alpha_blend_rgb_dst = rgb_df;
+        self.state.alpha_blend_alpha_src = alpha_sf;
+        self.state.alpha_blend_alpha_dst = alpha_df;
+        log::trace!(
+            "Alpha blend function set to: RGB({:?}, {:?}), Alpha({:?}, {:?})",
+            rgb_sf,
+            rgb_df,
+            alpha_sf,
+            alpha_df
+        );
+    }
+
+    // ==================== Cull Mode Functions ====================
+
+    /// grCullMode - set the cull mode
+    pub fn cull_mode(&mut self, mode: CullMode) {
+        self.state.cull_mode = mode;
+        log::debug!("Cull mode set to: {:?}", mode);
+    }
+
+    // ==================== Render Buffer Functions ====================
+
+    /// grRenderBuffer - select the buffer to render to
+    pub fn render_buffer(&mut self, buffer: Buffer) {
+        self.state.render_buffer = buffer;
+        log::debug!("Render buffer set to: {:?}", buffer);
+    }
+
+    /// grSstOrigin - set the Y origin for rendering
+    ///
+    /// This affects the coordinate system used for vertex Y coordinates.
+    /// - UpperLeft: Y increases downward (default, matches screen coordinates)
+    /// - LowerLeft: Y increases upward (OpenGL-style)
+    pub fn sst_origin(&mut self, origin: OriginLocation) {
+        self.state.origin = origin;
+        log::debug!("SST origin set to: {:?}", origin);
+    }
+
+    // ==================== Constant Color Functions ====================
+
+    /// grConstantColorValue - set the constant color
+    pub fn constant_color_value(&mut self, color: Color) {
+        self.state.constant_color = color;
+        log::trace!("Constant color set to: {:?}", color);
+    }
+
+    // ==================== Fog Functions ====================
+
+    /// grFogMode - set the fog mode
+    pub fn fog_mode(&mut self, mode: FogMode) {
+        self.state.fog_mode = mode;
+        log::debug!("Fog mode set to: {:?}", mode);
+    }
+
+    /// grFogColorValue - set the fog color
+    pub fn fog_color_value(&mut self, color: Color) {
+        self.state.fog_color = color;
+        log::debug!("Fog color set to: {:?}", color);
+    }
+
+    // ==================== Chromakey Functions ====================
+
+    /// grChromakeyMode - enable/disable chroma-keying
+    pub fn chromakey_mode(&mut self, mode: ChromakeyMode) {
+        self.state.chromakey_mode = mode;
+        // Track chromakey changes for batched rendering
+        let enabled = matches!(mode, ChromakeyMode::Enable);
+        self.vertex_batch.set_chromakey(enabled);
+        log::debug!("Chromakey mode set to: {:?}", mode);
+    }
+
+    /// grChromakeyValue - set the chroma-key reference color
+    pub fn chromakey_value(&mut self, color: Color) {
+        self.state.chromakey_value = color;
+        log::debug!("Chromakey value set to: {:?}", color);
+    }
+
+    // ==================== Alpha Test Functions ====================
+
+    /// grAlphaTestFunction - set the alpha test function
+    pub fn alpha_test_function(&mut self, function: CmpFnc) {
+        self.state.alpha_test_function = function;
+        log::debug!("Alpha test function set to: {:?}", function);
+    }
+
+    /// grAlphaTestReferenceValue - set the alpha test reference value
+    pub fn alpha_test_reference_value(&mut self, value: Alpha) {
+        self.state.alpha_test_reference = value;
+        log::debug!("Alpha test reference set to: {:?}", value);
+    }
+
+    // ==================== Enable/Disable Functions ====================
+
+    /// grEnable - enable a Glide feature
+    pub fn enable(&mut self, mode: glidesys::EnableMode) {
+        match mode {
+            glidesys::EnableMode::AaOrdered => self.state.aa_ordered = true,
+            glidesys::EnableMode::AllowMipmapDither => self.state.allow_mipmap_dither = true,
+            glidesys::EnableMode::Passthru => self.state.passthru = true,
+            glidesys::EnableMode::ShamelessPlug => self.state.shameless_plug = true,
+            glidesys::EnableMode::VideoSmoothing => self.state.video_smoothing = true,
+        }
+        log::debug!("Enabled: {:?}", mode);
+    }
+
+    /// grDisable - disable a Glide feature
+    pub fn disable(&mut self, mode: glidesys::EnableMode) {
+        match mode {
+            glidesys::EnableMode::AaOrdered => self.state.aa_ordered = false,
+            glidesys::EnableMode::AllowMipmapDither => self.state.allow_mipmap_dither = false,
+            glidesys::EnableMode::Passthru => self.state.passthru = false,
+            glidesys::EnableMode::ShamelessPlug => self.state.shameless_plug = false,
+            glidesys::EnableMode::VideoSmoothing => self.state.video_smoothing = false,
+        }
+        log::debug!("Disabled: {:?}", mode);
+    }
+
+    // ==================== Texture Functions ====================
+
+    /// Ensure the active texture for a TMU is uploaded to Vulkan
+    /// Returns the texture address if texturing is enabled, or 0 if not
+    fn ensure_texture_uploaded(&mut self, tmu_idx: usize) -> u32 {
+        let tex_addr = self.state.tex_source[tmu_idx];
+        if tex_addr == 0 {
+            return 0;
+        }
+
+        // Check if texture is already in Vulkan cache
+        let needs_upload = self
+            .vulkan_app
+            .as_ref()
+            .map(|app| !app.texture_cache.has_texture(tex_addr))
+            .unwrap_or(false);
+
+        if needs_upload {
+            // Get texture data from CPU memory (clone to avoid borrow issues)
+            let texture_info = self.texture_memory[tmu_idx]
+                .get_texture(tex_addr)
+                .map(|t| (t.width, t.height, t.format, t.data.clone()));
+
+            let palette_entries = self.texture_memory[tmu_idx]
+                .get_palette(0)
+                .map(|p| p.entries.clone());
+
+            if texture_info.is_none() {
+                log::warn!(
+                    "Texture {:#x} not found in CPU memory for TMU{} (using placeholder)",
+                    tex_addr,
+                    tmu_idx
+                );
+            }
+
+            if let (Some((width, height, format, data)), Some(app)) =
+                (texture_info, &mut self.vulkan_app)
+            {
+                log::trace!(
+                    "Uploading texture {:#x} to Vulkan ({}x{}, {:?})",
+                    tex_addr,
+                    width,
+                    height,
+                    format
+                );
+
+                // Create temporary TextureData and PaletteTable for upload
+                let texture_data = utility::texture::TextureData::new(width, height, format, data);
+                let palette =
+                    palette_entries.map(|entries| utility::texture::PaletteTable { entries });
+
+                app.texture_cache.upload_texture(
+                    &app.device,
+                    &self.vulkan_instance.instance,
+                    app.physical_device,
+                    app.command_pool,
+                    app.graphics_queue,
+                    tex_addr,
+                    &texture_data,
+                    palette.as_ref(),
+                );
+            }
+        }
+        tex_addr
+    }
+
+    /// Ensure a texture is uploaded to Vulkan by searching all TMUs for it
+    fn ensure_texture_uploaded_by_addr(&mut self, tex_addr: u32) {
+        if tex_addr == 0 {
+            return;
+        }
+
+        // Check if texture is already in Vulkan cache
+        let needs_upload = self
+            .vulkan_app
+            .as_ref()
+            .map(|app| !app.texture_cache.has_texture(tex_addr))
+            .unwrap_or(false);
+
+        if !needs_upload {
+            return;
+        }
+
+        // Search all TMUs for this texture address
+        let mut texture_info = None;
+        let mut palette_entries = None;
+
+        for tmu_idx in 0..GLIDE_NUM_TMU {
+            if let Some(tex) = self.texture_memory[tmu_idx].get_texture(tex_addr) {
+                texture_info = Some((tex.width, tex.height, tex.format, tex.data.clone()));
+                palette_entries = self.texture_memory[tmu_idx]
+                    .get_palette(0)
+                    .map(|p| p.entries.clone());
+                break;
+            }
+        }
+
+        if texture_info.is_none() {
+            log::warn!(
+                "Texture {:#x} not found in CPU memory for any TMU - will use placeholder",
+                tex_addr
+            );
+            return;
+        }
+
+        // Validate texture dimensions before upload
+        if let Some((width, height, _, _)) = &texture_info {
+            if *width == 0 || *height == 0 {
+                log::trace!(
+                    "Texture {:#x} has invalid dimensions ({}x{}), skipping",
+                    tex_addr,
+                    width,
+                    height
+                );
+                return;
+            }
+        }
+
+        if let (Some((width, height, format, data)), Some(app)) =
+            (texture_info, &mut self.vulkan_app)
+        {
+            log::trace!(
+                "Uploading texture {:#x} to Vulkan ({}x{}, {:?})",
+                tex_addr,
+                width,
+                height,
+                format
+            );
+
+            let texture_data = utility::texture::TextureData::new(width, height, format, data);
+            let palette = palette_entries.map(|entries| utility::texture::PaletteTable { entries });
+
+            app.texture_cache.upload_texture(
+                &app.device,
+                &self.vulkan_instance.instance,
+                app.physical_device,
+                app.command_pool,
+                app.graphics_queue,
+                tex_addr,
+                &texture_data,
+                palette.as_ref(),
+            );
+        }
+    }
+
+    /// grTexSource - specify the current texture source for rendering
+    pub fn tex_source(
+        &mut self,
+        tmu: ChipID,
+        start_address: FxU32,
+        even_odd: FxU32,
+        info: &TexInfo,
+    ) {
+        let tmu_idx = tmu as usize;
+        if tmu_idx < GLIDE_NUM_TMU {
+            self.state.tex_source[tmu_idx] = start_address;
+            // Record texture change for batched rendering
+            self.vertex_batch.set_texture(start_address);
+            log::trace!(
+                "Texture source set for TMU{}: addr={:#x}, even_odd={}, format={:?}",
+                tmu_idx,
+                start_address,
+                even_odd,
+                info.format()
+            );
+        }
+    }
+
+    /// grTexFilterMode - set texture filtering mode
+    pub fn tex_filter_mode(
+        &mut self,
+        tmu: ChipID,
+        min_filter: TextureFilterMode,
+        mag_filter: TextureFilterMode,
+    ) {
+        let tmu_idx = tmu as usize;
+        if tmu_idx < GLIDE_NUM_TMU {
+            self.state.tex_filter_mode_min[tmu_idx] = min_filter;
+            self.state.tex_filter_mode_mag[tmu_idx] = mag_filter;
+            log::trace!(
+                "Texture filter mode set for TMU{}: min={:?}, mag={:?}",
+                tmu_idx,
+                min_filter,
+                mag_filter
+            );
+        }
+    }
+
+    /// grTexClampMode - set texture clamp mode
+    pub fn tex_clamp_mode(
+        &mut self,
+        tmu: ChipID,
+        s_clamp: TextureClampMode,
+        t_clamp: TextureClampMode,
+    ) {
+        let tmu_idx = tmu as usize;
+        if tmu_idx < GLIDE_NUM_TMU {
+            self.state.tex_clamp_mode_s[tmu_idx] = s_clamp;
+            self.state.tex_clamp_mode_t[tmu_idx] = t_clamp;
+            log::debug!(
+                "Texture clamp mode set for TMU{}: s={:?}, t={:?}",
+                tmu_idx,
+                s_clamp,
+                t_clamp
+            );
+        }
+    }
+
+    /// grTexMipMapMode - set mipmap mode
+    pub fn tex_mipmap_mode(&mut self, tmu: ChipID, mode: MipMapMode, lod_blending: FxBool) {
+        let tmu_idx = tmu as usize;
+        if tmu_idx < GLIDE_NUM_TMU {
+            self.state.tex_mipmap_mode[tmu_idx] = mode;
+            log::debug!(
+                "Texture mipmap mode set for TMU{}: mode={:?}, lod_blending={:?}",
+                tmu_idx,
+                mode,
+                lod_blending
+            );
+        }
+    }
+
+    /// grTexLodBiasValue - set LOD bias value
+    pub fn tex_lod_bias_value(&mut self, tmu: ChipID, bias: f32) {
+        let tmu_idx = tmu as usize;
+        if tmu_idx < GLIDE_NUM_TMU {
+            self.state.tex_lod_bias[tmu_idx] = bias;
+            log::debug!("Texture LOD bias set for TMU{}: {}", tmu_idx, bias);
+        }
+    }
+
+    /// grTexCombine - set texture combine mode
+    pub fn tex_combine(
+        &mut self,
+        tmu: ChipID,
+        rgb_function: TextureCombineFnc,
+        rgb_factor: CombineFactor,
+        alpha_function: TextureCombineFnc,
+        alpha_factor: CombineFactor,
+        rgb_invert: FxBool,
+        alpha_invert: FxBool,
+    ) {
+        let tmu_idx = tmu as usize;
+        if tmu_idx < GLIDE_NUM_TMU {
+            self.state.tex_combine_function[tmu_idx] = rgb_function;
+            self.state.tex_combine_factor[tmu_idx] = rgb_factor;
+            log::debug!(
+                "Texture combine set for TMU{}: rgb_func={:?}, rgb_factor={:?}, alpha_func={:?}, alpha_factor={:?}, rgb_invert={:?}, alpha_invert={:?}",
+                tmu_idx, rgb_function, rgb_factor, alpha_function, alpha_factor, rgb_invert, alpha_invert
+            );
+        }
+    }
+
+    /// grTexMinAddress - return minimum valid texture start address
+    /// Reference: docs/glide3x/cvg/glide3/src/ditex.c
+    pub fn tex_min_address(&self, _tmu: ChipID) -> FxU32 {
+        0
+    }
+
+    /// grTexMaxAddress - return maximum valid texture start address
+    /// Reference: docs/glide3x/cvg/glide3/src/ditex.c
+    /// Returns total_mem - 8 (last 8 bytes are reserved)
+    pub fn tex_max_address(&self, tmu: ChipID) -> FxU32 {
+        let tmu_idx = tmu as usize;
+        if tmu_idx < GLIDE_NUM_TMU {
+            (self.texture_memory[tmu_idx].memory_available() as FxU32).saturating_sub(8)
+        } else {
+            0
+        }
+    }
+
+    /// grTexTextureMemRequired - return bytes required for texture
+    pub fn tex_texture_mem_required(&self, even_odd: FxU32, info: &TexInfo) -> FxU32 {
+        let _ = even_odd;
+        info.get_size() as FxU32
+    }
+
+    /// Get texture memory size for a TMU (in bytes)
+    /// GlideVK extension - not part of original Glide API
+    pub fn get_texture_memory_size(&self, tmu: ChipID) -> usize {
+        let tmu_idx = tmu as usize;
+        if tmu_idx < GLIDE_NUM_TMU {
+            self.texture_memory[tmu_idx].memory_available()
+        } else {
+            0
+        }
+    }
+
+    /// Set texture memory size for a TMU (in bytes)
+    /// GlideVK extension - not part of original Glide API
+    /// Common values: 2MB (0x200000), 4MB (0x400000), 8MB (0x800000)
+    pub fn set_texture_memory_size(&mut self, tmu: ChipID, size: usize) {
+        let tmu_idx = tmu as usize;
+        if tmu_idx < GLIDE_NUM_TMU {
+            self.texture_memory[tmu_idx].set_max_memory(size);
+            log::info!(
+                "TMU{} texture memory set to {} bytes ({} MB)",
+                tmu_idx,
+                size,
+                size / (1024 * 1024)
+            );
+        }
+    }
+
+    /// grVertexLayout - configure vertex component layout
+    /// Reference: docs/glide3x/cvg/glide3/src/distrip.c
+    ///
+    /// # Arguments
+    /// * `param` - Which vertex component to configure (GR_PARAM_*)
+    /// * `offset` - Byte offset of this component within the vertex structure
+    /// * `mode` - GR_PARAM_ENABLE or GR_PARAM_DISABLE
+    pub fn vertex_layout(&mut self, param: FxU32, offset: FxU32, mode: FxU32) {
+        log::debug!(
+            "grVertexLayout: param={:#x}, offset={}, mode={}",
+            param,
+            offset,
+            mode
+        );
+
+        let offset = offset as i32;
+        let mode = if mode == 0 {
+            VertexLayoutMode::Disable
+        } else {
+            VertexLayoutMode::Enable
+        };
+
+        let layout = &mut self.state.vertex_layout;
+
+        match param {
+            0x01 => {
+                // GR_PARAM_XY - must be at offset 0
+                if offset != 0 {
+                    log::warn!(
+                        "grVertexLayout: GR_PARAM_XY offset must be 0, got {}",
+                        offset
+                    );
+                }
+                layout.xy = VertexComponentInfo { offset, mode };
+            }
+            0x02 => {
+                // GR_PARAM_Z
+                layout.z = VertexComponentInfo { offset, mode };
+            }
+            0x03 => {
+                // GR_PARAM_W
+                layout.w = VertexComponentInfo { offset, mode };
+            }
+            0x04 => {
+                // GR_PARAM_Q
+                layout.q = VertexComponentInfo { offset, mode };
+            }
+            0x05 => {
+                // GR_PARAM_FOG_EXT
+                layout.fog = VertexComponentInfo { offset, mode };
+            }
+            0x10 => {
+                // GR_PARAM_A
+                layout.a = VertexComponentInfo { offset, mode };
+                if mode == VertexLayoutMode::Enable {
+                    layout.color_type = VertexColorType::Float;
+                }
+            }
+            0x20 => {
+                // GR_PARAM_RGB
+                layout.rgb = VertexComponentInfo { offset, mode };
+                if mode == VertexLayoutMode::Enable {
+                    layout.color_type = VertexColorType::Float;
+                }
+            }
+            0x30 => {
+                // GR_PARAM_PARGB
+                layout.pargb = VertexComponentInfo { offset, mode };
+                if mode == VertexLayoutMode::Enable {
+                    layout.color_type = VertexColorType::U8;
+                }
+            }
+            0x40 => {
+                // GR_PARAM_ST0
+                layout.st0 = VertexComponentInfo { offset, mode };
+            }
+            0x41 => {
+                // GR_PARAM_ST1
+                layout.st1 = VertexComponentInfo { offset, mode };
+            }
+            0x50 => {
+                // GR_PARAM_Q0
+                layout.q0 = VertexComponentInfo { offset, mode };
+            }
+            0x51 => {
+                // GR_PARAM_Q1
+                layout.q1 = VertexComponentInfo { offset, mode };
+            }
+            _ => {
+                log::warn!("grVertexLayout: unknown param {:#x}", param);
+            }
+        }
+    }
+
+    /// Get the current vertex layout
+    pub fn get_vertex_layout(&self) -> &VertexLayout {
+        &self.state.vertex_layout
+    }
+
+    /// Reset vertex layout to default state (for grReset with GR_VERTEX_PARAMETER)
+    pub fn reset_vertex_layout(&mut self) {
+        self.state.vertex_layout = VertexLayout::default();
+    }
+
+    /// grReset - reset statistics or vertex parameters
+    /// Reference: docs/glide3x/h5/glide3/src/diget.c
+    ///
+    /// # Arguments
+    /// * `what` - What to reset (GR_STATS_* or GR_VERTEX_PARAMETER)
+    ///
+    /// # Returns
+    /// * FxBool::True if successful, FxBool::False otherwise
+    pub fn reset(&mut self, what: FxU32) -> FxBool {
+        // GR_STATS_POINTS = 0x1e
+        // GR_STATS_LINES = 0x17
+        // GR_STATS_PIXELS = 0x1d
+        // GR_STATS_TRIANGLES = 0x21
+        // GR_VERTEX_PARAMETER = 0x29
+        match what {
+            0x1e => {
+                // GR_STATS_POINTS - reset points drawn counter
+                // Stats not tracked in current implementation
+                log::debug!("grReset: GR_STATS_POINTS");
+                FxBool::True
+            }
+            0x17 => {
+                // GR_STATS_LINES - reset lines drawn counter
+                // Stats not tracked in current implementation
+                log::debug!("grReset: GR_STATS_LINES");
+                FxBool::True
+            }
+            0x1d => {
+                // GR_STATS_PIXELS - reset pixel performance stats
+                // Stats not tracked in current implementation
+                log::debug!("grReset: GR_STATS_PIXELS");
+                FxBool::True
+            }
+            0x21 => {
+                // GR_STATS_TRIANGLES - reset triangle stats
+                // Stats not tracked in current implementation
+                log::debug!("grReset: GR_STATS_TRIANGLES");
+                FxBool::True
+            }
+            0x29 => {
+                // GR_VERTEX_PARAMETER - reset vertex layout to default
+                log::debug!("grReset: GR_VERTEX_PARAMETER");
+                self.reset_vertex_layout();
+                FxBool::True
+            }
+            _ => {
+                log::warn!("grReset: unknown parameter {:#x}", what);
+                FxBool::False
+            }
+        }
+    }
+
+    /// grTexDownloadMipMap - download texture mipmap to TMU memory
+    pub fn tex_download_mipmap(
+        &mut self,
+        tmu: ChipID,
+        start_address: FxU32,
+        _even_odd: FxU32,
+        info: &TexInfo,
+    ) {
+        let tmu_idx = tmu as usize;
+        if tmu_idx >= GLIDE_NUM_TMU {
+            return;
+        }
+
+        let (width, height) = info.get_dimensions();
+        let _size = info.get_size();
+        let format = info.format();
+
+        log::trace!(
+            "tex_download_mipmap: addr={:#x}, {}x{}, format={:?}, raw={}",
+            start_address,
+            width,
+            height,
+            format,
+            info.debug_raw_values()
+        );
+
+        // Copy texture data from the TexInfo
+        let data = info.get_data().to_vec();
+
+        // Invalidate any existing Vulkan texture at this address (content may have changed)
+        if let Some(app) = &mut self.vulkan_app {
+            app.texture_cache
+                .invalidate_texture(&app.device, start_address);
+        }
+
+        // Store texture in texture memory
+        let texture = utility::texture::TextureData::new(width as u32, height as u32, format, data);
+        self.texture_memory[tmu_idx].store_texture(start_address, texture);
+
+        // Update current texture source
+        self.state.tex_source[tmu_idx] = start_address;
+    }
+
+    /// grTexDownloadMipMapLevel - download a single mipmap level
+    pub fn tex_download_mipmap_level(
+        &mut self,
+        tmu: ChipID,
+        start_address: FxU32,
+        this_lod: LOD,
+        _large_lod: LOD,
+        aspect_ratio: AspectRatio,
+        format: TextureFormat,
+        _even_odd: FxU32,
+        data: *const std::ffi::c_void,
+    ) {
+        let tmu_idx = tmu as usize;
+        if tmu_idx >= GLIDE_NUM_TMU {
+            return;
+        }
+
+        let (width, height) = this_lod.to_texture_size(aspect_ratio);
+        let bytes_per_pixel = format.bytes_per_pixel();
+        let size = width * height * bytes_per_pixel;
+
+        log::debug!(
+            "Texture mipmap level download for TMU{}: addr={:#x}, {}x{}, lod={:?}, format={:?}",
+            tmu_idx,
+            start_address,
+            width,
+            height,
+            this_lod,
+            format
+        );
+
+        // Copy texture data from pointer
+        let texture_data = if !data.is_null() {
+            unsafe { std::slice::from_raw_parts(data as *const u8, size).to_vec() }
+        } else {
+            vec![0; size]
+        };
+
+        // Invalidate any existing Vulkan texture at this address
+        if let Some(app) = &mut self.vulkan_app {
+            app.texture_cache
+                .invalidate_texture(&app.device, start_address);
+        }
+
+        // Store texture in texture memory
+        let texture =
+            utility::texture::TextureData::new(width as u32, height as u32, format, texture_data);
+        self.texture_memory[tmu_idx].store_texture(start_address, texture);
+    }
+
+    /// grTexDownloadMipMapLevelPartial - download a partial mipmap level (row range)
+    pub fn tex_download_mipmap_level_partial(
+        &mut self,
+        tmu: ChipID,
+        start_address: FxU32,
+        this_lod: LOD,
+        _large_lod: LOD,
+        aspect_ratio: AspectRatio,
+        format: TextureFormat,
+        _even_odd: FxU32,
+        data: *const std::ffi::c_void,
+        start_row: i32,
+        end_row: i32,
+    ) {
+        let tmu_idx = tmu as usize;
+        if tmu_idx >= GLIDE_NUM_TMU {
+            return;
+        }
+
+        let (width, height) = this_lod.to_texture_size(aspect_ratio);
+        let bytes_per_pixel = format.bytes_per_pixel();
+        let row_bytes = width * bytes_per_pixel;
+
+        // Clamp row range to valid values
+        let start_row = start_row.max(0) as usize;
+        let end_row = (end_row as usize).min(height);
+        let num_rows = end_row.saturating_sub(start_row);
+
+        if num_rows == 0 {
+            return;
+        }
+
+        log::debug!(
+            "Texture mipmap level partial download for TMU{}: addr={:#x}, {}x{}, rows {}..{}, format={:?}",
+            tmu_idx,
+            start_address,
+            width,
+            height,
+            start_row,
+            end_row,
+            format
+        );
+
+        // Get or create texture at this address
+        let texture = self.texture_memory[tmu_idx].get_texture_mut(start_address);
+
+        if let Some(tex) = texture {
+            // Update existing texture with partial data
+            if !data.is_null() {
+                let src_data =
+                    unsafe { std::slice::from_raw_parts(data as *const u8, num_rows * row_bytes) };
+                let dst_offset = start_row * row_bytes;
+                let dst_end = dst_offset + num_rows * row_bytes;
+                if dst_end <= tex.data.len() {
+                    tex.data[dst_offset..dst_end].copy_from_slice(src_data);
+                }
+            }
+        } else {
+            // Create new texture and fill partial data
+            let total_size = width * height * bytes_per_pixel;
+            let mut texture_data = vec![0u8; total_size];
+
+            if !data.is_null() {
+                let src_data =
+                    unsafe { std::slice::from_raw_parts(data as *const u8, num_rows * row_bytes) };
+                let dst_offset = start_row * row_bytes;
+                texture_data[dst_offset..dst_offset + num_rows * row_bytes]
+                    .copy_from_slice(src_data);
+            }
+
+            let texture = utility::texture::TextureData::new(
+                width as u32,
+                height as u32,
+                format,
+                texture_data,
+            );
+            self.texture_memory[tmu_idx].store_texture(start_address, texture);
+        }
+    }
+
+    /// grTexDownloadTable - download texture color table (palette or NCC)
+    /// Always downloads to TMU0 per Glide3 API spec
+    pub fn tex_download_table(
+        &mut self,
+        table_type: TextureTableType,
+        data: *const std::ffi::c_void,
+    ) {
+        if data.is_null() {
+            log::warn!("grTexDownloadTable called with null data pointer");
+            return;
+        }
+
+        log::debug!("Texture table download: type={:?}", table_type);
+
+        match table_type {
+            TextureTableType::Palette | TextureTableType::Palette6666Ext => {
+                // Copy palette data (256 entries * 4 bytes each = 1024 bytes)
+                let palette_data =
+                    unsafe { std::slice::from_raw_parts(data as *const u8, 256 * 4) };
+                let palette = utility::texture::PaletteTable::from_data(palette_data);
+                // Always download to TMU0
+                self.texture_memory[0].store_palette(0, palette);
+            }
+            TextureTableType::Ncc0 | TextureTableType::Ncc1 => {
+                // NCC (Narrow Channel Compression) tables are used for YIQ texture formats
+                // Structure: 16 bytes yRGB + 24 bytes iRGB + 24 bytes qRGB + 48 bytes packed = 112 bytes
+                // For now, store as raw data - NCC decompression would be done during texture sampling
+                log::debug!(
+                    "NCC table download (type {:?}) - not fully implemented",
+                    table_type
+                );
+                // TODO: Implement NCC table storage and decompression
+            }
+        }
+
+        // Store current table type in state
+        self.state.tex_table_type = table_type;
+    }
+
+    // ==================== Drawing Functions ====================
+
+    /// grDrawTriangle - draw a triangle
+    pub fn draw_triangle(&mut self, a: &Vertex, b: &Vertex, c: &Vertex) {
+        // Apply Y-flip for lower-left origin
+        let (a, b, c) = if self.state.origin == OriginLocation::LowerLeft {
+            let h = self.state.screen_height as f32;
+            let mut a = *a;
+            let mut b = *b;
+            let mut c = *c;
+            a.y = h - a.y;
+            b.y = h - b.y;
+            c.y = h - c.y;
+            (a, b, c)
+        } else {
+            (*a, *b, *c)
+        };
+
+        // Check culling
+        if self.state.cull_mode != CullMode::Disable {
+            // Calculate signed area (cross product of edges)
+            let area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+            match self.state.cull_mode {
+                CullMode::Negative if area < 0.0 => return,
+                CullMode::Positive if area > 0.0 => return,
+                _ => {}
+            }
+        }
+
+        // Convert Glide vertices to GPU vertices using per-vertex (iterated) colors
+        // This is the correct behavior for legacy Glide text and UI rendering
+        let v0 = utility::vertex::GpuVertex::from_glide_vertex(&a);
+        let v1 = utility::vertex::GpuVertex::from_glide_vertex(&b);
+        let v2 = utility::vertex::GpuVertex::from_glide_vertex(&c);
+
+        if !self.vertex_batch.push_triangle(v0, v1, v2) {
+            log::warn!("Vertex batch full, triangle dropped");
+        }
+    }
+
+    /// grDrawPoint - draw a point as a small quad
+    pub fn draw_point(&mut self, pt: &Vertex) {
+        // Apply Y-flip for lower-left origin
+        let pt = if self.state.origin == OriginLocation::LowerLeft {
+            let h = self.state.screen_height as f32;
+            let mut pt = *pt;
+            pt.y = h - pt.y;
+            pt
+        } else {
+            *pt
+        };
+
+        // Render point as a 1-pixel quad (2 triangles)
+        const POINT_SIZE: f32 = 0.5;
+
+        // Use per-vertex (iterated) colors
+        let gpu_v = utility::vertex::GpuVertex::from_glide_vertex(&pt);
+        let x = gpu_v.position[0];
+        let y = gpu_v.position[1];
+
+        // Create 4 corners of a small quad
+        let v0 = utility::vertex::GpuVertex {
+            position: [x - POINT_SIZE, y - POINT_SIZE],
+            ..gpu_v
+        };
+        let v1 = utility::vertex::GpuVertex {
+            position: [x + POINT_SIZE, y - POINT_SIZE],
+            ..gpu_v
+        };
+        let v2 = utility::vertex::GpuVertex {
+            position: [x + POINT_SIZE, y + POINT_SIZE],
+            ..gpu_v
+        };
+        let v3 = utility::vertex::GpuVertex {
+            position: [x - POINT_SIZE, y + POINT_SIZE],
+            ..gpu_v
+        };
+
+        // Two triangles to form the quad
+        if !self.vertex_batch.push_triangle(v0, v1, v2) {
+            log::warn!("Vertex batch full, point dropped");
+            return;
+        }
+        if !self.vertex_batch.push_triangle(v0, v2, v3) {
+            log::warn!("Vertex batch full, point dropped");
+        }
+    }
+
+    /// grDrawLine - draw a line as a thin quad
+    pub fn draw_line(&mut self, v1: &Vertex, v2: &Vertex) {
+        // Apply Y-flip for lower-left origin
+        let (v1, v2) = if self.state.origin == OriginLocation::LowerLeft {
+            let h = self.state.screen_height as f32;
+            let mut v1 = *v1;
+            let mut v2 = *v2;
+            v1.y = h - v1.y;
+            v2.y = h - v2.y;
+            (v1, v2)
+        } else {
+            (*v1, *v2)
+        };
+
+        // Render line as a thin quad (2 triangles)
+        const LINE_WIDTH: f32 = 0.5;
+
+        // Use per-vertex (iterated) colors
+        let gpu_v1 = utility::vertex::GpuVertex::from_glide_vertex(&v1);
+        let gpu_v2 = utility::vertex::GpuVertex::from_glide_vertex(&v2);
+
+        let x1 = gpu_v1.position[0];
+        let y1 = gpu_v1.position[1];
+        let x2 = gpu_v2.position[0];
+        let y2 = gpu_v2.position[1];
+
+        // Calculate perpendicular direction for line width
+        let dx = x2 - x1;
+        let dy = y2 - y1;
+        let len = (dx * dx + dy * dy).sqrt();
+
+        if len < 0.001 {
+            // Line too short, draw as a point
+            self.draw_point(&v1);
+            return;
+        }
+
+        // Normalized perpendicular
+        let px = -dy / len * LINE_WIDTH;
+        let py = dx / len * LINE_WIDTH;
+
+        // Create 4 corners of the line quad
+        let c0 = utility::vertex::GpuVertex {
+            position: [x1 - px, y1 - py],
+            ..gpu_v1
+        };
+        let c1 = utility::vertex::GpuVertex {
+            position: [x1 + px, y1 + py],
+            ..gpu_v1
+        };
+        let c2 = utility::vertex::GpuVertex {
+            position: [x2 + px, y2 + py],
+            ..gpu_v2
+        };
+        let c3 = utility::vertex::GpuVertex {
+            position: [x2 - px, y2 - py],
+            ..gpu_v2
+        };
+
+        // Two triangles to form the quad
+        if !self.vertex_batch.push_triangle(c0, c1, c2) {
+            log::warn!("Vertex batch full, line dropped");
+            return;
+        }
+        if !self.vertex_batch.push_triangle(c0, c2, c3) {
+            log::warn!("Vertex batch full, line dropped");
+        }
+    }
+
+    /// grDrawVertexArray - draw primitives from an array of vertex pointers
+    pub fn draw_vertex_array(
+        &mut self,
+        mode: PrimitiveType,
+        count: FxU32,
+        pointers: *const *const Vertex,
+    ) {
+        if pointers.is_null() || count == 0 {
+            return;
+        }
+
+        let layout = &self.state.vertex_layout;
+        let origin = self.state.origin;
+        let screen_height = self.state.screen_height as f32;
+        let cull_mode = self.state.cull_mode;
+        let vertex_size = layout.vertex_size();
+
+        // Extract vertices using the configured layout
+        let gpu_vertices: Vec<utility::vertex::GpuVertex> = (0..count as usize)
+            .filter_map(|i| unsafe {
+                let ptr = *pointers.add(i);
+                if ptr.is_null() {
+                    return None;
+                }
+
+                let vertex_data = std::slice::from_raw_parts(ptr as *const u8, vertex_size);
+                let (x, mut y, r, g, b, a, s, t, oow) = layout.extract_vertex(vertex_data);
+
+                // Apply Y-flip for lower-left origin
+                if origin == OriginLocation::LowerLeft {
+                    y = screen_height - y;
+                }
+
+                Some(utility::vertex::GpuVertex::from_layout_data(
+                    x, y, r, g, b, a, s, t, oow,
+                ))
+            })
+            .collect();
+
+        // Draw primitives based on mode
+        self.draw_primitives_gpu(mode, &gpu_vertices, cull_mode);
+    }
+
+    /// grDrawVertexArrayContiguous - draw primitives from a contiguous vertex array
+    pub fn draw_vertex_array_contiguous(
+        &mut self,
+        mode: PrimitiveType,
+        count: FxU32,
+        pointers: *const Vertex,
+        stride: FxU32,
+    ) {
+        if pointers.is_null() || count == 0 {
+            return;
+        }
+
+        let layout = &self.state.vertex_layout;
+        let origin = self.state.origin;
+        let screen_height = self.state.screen_height as f32;
+        let cull_mode = self.state.cull_mode;
+        let current_texture = self.vertex_batch.current_texture();
+
+        // Log small texture draws (likely glyphs) for debugging
+        static LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let draw_num = LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Get texture dimensions to identify glyph draws
+        let tex_size = self.texture_memory[0]
+            .get_texture(current_texture)
+            .map(|t| (t.width, t.height))
+            .unwrap_or((0, 0));
+
+        // Log first 20 small texture draws (32x32 or smaller = likely glyphs)
+        let is_small_texture = tex_size.0 <= 32 && tex_size.1 <= 32 && tex_size.0 > 0;
+        let should_log = is_small_texture && draw_num < 20;
+
+        if is_small_texture && should_log {
+            log::trace!(
+                "grDrawVertexArrayContiguous: texture={:#x} ({}x{}), mode={:?}, count={}",
+                current_texture,
+                tex_size.0,
+                tex_size.1,
+                mode,
+                count
+            );
+        }
+
+        // Extract vertices using the configured layout
+        let gpu_vertices: Vec<utility::vertex::GpuVertex> = (0..count as usize)
+            .map(|i| unsafe {
+                let byte_ptr = (pointers as *const u8).add(i * stride as usize);
+                let vertex_data = std::slice::from_raw_parts(byte_ptr, stride as usize);
+
+                let (x, mut y, r, g, b, a, s, t, oow) = layout.extract_vertex(vertex_data);
+
+                // Log first 4 vertices of small texture draws at trace level
+                if should_log && i < 4 {
+                    log::trace!(
+                        "  Vertex {}: pos=({:.1}, {:.1}), st=({:.1}, {:.1})",
+                        i,
+                        x,
+                        y,
+                        s,
+                        t
+                    );
+                }
+
+                // Apply Y-flip for lower-left origin
+                if origin == OriginLocation::LowerLeft {
+                    y = screen_height - y;
+                }
+
+                utility::vertex::GpuVertex::from_layout_data(x, y, r, g, b, a, s, t, oow)
+            })
+            .collect();
+
+        // Draw primitives based on mode
+        self.draw_primitives_gpu(mode, &gpu_vertices, cull_mode);
+    }
+
+    /// Internal helper to draw primitives from GPU vertices
+    fn draw_primitives_gpu(
+        &mut self,
+        mode: PrimitiveType,
+        vertices: &[utility::vertex::GpuVertex],
+        cull_mode: CullMode,
+    ) {
+        match mode {
+            PrimitiveType::Points => {
+                for v in vertices {
+                    self.draw_point_gpu(*v);
+                }
+            }
+            PrimitiveType::Lines => {
+                for chunk in vertices.chunks(2) {
+                    if chunk.len() == 2 {
+                        self.draw_line_gpu(chunk[0], chunk[1]);
+                    }
+                }
+            }
+            PrimitiveType::LineStrip => {
+                for window in vertices.windows(2) {
+                    self.draw_line_gpu(window[0], window[1]);
+                }
+            }
+            PrimitiveType::Triangles => {
+                for chunk in vertices.chunks(3) {
+                    if chunk.len() == 3 {
+                        self.draw_triangle_gpu(chunk[0], chunk[1], chunk[2], cull_mode);
+                    }
+                }
+            }
+            PrimitiveType::TriangleFan => {
+                if vertices.len() >= 3 {
+                    let first = vertices[0];
+                    for i in 1..vertices.len() - 1 {
+                        self.draw_triangle_gpu(first, vertices[i], vertices[i + 1], cull_mode);
+                    }
+                }
+            }
+            PrimitiveType::TriangleStrip => {
+                for i in 0..vertices.len().saturating_sub(2) {
+                    if i % 2 == 0 {
+                        self.draw_triangle_gpu(
+                            vertices[i],
+                            vertices[i + 1],
+                            vertices[i + 2],
+                            cull_mode,
+                        );
+                    } else {
+                        self.draw_triangle_gpu(
+                            vertices[i + 1],
+                            vertices[i],
+                            vertices[i + 2],
+                            cull_mode,
+                        );
+                    }
+                }
+            }
+            PrimitiveType::Polygon => {
+                if vertices.len() >= 3 {
+                    let first = vertices[0];
+                    for i in 1..vertices.len() - 1 {
+                        self.draw_triangle_gpu(first, vertices[i], vertices[i + 1], cull_mode);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draw a triangle from GPU vertices with culling
+    fn draw_triangle_gpu(
+        &mut self,
+        v0: utility::vertex::GpuVertex,
+        v1: utility::vertex::GpuVertex,
+        v2: utility::vertex::GpuVertex,
+        cull_mode: CullMode,
+    ) {
+        // Check culling
+        if cull_mode != CullMode::Disable {
+            let (ax, ay) = (v0.position[0], v0.position[1]);
+            let (bx, by) = (v1.position[0], v1.position[1]);
+            let (cx, cy) = (v2.position[0], v2.position[1]);
+            let area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+            match cull_mode {
+                CullMode::Negative if area < 0.0 => return,
+                CullMode::Positive if area > 0.0 => return,
+                _ => {}
+            }
+        }
+
+        if !self.vertex_batch.push_triangle(v0, v1, v2) {
+            log::warn!("Vertex batch full, triangle dropped");
+        }
+    }
+
+    /// Draw a point as a small quad from GPU vertex
+    fn draw_point_gpu(&mut self, v: utility::vertex::GpuVertex) {
+        const POINT_SIZE: f32 = 0.5;
+        let x = v.position[0];
+        let y = v.position[1];
+
+        let v0 = utility::vertex::GpuVertex {
+            position: [x - POINT_SIZE, y - POINT_SIZE],
+            ..v
+        };
+        let v1 = utility::vertex::GpuVertex {
+            position: [x + POINT_SIZE, y - POINT_SIZE],
+            ..v
+        };
+        let v2 = utility::vertex::GpuVertex {
+            position: [x + POINT_SIZE, y + POINT_SIZE],
+            ..v
+        };
+        let v3 = utility::vertex::GpuVertex {
+            position: [x - POINT_SIZE, y + POINT_SIZE],
+            ..v
+        };
+
+        if !self.vertex_batch.push_triangle(v0, v1, v2) {
+            log::warn!("Vertex batch full, point dropped");
+            return;
+        }
+        if !self.vertex_batch.push_triangle(v0, v2, v3) {
+            log::warn!("Vertex batch full, point dropped");
+        }
+    }
+
+    /// Draw a line as a thin quad from GPU vertices
+    fn draw_line_gpu(&mut self, v1: utility::vertex::GpuVertex, v2: utility::vertex::GpuVertex) {
+        const LINE_WIDTH: f32 = 0.5;
+
+        let dx = v2.position[0] - v1.position[0];
+        let dy = v2.position[1] - v1.position[1];
+        let len = (dx * dx + dy * dy).sqrt();
+
+        if len < 0.001 {
+            return;
+        }
+
+        let nx = -dy / len * LINE_WIDTH;
+        let ny = dx / len * LINE_WIDTH;
+
+        let p0 = utility::vertex::GpuVertex {
+            position: [v1.position[0] + nx, v1.position[1] + ny],
+            ..v1
+        };
+        let p1 = utility::vertex::GpuVertex {
+            position: [v1.position[0] - nx, v1.position[1] - ny],
+            ..v1
+        };
+        let p2 = utility::vertex::GpuVertex {
+            position: [v2.position[0] - nx, v2.position[1] - ny],
+            ..v2
+        };
+        let p3 = utility::vertex::GpuVertex {
+            position: [v2.position[0] + nx, v2.position[1] + ny],
+            ..v2
+        };
+
+        if !self.vertex_batch.push_triangle(p0, p1, p2) {
+            log::warn!("Vertex batch full, line dropped");
+            return;
+        }
+        if !self.vertex_batch.push_triangle(p0, p2, p3) {
+            log::warn!("Vertex batch full, line dropped");
+        }
+    }
+
+    /// Internal helper to draw primitives based on mode
+    fn draw_primitives(&mut self, mode: PrimitiveType, vertices: &[&Vertex]) {
+        match mode {
+            PrimitiveType::Points => {
+                for v in vertices {
+                    self.draw_point(v);
+                }
+            }
+            PrimitiveType::Lines => {
+                // Draw pairs of vertices as lines
+                for chunk in vertices.chunks(2) {
+                    if chunk.len() == 2 {
+                        self.draw_line(chunk[0], chunk[1]);
+                    }
+                }
+            }
+            PrimitiveType::LineStrip => {
+                // Draw connected lines
+                for window in vertices.windows(2) {
+                    self.draw_line(window[0], window[1]);
+                }
+            }
+            PrimitiveType::Triangles => {
+                // Draw groups of 3 vertices as triangles
+                for chunk in vertices.chunks(3) {
+                    if chunk.len() == 3 {
+                        self.draw_triangle(chunk[0], chunk[1], chunk[2]);
+                    }
+                }
+            }
+            PrimitiveType::TriangleStrip => {
+                // Draw triangle strip (v0,v1,v2), (v2,v1,v3), (v2,v3,v4)...
+                for i in 0..vertices.len().saturating_sub(2) {
+                    if i % 2 == 0 {
+                        self.draw_triangle(vertices[i], vertices[i + 1], vertices[i + 2]);
+                    } else {
+                        self.draw_triangle(vertices[i + 1], vertices[i], vertices[i + 2]);
+                    }
+                }
+            }
+            PrimitiveType::TriangleFan => {
+                // Draw triangle fan: all triangles share first vertex
+                if vertices.len() >= 3 {
+                    let first = vertices[0];
+                    for i in 1..vertices.len() - 1 {
+                        self.draw_triangle(first, vertices[i], vertices[i + 1]);
+                    }
+                }
+            }
+            PrimitiveType::Polygon => {
+                // Draw polygon as triangle fan (same as fan for convex polygons)
+                if vertices.len() >= 3 {
+                    let first = vertices[0];
+                    for i in 1..vertices.len() - 1 {
+                        self.draw_triangle(first, vertices[i], vertices[i + 1]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get a reference to the window
+    pub fn window_ref(&self) -> Option<&Window> {
+        self.window.as_ref()
+    }
+
+    /// Get the actual screen/framebuffer width in pixels
+    pub fn sst_screen_width(&self) -> u32 {
+        self.vulkan_app
+            .as_ref()
+            .map(|app| app.swapchain_extent.width)
+            .unwrap_or(0)
+    }
+
+    /// Get the actual screen/framebuffer height in pixels
+    pub fn sst_screen_height(&self) -> u32 {
+        self.vulkan_app
+            .as_ref()
+            .map(|app| app.swapchain_extent.height)
+            .unwrap_or(0)
+    }
+
+    /// Read the current framebuffer contents
+    /// Returns (width, height, pixel_data) where pixel_data is BGRA bytes (4 bytes per pixel)
+    pub fn lfb_read_region(&self) -> Option<(u32, u32, Vec<u8>)> {
+        let app = self.vulkan_app.as_ref()?;
+
+        unsafe {
+            // Wait for rendering to complete
+            app.device
+                .device_wait_idle()
+                .expect("Failed to wait for device idle");
+
+            let width = app.swapchain_extent.width;
+            let height = app.swapchain_extent.height;
+            let image_size = (width * height * 4) as vk::DeviceSize;
+
+            // Create staging buffer for readback
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(image_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            let staging_buffer = app
+                .device
+                .create_buffer(&buffer_info, None)
+                .expect("Failed to create staging buffer");
+
+            let mem_requirements = app.device.get_buffer_memory_requirements(staging_buffer);
+
+            // Find host-visible memory type
+            let instance = &self.vulkan_instance.instance;
+            let mem_properties =
+                instance.get_physical_device_memory_properties(app.physical_device);
+
+            let mut memory_type_index = 0;
+            for i in 0..mem_properties.memory_type_count {
+                if (mem_requirements.memory_type_bits & (1 << i)) != 0
+                    && mem_properties.memory_types[i as usize]
+                        .property_flags
+                        .contains(
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )
+                {
+                    memory_type_index = i;
+                    break;
+                }
+            }
+
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_requirements.size)
+                .memory_type_index(memory_type_index);
+
+            let staging_memory = app
+                .device
+                .allocate_memory(&alloc_info, None)
+                .expect("Failed to allocate staging memory");
+
+            app.device
+                .bind_buffer_memory(staging_buffer, staging_memory, 0)
+                .expect("Failed to bind staging buffer memory");
+
+            // Create command buffer for copy
+            let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(app.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+
+            let cmd_buffers = app
+                .device
+                .allocate_command_buffers(&cmd_alloc_info)
+                .expect("Failed to allocate command buffer");
+            let cmd = cmd_buffers[0];
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+            app.device
+                .begin_command_buffer(cmd, &begin_info)
+                .expect("Failed to begin command buffer");
+
+            // Transition image layout for transfer
+            let src_image = app.swapchain_images[app.current_image_index as usize];
+
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(src_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_access_mask(vk::AccessFlags::MEMORY_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+
+            app.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+
+            // Copy image to buffer
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+
+            app.device.cmd_copy_image_to_buffer(
+                cmd,
+                src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                staging_buffer,
+                &[region],
+            );
+
+            // Transition image back
+            let barrier_back = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(src_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ);
+
+            app.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier_back],
+            );
+
+            app.device
+                .end_command_buffer(cmd)
+                .expect("Failed to end command buffer");
+
+            // Submit and wait
+            let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
+
+            app.device
+                .queue_submit(app.graphics_queue, &[submit_info], vk::Fence::null())
+                .expect("Failed to submit copy command");
+
+            app.device
+                .queue_wait_idle(app.graphics_queue)
+                .expect("Failed to wait for queue");
+
+            // Read back data
+            let data_ptr = app
+                .device
+                .map_memory(staging_memory, 0, image_size, vk::MemoryMapFlags::empty())
+                .expect("Failed to map memory");
+
+            let mut pixels = vec![0u8; image_size as usize];
+            std::ptr::copy_nonoverlapping(
+                data_ptr as *const u8,
+                pixels.as_mut_ptr(),
+                image_size as usize,
+            );
+
+            app.device.unmap_memory(staging_memory);
+
+            // Cleanup
+            app.device
+                .free_command_buffers(app.command_pool, &cmd_buffers);
+            app.device.destroy_buffer(staging_buffer, None);
+            app.device.free_memory(staging_memory, None);
+
+            Some((width, height, pixels))
+        }
+    }
+
+    /// Copy a pixel rectangle from the frame buffer to user memory as RGB565
+    ///
+    /// # Arguments
+    /// * `_src_buffer` - Source buffer (currently ignored, uses current swapchain image)
+    /// * `src_x`, `src_y` - Source coordinates (y origin is upper left)
+    /// * `src_width`, `src_height` - Size of rectangle to copy
+    /// * `dst_stride` - Stride in bytes of destination buffer
+    /// * `dst_data` - Pointer to destination buffer (RGB565 format)
+    ///
+    /// # Returns
+    /// FxBool::True on success, FxBool::False on failure
+    pub fn lfb_read_region_rgb565(
+        &self,
+        _src_buffer: glidesys::Buffer,
+        src_x: FxU32,
+        src_y: FxU32,
+        src_width: FxU32,
+        src_height: FxU32,
+        dst_stride: FxU32,
+        dst_data: *mut std::ffi::c_void,
+    ) -> glidesys::FxBool {
+        // Read entire framebuffer
+        if let Some((fb_width, fb_height, pixels)) = self.lfb_read_region() {
+            // Validate bounds
+            if src_x + src_width > fb_width || src_y + src_height > fb_height {
+                return glidesys::FxBool::False;
+            }
+
+            // Copy requested region to destination buffer
+            // Source is BGRA (4 bytes per pixel), destination is RGB565 (2 bytes per pixel)
+            let dst = dst_data as *mut u8;
+            for row in 0..src_height {
+                let src_row_start = ((src_y + row) * fb_width + src_x) as usize * 4;
+                let dst_row_start = (row * dst_stride) as usize;
+
+                for col in 0..src_width {
+                    let src_idx = src_row_start + (col as usize) * 4;
+                    let dst_idx = dst_row_start + (col as usize) * 2;
+
+                    // Convert BGRA to RGB565
+                    let b = pixels[src_idx] as u16;
+                    let g = pixels[src_idx + 1] as u16;
+                    let r = pixels[src_idx + 2] as u16;
+
+                    // RGB565: RRRRR GGGGGG BBBBB
+                    let rgb565: u16 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+
+                    unsafe {
+                        let dst_ptr = dst.add(dst_idx) as *mut u16;
+                        *dst_ptr = rgb565;
+                    }
+                }
+            }
+            glidesys::FxBool::True
+        } else {
+            glidesys::FxBool::False
+        }
+    }
+
+    /// Lock the linear frame buffer for direct access
+    ///
+    /// # Arguments
+    /// * `lock_type` - Read or write lock
+    /// * `buffer` - Which buffer to lock (front/back)
+    /// * `write_mode` - Pixel format for write operations
+    /// * `origin` - Y origin location
+    /// * `pixel_pipeline` - Whether to use pixel pipeline (ignored)
+    /// * `info` - Output: filled with lock information
+    ///
+    /// # Returns
+    /// FxBool::True if lock succeeded, FxBool::False otherwise
+    pub fn lfb_lock(
+        &mut self,
+        lock_type: glidesys::LfbLock,
+        buffer: glidesys::Buffer,
+        write_mode: glidesys::LfbWriteMode,
+        origin: glidesys::OriginLocation,
+        _pixel_pipeline: FxBool,
+        info: &mut glidesys::LfbInfo,
+    ) -> FxBool {
+        // Check if already locked
+        if self.lfb_lock_state.is_locked {
+            log::warn!("LFB already locked");
+            return FxBool::False;
+        }
+
+        let app = match self.vulkan_app.as_ref() {
+            Some(app) => app,
+            None => return FxBool::False,
+        };
+
+        let width = app.swapchain_extent.width;
+        let height = app.swapchain_extent.height;
+
+        // Calculate stride based on write mode (bytes per pixel)
+        let bytes_per_pixel = match write_mode {
+            glidesys::LfbWriteMode::Rgb565
+            | glidesys::LfbWriteMode::Rgb555
+            | glidesys::LfbWriteMode::Argb1555 => 2,
+            glidesys::LfbWriteMode::Rgb888 => 3,
+            glidesys::LfbWriteMode::Argb8888 => 4,
+            glidesys::LfbWriteMode::Rgb565Depth
+            | glidesys::LfbWriteMode::Rgb555Depth
+            | glidesys::LfbWriteMode::Argb1555Depth
+            | glidesys::LfbWriteMode::Za16 => 4,
+            _ => 2, // Default to 16-bit
+        };
+        let stride = width * bytes_per_pixel;
+
+        // Allocate buffer
+        let buffer_size = (stride * height) as usize;
+        let mut data = vec![0u8; buffer_size];
+
+        // For read locks, copy framebuffer data to buffer
+        if lock_type == glidesys::LfbLock::ReadOnly {
+            if let Some((_, _, pixels)) = self.lfb_read_region() {
+                // Convert from BGRA to requested format
+                match write_mode {
+                    glidesys::LfbWriteMode::Rgb565 | glidesys::LfbWriteMode::Any => {
+                        // Convert BGRA to RGB565
+                        for y in 0..height {
+                            for x in 0..width {
+                                let src_idx = ((y * width + x) * 4) as usize;
+                                let dst_idx = ((y * stride) + (x * 2)) as usize;
+                                if src_idx + 2 < pixels.len() && dst_idx + 1 < data.len() {
+                                    let b = pixels[src_idx] as u16;
+                                    let g = pixels[src_idx + 1] as u16;
+                                    let r = pixels[src_idx + 2] as u16;
+                                    let rgb565: u16 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+                                    data[dst_idx] = (rgb565 & 0xFF) as u8;
+                                    data[dst_idx + 1] = ((rgb565 >> 8) & 0xFF) as u8;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // For other formats, just copy raw BGRA data
+                        let copy_len = std::cmp::min(data.len(), pixels.len());
+                        data[..copy_len].copy_from_slice(&pixels[..copy_len]);
+                    }
+                }
+            }
+        }
+
+        // Store lock state
+        self.lfb_lock_state.is_locked = true;
+        self.lfb_lock_state.lock_type = lock_type;
+        self.lfb_lock_state.buffer = buffer;
+        self.lfb_lock_state.write_mode = write_mode;
+        self.lfb_lock_state.origin = origin;
+        self.lfb_lock_state.width = width;
+        self.lfb_lock_state.height = height;
+        self.lfb_lock_state.stride = stride;
+        self.lfb_lock_state.data = data;
+
+        // Fill info structure
+        info.size = std::mem::size_of::<glidesys::LfbInfo>() as i32;
+        info.lfb_ptr = self.lfb_lock_state.data.as_mut_ptr() as *mut std::ffi::c_void;
+        info.stride_in_bytes = stride;
+        info.write_mode = write_mode;
+        info.origin = origin;
+
+        FxBool::True
+    }
+
+    /// Unlock the linear frame buffer
+    ///
+    /// # Arguments
+    /// * `lock_type` - The lock type used when locking
+    /// * `buffer` - The buffer that was locked
+    ///
+    /// # Returns
+    /// FxBool::True if unlock succeeded
+    pub fn lfb_unlock(&mut self, lock_type: glidesys::LfbLock, buffer: glidesys::Buffer) -> FxBool {
+        if !self.lfb_lock_state.is_locked {
+            return FxBool::False;
+        }
+
+        if self.lfb_lock_state.lock_type != lock_type || self.lfb_lock_state.buffer != buffer {
+            return FxBool::False;
+        }
+
+        // For write locks, upload data to framebuffer and present immediately
+        if lock_type == glidesys::LfbLock::WriteOnly {
+            self.lfb_upload_to_framebuffer();
+        }
+
+        // Clear lock state
+        self.lfb_lock_state.is_locked = false;
+        self.lfb_lock_state.data.clear();
+
+        FxBool::True
+    }
+
+    /// Upload LFB write data to the Vulkan framebuffer
+    fn lfb_upload_to_framebuffer(&mut self) {
+        let app = match self.vulkan_app.as_mut() {
+            Some(app) => app,
+            None => return,
+        };
+
+        let width = self.lfb_lock_state.width;
+        let height = self.lfb_lock_state.height;
+        let stride = self.lfb_lock_state.stride;
+        let write_mode = self.lfb_lock_state.write_mode;
+        let origin = self.lfb_lock_state.origin;
+        let src_data = &self.lfb_lock_state.data;
+
+        unsafe {
+            app.device
+                .queue_wait_idle(app.graphics_queue)
+                .expect("Failed to wait for graphics queue");
+
+            // Wait for and reset fence before acquire (fence might be signaled from previous frame)
+            app.device
+                .wait_for_fences(&[app.in_flight_fence], true, 0)
+                .ok(); // Ignore timeout - fence might not be signaled yet
+            app.device
+                .reset_fences(&[app.in_flight_fence])
+                .expect("Failed to reset fence before acquire");
+
+            // Acquire next swapchain image with retry loop
+            loop {
+                match app.swapchain_loader.acquire_next_image(
+                    app.swapchain,
+                    1_000_000_000,
+                    vk::Semaphore::null(),
+                    app.in_flight_fence,
+                ) {
+                    Ok((image_index, _)) => {
+                        app.current_image_index = image_index;
+                        app.device
+                            .wait_for_fences(&[app.in_flight_fence], true, u64::MAX)
+                            .expect("Failed to wait for acquire fence");
+                        app.device
+                            .reset_fences(&[app.in_flight_fence])
+                            .expect("Failed to reset fence after acquire");
+                        break;
+                    }
+                    Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(e) => panic!("Failed to acquire next image: {:?}", e),
+                }
+            }
+        }
+
+        // Determine bytes per pixel based on write mode
+        let bytes_per_pixel: u32 = match write_mode {
+            glidesys::LfbWriteMode::Rgb565
+            | glidesys::LfbWriteMode::Rgb555
+            | glidesys::LfbWriteMode::Argb1555 => 2,
+            glidesys::LfbWriteMode::Rgb888 => 3,
+            glidesys::LfbWriteMode::Argb8888 => 4,
+            _ => 2,
+        };
+
+        // Convert source data to BGRA8888
+        let mut bgra_data = vec![0u8; (width * height * 4) as usize];
+        for y in 0..height {
+            // Handle Y-flip for lower-left origin
+            let src_y = if origin == glidesys::OriginLocation::LowerLeft {
+                height - 1 - y
+            } else {
+                y
+            };
+
+            for x in 0..width {
+                let src_idx = (src_y * stride + x * bytes_per_pixel) as usize;
+                let dst_idx = ((y * width + x) * 4) as usize;
+
+                if dst_idx + 3 < bgra_data.len() {
+                    let (r, g, b, a) = match write_mode {
+                        glidesys::LfbWriteMode::Rgb565 | glidesys::LfbWriteMode::Any => {
+                            if src_idx + 1 < src_data.len() {
+                                let rgb565 = (src_data[src_idx] as u16)
+                                    | ((src_data[src_idx + 1] as u16) << 8);
+                                let r5 = ((rgb565 >> 11) & 0x1F) as u8;
+                                let g6 = ((rgb565 >> 5) & 0x3F) as u8;
+                                let b5 = (rgb565 & 0x1F) as u8;
+                                (
+                                    (r5 << 3) | (r5 >> 2),
+                                    (g6 << 2) | (g6 >> 4),
+                                    (b5 << 3) | (b5 >> 2),
+                                    255u8,
+                                )
+                            } else {
+                                (0, 0, 0, 255)
+                            }
+                        }
+                        glidesys::LfbWriteMode::Rgb555 => {
+                            if src_idx + 1 < src_data.len() {
+                                let rgb555 = (src_data[src_idx] as u16)
+                                    | ((src_data[src_idx + 1] as u16) << 8);
+                                let r5 = ((rgb555 >> 10) & 0x1F) as u8;
+                                let g5 = ((rgb555 >> 5) & 0x1F) as u8;
+                                let b5 = (rgb555 & 0x1F) as u8;
+                                (
+                                    (r5 << 3) | (r5 >> 2),
+                                    (g5 << 3) | (g5 >> 2),
+                                    (b5 << 3) | (b5 >> 2),
+                                    255u8,
+                                )
+                            } else {
+                                (0, 0, 0, 255)
+                            }
+                        }
+                        glidesys::LfbWriteMode::Argb1555 => {
+                            if src_idx + 1 < src_data.len() {
+                                let argb1555 = (src_data[src_idx] as u16)
+                                    | ((src_data[src_idx + 1] as u16) << 8);
+                                let a1 = ((argb1555 >> 15) & 0x1) as u8;
+                                let r5 = ((argb1555 >> 10) & 0x1F) as u8;
+                                let g5 = ((argb1555 >> 5) & 0x1F) as u8;
+                                let b5 = (argb1555 & 0x1F) as u8;
+                                (
+                                    (r5 << 3) | (r5 >> 2),
+                                    (g5 << 3) | (g5 >> 2),
+                                    (b5 << 3) | (b5 >> 2),
+                                    if a1 != 0 { 255 } else { 0 },
+                                )
+                            } else {
+                                (0, 0, 0, 255)
+                            }
+                        }
+                        glidesys::LfbWriteMode::Rgb888 => {
+                            if src_idx + 2 < src_data.len() {
+                                (
+                                    src_data[src_idx + 2], // R
+                                    src_data[src_idx + 1], // G
+                                    src_data[src_idx],     // B
+                                    255u8,
+                                )
+                            } else {
+                                (0, 0, 0, 255)
+                            }
+                        }
+                        glidesys::LfbWriteMode::Argb8888 => {
+                            if src_idx + 3 < src_data.len() {
+                                (
+                                    src_data[src_idx + 2], // R
+                                    src_data[src_idx + 1], // G
+                                    src_data[src_idx],     // B
+                                    src_data[src_idx + 3], // A
+                                )
+                            } else {
+                                (0, 0, 0, 255)
+                            }
+                        }
+                        _ => (0, 0, 0, 255),
+                    };
+
+                    // Write as BGRA
+                    bgra_data[dst_idx] = b;
+                    bgra_data[dst_idx + 1] = g;
+                    bgra_data[dst_idx + 2] = r;
+                    bgra_data[dst_idx + 3] = a;
+                }
+            }
+        }
+
+        unsafe {
+            let image_size = bgra_data.len() as vk::DeviceSize;
+
+            // Create staging buffer
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(image_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            let staging_buffer = app
+                .device
+                .create_buffer(&buffer_info, None)
+                .expect("Failed to create staging buffer");
+
+            let mem_requirements = app.device.get_buffer_memory_requirements(staging_buffer);
+
+            // Find host-visible memory type
+            let instance = &self.vulkan_instance.instance;
+            let mem_properties =
+                instance.get_physical_device_memory_properties(app.physical_device);
+
+            let mut memory_type_index = 0;
+            for i in 0..mem_properties.memory_type_count {
+                if (mem_requirements.memory_type_bits & (1 << i)) != 0
+                    && mem_properties.memory_types[i as usize]
+                        .property_flags
+                        .contains(
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )
+                {
+                    memory_type_index = i;
+                    break;
+                }
+            }
+
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_requirements.size)
+                .memory_type_index(memory_type_index);
+
+            let staging_memory = app
+                .device
+                .allocate_memory(&alloc_info, None)
+                .expect("Failed to allocate staging memory");
+
+            app.device
+                .bind_buffer_memory(staging_buffer, staging_memory, 0)
+                .expect("Failed to bind staging buffer memory");
+
+            // Copy data to staging buffer
+            let data_ptr = app
+                .device
+                .map_memory(staging_memory, 0, image_size, vk::MemoryMapFlags::empty())
+                .expect("Failed to map memory");
+
+            std::ptr::copy_nonoverlapping(bgra_data.as_ptr(), data_ptr as *mut u8, bgra_data.len());
+
+            app.device.unmap_memory(staging_memory);
+
+            // Create command buffer for copy
+            let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(app.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+
+            let cmd_buffers = app
+                .device
+                .allocate_command_buffers(&cmd_alloc_info)
+                .expect("Failed to allocate command buffer");
+            let cmd = cmd_buffers[0];
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+            app.device
+                .begin_command_buffer(cmd, &begin_info)
+                .expect("Failed to begin command buffer");
+
+            // Get the target image (back buffer = current swapchain image)
+            let dst_image = app.swapchain_images[app.current_image_index as usize];
+
+            // Transition image layout for transfer
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(dst_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+            app.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+
+            // Copy buffer to image
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+
+            app.device.cmd_copy_buffer_to_image(
+                cmd,
+                staging_buffer,
+                dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+
+            // Transition image to present layout
+            let barrier_present = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(dst_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ);
+
+            app.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier_present],
+            );
+
+            app.device
+                .end_command_buffer(cmd)
+                .expect("Failed to end command buffer");
+
+            // Submit without fence (fence is used for acquire only in LFB path)
+            let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
+
+            app.device
+                .queue_submit(app.graphics_queue, &[submit_info], vk::Fence::null())
+                .expect("Failed to submit copy command");
+
+            app.device
+                .queue_wait_idle(app.graphics_queue)
+                .expect("Failed to wait for queue");
+
+            // Present the image to return it to the swapchain pool
+            let swapchains = [app.swapchain];
+            let image_indices = [app.current_image_index];
+            let present_info = vk::PresentInfoKHR::default()
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+
+            let _ = app
+                .swapchain_loader
+                .queue_present(app.graphics_queue, &present_info);
+
+            // Signal the fence so buffer_swap's wait_for_fences won't hang if called next
+            let empty_submit = vk::SubmitInfo::default();
+            app.device
+                .queue_submit(app.graphics_queue, &[empty_submit], app.in_flight_fence)
+                .expect("Failed to signal fence");
+
+            // Cleanup
+            app.device
+                .free_command_buffers(app.command_pool, &cmd_buffers);
+            app.device.destroy_buffer(staging_buffer, None);
+            app.device.free_memory(staging_memory, None);
+
+            log::debug!(
+                "LFB write data uploaded to framebuffer ({}x{})",
+                width,
+                height
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl WindowInteraction for Gr {
+    fn draw_frame(&mut self, delta_time: f32) {
+        // todo!()
+    }
+
+    fn recreate_swapchain(&mut self) {
+        todo!()
+    }
+
+    fn cleanup_swapchain(&self) {
+        if let Some(app) = &self.vulkan_app {
+            app.cleanup_swapchain()
+        }
+    }
+
+    fn wait_device_idle(&self) {
+        unsafe {
+            if let Some(app) = &self.vulkan_app {
+                app.get_device()
+                    .device_wait_idle()
+                    .expect("Failed to wait device idle!")
+            }
+        };
+    }
+
+    fn resize_framebuffer(&mut self) {
+        self.is_framebuffer_resized = true;
+    }
+
+    fn window_ref(&self) -> Option<&Window> {
+        self.window.as_ref()
+    }
+}
+
+impl Drop for Gr {
+    fn drop(&mut self) {
+        log::debug!("Dropping Gr");
+
+        // Clean up Vulkan resources if they exist
+        self.vulkan_app = None;
+        self.window = None;
+
+        // Destroy surface if valid
+        if self.surface != vk::SurfaceKHR::null() {
+            unsafe {
+                self.vulkan_instance
+                    .surface_loader
+                    .destroy_surface(self.surface, None);
+            }
+            self.surface = vk::SurfaceKHR::null();
+        }
+
+        // VulkanInstance handles its own cleanup in its Drop impl
+        log::debug!("Gr dropped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a Gr instance with Vulkan for testing.
+    /// Note: Requires MoltenVK ICD to be configured on macOS:
+    /// export VK_ICD_FILENAMES=/opt/homebrew/opt/molten-vk/etc/vulkan/icd.d/MoltenVK_icd.json
+    fn create_test_gr() -> Gr {
+        Gr::init(None)
+    }
+
+    // ==================== Gr::init Tests ====================
+
+    #[test]
+    fn test_gr_init_creates_vulkan_instance() {
+        let gr = create_test_gr();
+        // If we get here without panic, Vulkan instance was created successfully
+        assert!(gr.vulkan_app.is_none()); // No window, so no VulkanApp yet
+        assert!(gr.window.is_none());
+    }
+
+    #[test]
+    fn test_gr_init_default_state() {
+        let gr = create_test_gr();
+        assert_eq!(gr.state.screen_width, 0);
+        assert_eq!(gr.state.screen_height, 0);
+        assert_eq!(gr.state.num_buffers, 0);
+    }
+
+    // ==================== grSstSelect Tests ====================
+
+    #[test]
+    fn test_sst_select_device_zero() {
+        let mut gr = create_test_gr();
+        let result = gr.sst_select(0);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "grSstSelect() must be lower than the number of devices")]
+    fn test_sst_select_invalid_device() {
+        let mut gr = create_test_gr();
+        gr.sst_select(999); // Should panic - invalid device index
+    }
+
+    // ==================== grGetString Tests ====================
+
+    #[test]
+    fn test_get_string_renderer() {
+        let mut gr = create_test_gr();
+        let ptr = gr.get_string(EnvironmentInfo::Renderer);
+        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(s, "Glide");
+    }
+
+    #[test]
+    fn test_get_string_vendor() {
+        let mut gr = create_test_gr();
+        let ptr = gr.get_string(EnvironmentInfo::Vendor);
+        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(s, "3Dfx Interactive");
+    }
+
+    #[test]
+    fn test_get_string_version() {
+        let mut gr = create_test_gr();
+        let ptr = gr.get_string(EnvironmentInfo::Version);
+        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(s, "3.0");
+    }
+
+    #[test]
+    fn test_get_string_hardware() {
+        let mut gr = create_test_gr();
+        let ptr = gr.get_string(EnvironmentInfo::Hardware);
+        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(s, "Banshee");
+    }
+
+    #[test]
+    fn test_get_string_extension() {
+        let mut gr = create_test_gr();
+        let ptr = gr.get_string(EnvironmentInfo::Extension);
+        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(s, " "); // Just a space
+    }
+
+    // ==================== grGet Tests ====================
+
+    #[test]
+    fn test_get_num_boards() {
+        let mut gr = create_test_gr();
+        let mut value: i32 = 0;
+        let result = gr.get(EnvironmentParameters::NumBoards, 4, &mut value);
+        assert_eq!(result, 1);
+        assert_eq!(value, 1);
+    }
+
+    #[test]
+    fn test_get_max_texture_size() {
+        let mut gr = create_test_gr();
+        let mut value: i32 = 0;
+        let result = gr.get(EnvironmentParameters::MaxTextureSize, 4, &mut value);
+        assert_eq!(result, 1);
+        assert_eq!(value, 256);
+    }
+
+    #[test]
+    fn test_get_num_fb() {
+        let mut gr = create_test_gr();
+        let mut value: i32 = 0;
+        let result = gr.get(EnvironmentParameters::NumFb, 4, &mut value);
+        assert_eq!(result, 1);
+        assert_eq!(value, 1);
+    }
+
+    // ==================== grSelectContext Tests ====================
+
+    #[test]
+    fn test_select_context() {
+        let mut gr = create_test_gr();
+        let result = gr.select_context(1);
+        assert!(matches!(result, FxBool::True));
+    }
+
+    // ==================== grClipWindow Tests ====================
+
+    #[test]
+    fn test_clip_window() {
+        let mut gr = create_test_gr();
+        gr.clip_window(10, 20, 630, 460);
+        assert_eq!(gr.state.clipwindowf_xmin, 10.0);
+        assert_eq!(gr.state.clipwindowf_ymin, 20.0);
+        assert_eq!(gr.state.clipwindowf_xmax, 630.0);
+        assert_eq!(gr.state.clipwindowf_ymax, 460.0);
+    }
+
+    #[test]
+    fn test_clip_window_fullscreen() {
+        let mut gr = create_test_gr();
+        gr.clip_window(0, 0, 800, 600);
+        assert_eq!(gr.state.clipwindowf_xmin, 0.0);
+        assert_eq!(gr.state.clipwindowf_ymin, 0.0);
+        assert_eq!(gr.state.clipwindowf_xmax, 800.0);
+        assert_eq!(gr.state.clipwindowf_ymax, 600.0);
+    }
+
+    // ==================== Vertex Batch Tests ====================
+
+    #[test]
+    fn test_vertex_batch_initial_empty() {
+        let gr = create_test_gr();
+        assert!(gr.vertex_batch.is_empty());
+        assert_eq!(gr.vertex_batch.vertex_count(), 0);
+    }
+
+    // ==================== Color Conversion Tests ====================
+
+    #[test]
+    fn test_color_to_rgba_argb() {
+        let color = Color(0xFF804020); // ARGB: A=FF, R=80, G=40, B=20
+        let (r, g, b, a) = color.to_rgba(ColorFormat::Argb);
+        assert_eq!(r, 0x80);
+        assert_eq!(g, 0x40);
+        assert_eq!(b, 0x20);
+        assert_eq!(a, 0xFF);
+    }
+
+    #[test]
+    fn test_color_to_rgba_abgr() {
+        let color = Color(0xFF204080); // ABGR: A=FF, B=20, G=40, R=80
+        let (r, g, b, a) = color.to_rgba(ColorFormat::Abgr);
+        assert_eq!(r, 0x80);
+        assert_eq!(g, 0x40);
+        assert_eq!(b, 0x20);
+        assert_eq!(a, 0xFF);
+    }
+
+    #[test]
+    fn test_color_to_rgba_f() {
+        let color = Color(0xFF000000); // ARGB: A=FF, R=00, G=00, B=00
+        let (r, g, b, a) = color.to_rgba_f(ColorFormat::Argb);
+        assert_eq!(r, 0.0);
+        assert_eq!(g, 0.0);
+        assert_eq!(b, 0.0);
+        assert!((a - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_color_to_rgba_f_white() {
+        let color = Color(0xFFFFFFFF); // ARGB: all max
+        let (r, g, b, a) = color.to_rgba_f(ColorFormat::Argb);
+        assert!((r - 1.0).abs() < 0.01);
+        assert!((g - 1.0).abs() < 0.01);
+        assert!((b - 1.0).abs() < 0.01);
+        assert!((a - 1.0).abs() < 0.01);
+    }
+
+    // ==================== Alpha Tests ====================
+
+    #[test]
+    fn test_alpha_to_f32() {
+        let alpha = Alpha(255);
+        assert!((alpha.to_f32() - 1.0).abs() < 0.01);
+
+        let alpha_half = Alpha(128);
+        assert!((alpha_half.to_f32() - 0.5).abs() < 0.02);
+
+        let alpha_zero = Alpha(0);
+        assert_eq!(alpha_zero.to_f32(), 0.0);
+    }
+
+    // ==================== Depth Buffer Tests ====================
+
+    #[test]
+    fn test_depth_buffer_mode() {
+        let mut gr = create_test_gr();
+        gr.depth_buffer_mode(DepthBufferMode::ZBuffer);
+        assert!(matches!(
+            gr.state.depth_buffer_mode,
+            DepthBufferMode::ZBuffer
+        ));
+    }
+
+    #[test]
+    fn test_depth_buffer_function() {
+        let mut gr = create_test_gr();
+        gr.depth_buffer_function(CmpFnc::Less);
+        assert!(matches!(gr.state.depth_buffer_function, CmpFnc::Less));
+    }
+
+    #[test]
+    fn test_depth_mask() {
+        let mut gr = create_test_gr();
+        gr.depth_mask(FxBool::False);
+        assert!(!gr.state.depth_mask);
+        gr.depth_mask(FxBool::True);
+        assert!(gr.state.depth_mask);
+    }
+
+    // ==================== Color Mask Tests ====================
+
+    #[test]
+    fn test_color_mask() {
+        let mut gr = create_test_gr();
+        gr.color_mask(FxBool::False, FxBool::True);
+        assert!(!gr.state.color_mask_rgb);
+        assert!(gr.state.color_mask_alpha);
+    }
+
+    // ==================== Alpha Blend Tests ====================
+
+    #[test]
+    fn test_alpha_blend_function() {
+        let mut gr = create_test_gr();
+        gr.alpha_blend_function(
+            AlphaBlendFnc::SrcAlpha,
+            AlphaBlendFnc::OneMinusSrcAlpha,
+            AlphaBlendFnc::One,
+            AlphaBlendFnc::Zero,
+        );
+        assert!(matches!(
+            gr.state.alpha_blend_rgb_src,
+            AlphaBlendFnc::SrcAlpha
+        ));
+        assert!(matches!(
+            gr.state.alpha_blend_rgb_dst,
+            AlphaBlendFnc::OneMinusSrcAlpha
+        ));
+    }
+
+    // ==================== Cull Mode Tests ====================
+
+    #[test]
+    fn test_cull_mode() {
+        let mut gr = create_test_gr();
+        gr.cull_mode(CullMode::Negative);
+        assert_eq!(gr.state.cull_mode, CullMode::Negative);
+        gr.cull_mode(CullMode::Positive);
+        assert_eq!(gr.state.cull_mode, CullMode::Positive);
+    }
+
+    // ==================== Render Buffer Tests ====================
+
+    #[test]
+    fn test_render_buffer() {
+        let mut gr = create_test_gr();
+        gr.render_buffer(Buffer::Front);
+        assert!(matches!(gr.state.render_buffer, Buffer::Front));
+    }
+
+    // ==================== Constant Color Tests ====================
+
+    #[test]
+    fn test_constant_color_value() {
+        let mut gr = create_test_gr();
+        gr.constant_color_value(Color(0x12345678));
+        assert_eq!(gr.state.constant_color.0, 0x12345678);
+    }
+
+    // ==================== Fog Tests ====================
+
+    #[test]
+    fn test_fog_mode() {
+        let mut gr = create_test_gr();
+        gr.fog_mode(FogMode::WithTable);
+        assert!(matches!(gr.state.fog_mode, FogMode::WithTable));
+    }
+
+    #[test]
+    fn test_fog_color_value() {
+        let mut gr = create_test_gr();
+        gr.fog_color_value(Color(0xAABBCCDD));
+        assert_eq!(gr.state.fog_color.0, 0xAABBCCDD);
+    }
+
+    // ==================== Chromakey Tests ====================
+
+    #[test]
+    fn test_chromakey_mode() {
+        let mut gr = create_test_gr();
+        gr.chromakey_mode(ChromakeyMode::Enable);
+        assert!(matches!(gr.state.chromakey_mode, ChromakeyMode::Enable));
+    }
+
+    #[test]
+    fn test_chromakey_value() {
+        let mut gr = create_test_gr();
+        gr.chromakey_value(Color(0xFF00FF00));
+        assert_eq!(gr.state.chromakey_value.0, 0xFF00FF00);
+    }
+
+    // ==================== Alpha Test Tests ====================
+
+    #[test]
+    fn test_alpha_test_function() {
+        let mut gr = create_test_gr();
+        gr.alpha_test_function(CmpFnc::Greater);
+        assert!(matches!(gr.state.alpha_test_function, CmpFnc::Greater));
+    }
+
+    #[test]
+    fn test_alpha_test_reference_value() {
+        let mut gr = create_test_gr();
+        gr.alpha_test_reference_value(Alpha(128));
+        assert_eq!(gr.state.alpha_test_reference.0, 128);
+    }
+
+    // ==================== Draw Triangle Tests ====================
+
+    #[test]
+    fn test_draw_triangle_adds_to_batch() {
+        let mut gr = create_test_gr();
+        let v0 = Vertex::new(0.0, 0.0);
+        let v1 = Vertex::new(100.0, 0.0);
+        let v2 = Vertex::new(50.0, 100.0);
+        gr.draw_triangle(&v0, &v1, &v2);
+        assert_eq!(gr.vertex_batch.vertex_count(), 3);
+    }
+
+    #[test]
+    fn test_draw_triangle_with_cull_negative() {
+        let mut gr = create_test_gr();
+        gr.cull_mode(CullMode::Negative);
+        // Counter-clockwise triangle (negative area)
+        let v0 = Vertex::new(0.0, 0.0);
+        let v1 = Vertex::new(0.0, 100.0);
+        let v2 = Vertex::new(100.0, 0.0);
+        gr.draw_triangle(&v0, &v1, &v2);
+        // Should be culled
+        assert_eq!(gr.vertex_batch.vertex_count(), 0);
+    }
+
+    #[test]
+    fn test_draw_triangle_with_cull_positive() {
+        let mut gr = create_test_gr();
+        gr.cull_mode(CullMode::Positive);
+        // Clockwise triangle (positive area)
+        let v0 = Vertex::new(0.0, 0.0);
+        let v1 = Vertex::new(100.0, 0.0);
+        let v2 = Vertex::new(50.0, 100.0);
+        gr.draw_triangle(&v0, &v1, &v2);
+        // Should be culled
+        assert_eq!(gr.vertex_batch.vertex_count(), 0);
+    }
+
+    // ==================== Texture Tests ====================
+
+    #[test]
+    fn test_tex_filter_mode() {
+        let mut gr = create_test_gr();
+        gr.tex_filter_mode(
+            ChipID::Tmu0,
+            TextureFilterMode::Bilinear,
+            TextureFilterMode::Bilinear,
+        );
+        assert!(matches!(
+            gr.state.tex_filter_mode_min[0],
+            TextureFilterMode::Bilinear
+        ));
+        assert!(matches!(
+            gr.state.tex_filter_mode_mag[0],
+            TextureFilterMode::Bilinear
+        ));
+    }
+
+    #[test]
+    fn test_tex_clamp_mode() {
+        let mut gr = create_test_gr();
+        gr.tex_clamp_mode(
+            ChipID::Tmu0,
+            TextureClampMode::Clamp,
+            TextureClampMode::Wrap,
+        );
+        assert!(matches!(
+            gr.state.tex_clamp_mode_s[0],
+            TextureClampMode::Clamp
+        ));
+        assert!(matches!(
+            gr.state.tex_clamp_mode_t[0],
+            TextureClampMode::Wrap
+        ));
+    }
+
+    #[test]
+    fn test_tex_mipmap_mode() {
+        let mut gr = create_test_gr();
+        gr.tex_mipmap_mode(ChipID::Tmu0, MipMapMode::Nearest, FxBool::True);
+        assert!(matches!(gr.state.tex_mipmap_mode[0], MipMapMode::Nearest));
+    }
+
+    #[test]
+    fn test_tex_lod_bias_value() {
+        let mut gr = create_test_gr();
+        gr.tex_lod_bias_value(ChipID::Tmu0, -1.5);
+        assert!((gr.state.tex_lod_bias[0] - (-1.5)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_tex_combine() {
+        let mut gr = create_test_gr();
+        gr.tex_combine(
+            ChipID::Tmu0,
+            TextureCombineFnc::Decal,
+            CombineFactor::One,
+            TextureCombineFnc::Decal,
+            CombineFactor::One,
+            FxBool::False,
+            FxBool::False,
+        );
+        assert!(matches!(
+            gr.state.tex_combine_function[0],
+            TextureCombineFnc::Decal
+        ));
+        assert!(matches!(gr.state.tex_combine_factor[0], CombineFactor::One));
+    }
+
+    #[test]
+    fn test_tex_min_address() {
+        let gr = create_test_gr();
+        assert_eq!(gr.tex_min_address(ChipID::Tmu0), 0);
+    }
+
+    #[test]
+    fn test_tex_max_address() {
+        let gr = create_test_gr();
+        // Should return configured texture memory - 8 (last 8 bytes reserved)
+        // Default config is 8MB per TMU
+        let expected = gr.config().texture.memory.bytes() - 8;
+        assert_eq!(gr.tex_max_address(ChipID::Tmu0), expected);
+    }
+
+    // ==================== grVertexLayout Tests ====================
+
+    // GR_PARAM constants for tests
+    const GR_PARAM_XY: u32 = 0x01;
+    const GR_PARAM_Z: u32 = 0x02;
+    const GR_PARAM_W: u32 = 0x03;
+    const GR_PARAM_Q: u32 = 0x04;
+    const GR_PARAM_A: u32 = 0x10;
+    const GR_PARAM_RGB: u32 = 0x20;
+    const GR_PARAM_PARGB: u32 = 0x30;
+    const GR_PARAM_ST0: u32 = 0x40;
+    const GR_PARAM_ST1: u32 = 0x41;
+    const GR_PARAM_Q0: u32 = 0x50;
+    const GR_PARAM_Q1: u32 = 0x51;
+
+    const GR_PARAM_DISABLE: u32 = 0x00;
+    const GR_PARAM_ENABLE: u32 = 0x01;
+
+    #[test]
+    fn test_vertex_layout_xy() {
+        let mut gr = create_test_gr();
+        gr.vertex_layout(GR_PARAM_XY, 0, GR_PARAM_ENABLE);
+
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.xy.offset, 0);
+        assert_eq!(layout.xy.mode, VertexLayoutMode::Enable);
+    }
+
+    #[test]
+    fn test_vertex_layout_z() {
+        let mut gr = create_test_gr();
+        gr.vertex_layout(GR_PARAM_Z, 8, GR_PARAM_ENABLE);
+
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.z.offset, 8);
+        assert_eq!(layout.z.mode, VertexLayoutMode::Enable);
+    }
+
+    #[test]
+    fn test_vertex_layout_w() {
+        let mut gr = create_test_gr();
+        gr.vertex_layout(GR_PARAM_W, 12, GR_PARAM_ENABLE);
+
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.w.offset, 12);
+        assert_eq!(layout.w.mode, VertexLayoutMode::Enable);
+    }
+
+    #[test]
+    fn test_vertex_layout_rgb_sets_float_color_type() {
+        let mut gr = create_test_gr();
+        gr.vertex_layout(GR_PARAM_RGB, 16, GR_PARAM_ENABLE);
+
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.rgb.offset, 16);
+        assert_eq!(layout.rgb.mode, VertexLayoutMode::Enable);
+        assert_eq!(layout.color_type, VertexColorType::Float);
+    }
+
+    #[test]
+    fn test_vertex_layout_pargb_sets_u8_color_type() {
+        let mut gr = create_test_gr();
+        gr.vertex_layout(GR_PARAM_PARGB, 16, GR_PARAM_ENABLE);
+
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.pargb.offset, 16);
+        assert_eq!(layout.pargb.mode, VertexLayoutMode::Enable);
+        assert_eq!(layout.color_type, VertexColorType::U8);
+    }
+
+    #[test]
+    fn test_vertex_layout_alpha() {
+        let mut gr = create_test_gr();
+        gr.vertex_layout(GR_PARAM_A, 28, GR_PARAM_ENABLE);
+
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.a.offset, 28);
+        assert_eq!(layout.a.mode, VertexLayoutMode::Enable);
+        assert_eq!(layout.color_type, VertexColorType::Float);
+    }
+
+    #[test]
+    fn test_vertex_layout_texture_coords() {
+        let mut gr = create_test_gr();
+        gr.vertex_layout(GR_PARAM_ST0, 32, GR_PARAM_ENABLE);
+        gr.vertex_layout(GR_PARAM_ST1, 40, GR_PARAM_ENABLE);
+
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.st0.offset, 32);
+        assert_eq!(layout.st0.mode, VertexLayoutMode::Enable);
+        assert_eq!(layout.st1.offset, 40);
+        assert_eq!(layout.st1.mode, VertexLayoutMode::Enable);
+    }
+
+    #[test]
+    fn test_vertex_layout_q_coords() {
+        let mut gr = create_test_gr();
+        gr.vertex_layout(GR_PARAM_Q, 48, GR_PARAM_ENABLE);
+        gr.vertex_layout(GR_PARAM_Q0, 52, GR_PARAM_ENABLE);
+        gr.vertex_layout(GR_PARAM_Q1, 56, GR_PARAM_ENABLE);
+
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.q.offset, 48);
+        assert_eq!(layout.q.mode, VertexLayoutMode::Enable);
+        assert_eq!(layout.q0.offset, 52);
+        assert_eq!(layout.q0.mode, VertexLayoutMode::Enable);
+        assert_eq!(layout.q1.offset, 56);
+        assert_eq!(layout.q1.mode, VertexLayoutMode::Enable);
+    }
+
+    #[test]
+    fn test_vertex_layout_disable() {
+        let mut gr = create_test_gr();
+        gr.vertex_layout(GR_PARAM_RGB, 16, GR_PARAM_ENABLE);
+        gr.vertex_layout(GR_PARAM_RGB, 16, GR_PARAM_DISABLE);
+
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.rgb.mode, VertexLayoutMode::Disable);
+    }
+
+    #[test]
+    fn test_vertex_layout_reset() {
+        let mut gr = create_test_gr();
+        // Set up some layout
+        gr.vertex_layout(GR_PARAM_XY, 0, GR_PARAM_ENABLE);
+        gr.vertex_layout(GR_PARAM_RGB, 16, GR_PARAM_ENABLE);
+        gr.vertex_layout(GR_PARAM_ST0, 32, GR_PARAM_ENABLE);
+
+        // Reset
+        gr.reset_vertex_layout();
+
+        // All should be disabled
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.xy.mode, VertexLayoutMode::Disable);
+        assert_eq!(layout.rgb.mode, VertexLayoutMode::Disable);
+        assert_eq!(layout.st0.mode, VertexLayoutMode::Disable);
+        assert_eq!(layout.color_type, VertexColorType::Float);
+    }
+
+    #[test]
+    fn test_vertex_layout_typical_setup() {
+        let mut gr = create_test_gr();
+
+        // Typical Glide vertex setup like in test programs
+        gr.vertex_layout(GR_PARAM_XY, 0, GR_PARAM_ENABLE);
+        gr.vertex_layout(GR_PARAM_RGB, 16, GR_PARAM_ENABLE);
+        gr.vertex_layout(GR_PARAM_A, 28, GR_PARAM_ENABLE);
+        gr.vertex_layout(GR_PARAM_ST0, 36, GR_PARAM_ENABLE);
+
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.xy.offset, 0);
+        assert_eq!(layout.xy.mode, VertexLayoutMode::Enable);
+        assert_eq!(layout.rgb.offset, 16);
+        assert_eq!(layout.rgb.mode, VertexLayoutMode::Enable);
+        assert_eq!(layout.a.offset, 28);
+        assert_eq!(layout.a.mode, VertexLayoutMode::Enable);
+        assert_eq!(layout.st0.offset, 36);
+        assert_eq!(layout.st0.mode, VertexLayoutMode::Enable);
+        assert_eq!(layout.color_type, VertexColorType::Float);
+    }
+
+    // ==================== grReset Tests ====================
+
+    // GR_STATS_* and GR_VERTEX_PARAMETER constants
+    const GR_STATS_LINES: u32 = 0x17;
+    const GR_STATS_PIXELS: u32 = 0x1d;
+    const GR_STATS_POINTS: u32 = 0x1e;
+    const GR_STATS_TRIANGLES: u32 = 0x21;
+    const GR_VERTEX_PARAMETER: u32 = 0x29;
+
+    #[test]
+    fn test_reset_stats_points() {
+        let mut gr = create_test_gr();
+        let result = gr.reset(GR_STATS_POINTS);
+        assert_eq!(result, FxBool::True);
+    }
+
+    #[test]
+    fn test_reset_stats_lines() {
+        let mut gr = create_test_gr();
+        let result = gr.reset(GR_STATS_LINES);
+        assert_eq!(result, FxBool::True);
+    }
+
+    #[test]
+    fn test_reset_stats_pixels() {
+        let mut gr = create_test_gr();
+        let result = gr.reset(GR_STATS_PIXELS);
+        assert_eq!(result, FxBool::True);
+    }
+
+    #[test]
+    fn test_reset_stats_triangles() {
+        let mut gr = create_test_gr();
+        let result = gr.reset(GR_STATS_TRIANGLES);
+        assert_eq!(result, FxBool::True);
+    }
+
+    #[test]
+    fn test_reset_vertex_parameter() {
+        let mut gr = create_test_gr();
+
+        // Set up some vertex layout
+        gr.vertex_layout(GR_PARAM_XY, 0, GR_PARAM_ENABLE);
+        gr.vertex_layout(GR_PARAM_RGB, 16, GR_PARAM_ENABLE);
+        gr.vertex_layout(GR_PARAM_ST0, 32, GR_PARAM_ENABLE);
+
+        // Verify layout is set
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.xy.mode, VertexLayoutMode::Enable);
+
+        // Reset vertex parameters
+        let result = gr.reset(GR_VERTEX_PARAMETER);
+        assert_eq!(result, FxBool::True);
+
+        // All should be disabled now
+        let layout = gr.get_vertex_layout();
+        assert_eq!(layout.xy.mode, VertexLayoutMode::Disable);
+        assert_eq!(layout.rgb.mode, VertexLayoutMode::Disable);
+        assert_eq!(layout.st0.mode, VertexLayoutMode::Disable);
+        assert_eq!(layout.color_type, VertexColorType::Float);
+    }
+
+    #[test]
+    fn test_reset_unknown_parameter() {
+        let mut gr = create_test_gr();
+        let result = gr.reset(0xFF); // Invalid parameter
+        assert_eq!(result, FxBool::False);
+    }
+}

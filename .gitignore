@@ -1,0 +1,6 @@
+/target
+.vscode
+src/tmp
+*.exe
+*.dll
+old-docs

@@ -1,0 +1,14 @@
+[workspace]
+members = ["glidevk", "glide3x"]
+resolver = "2"
+
+# Reduce debug info size for Wine compatibility
+# Full debug symbols create PE sections too large for Wine to load
+[profile.dev]
+debug = 1  # Line tables only (reduced size)
+split-debuginfo = "packed"
+panic = "abort"  # Avoid unwinding issues under Wine
+opt-level = 1    # Minimal optimization to reduce .eh_frame complexity
+
+[profile.dev.package."*"]
+debug = false  # No debug info for dependencies
