@@ -172,8 +172,8 @@ impl Default for State {
             alpha_blend_alpha_dst: AlphaBlendFnc::Zero,
             // Default culling: disabled
             cull_mode: CullMode::Disable,
-            // Default dithering: disabled
-            dither_mode: DitherMode::Disable,
+            // Default dithering: 4x4
+            dither_mode: DitherMode::Dither4x4,
             // Default render buffer: back buffer
             render_buffer: Buffer::Back,
             // Default origin: upper-left
@@ -477,9 +477,14 @@ impl Gr {
 
             log::info!(
                 "sst_win_open: game={}x{}, window={}x{}, viewport=({},{} {}x{})",
-                self.state.screen_width, self.state.screen_height,
-                window_width, window_height,
-                vp_x, vp_y, vp_w, vp_h
+                self.state.screen_width,
+                self.state.screen_height,
+                window_width,
+                window_height,
+                vp_x,
+                vp_y,
+                vp_w,
+                vp_h
             );
 
             let _flip = match origin {
@@ -519,8 +524,10 @@ impl Gr {
                     if let Some(monitor) = window.current_monitor() {
                         let monitor_size = monitor.size();
                         let monitor_pos = monitor.position();
-                        let x = monitor_pos.x + ((monitor_size.width as i32 - window_width as i32) / 2);
-                        let y = monitor_pos.y + ((monitor_size.height as i32 - window_height as i32) / 2);
+                        let x =
+                            monitor_pos.x + ((monitor_size.width as i32 - window_width as i32) / 2);
+                        let y = monitor_pos.y
+                            + ((monitor_size.height as i32 - window_height as i32) / 2);
                         window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
                     }
                 }
@@ -614,7 +621,9 @@ impl Gr {
                 .image_format(surface_format.format)
                 .image_extent(extent)
                 .image_usage(
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSFER_SRC
+                        | vk::ImageUsageFlags::TRANSFER_DST,
                 )
                 .image_sharing_mode(image_sharing_mode)
                 .queue_family_indices(&queue_family_indices)
@@ -1231,7 +1240,7 @@ impl Gr {
     /// grDitherMode - specify the dither mode
     pub fn dither_mode(&mut self, mode: DitherMode) {
         self.state.dither_mode = mode;
-        log::debug!("Dither mode set to: {:?}", mode);
+        log::trace!("Dither mode set to: {:?}", mode);
     }
 
     /// grColorMask - enable/disable writing to the color and alpha buffers
@@ -1291,7 +1300,7 @@ impl Gr {
     /// - LowerLeft: Y increases upward (OpenGL-style)
     pub fn sst_origin(&mut self, origin: OriginLocation) {
         self.state.origin = origin;
-        log::debug!("SST origin set to: {:?}", origin);
+        log::trace!("SST origin set to: {:?}", origin);
     }
 
     // ==================== Constant Color Functions ====================
@@ -1307,13 +1316,13 @@ impl Gr {
     /// grFogMode - set the fog mode
     pub fn fog_mode(&mut self, mode: FogMode) {
         self.state.fog_mode = mode;
-        log::debug!("Fog mode set to: {:?}", mode);
+        log::trace!("Fog mode set to: {:?}", mode);
     }
 
     /// grFogColorValue - set the fog color
     pub fn fog_color_value(&mut self, color: Color) {
         self.state.fog_color = color;
-        log::debug!("Fog color set to: {:?}", color);
+        log::trace!("Fog color set to: {:?}", color);
     }
 
     // ==================== Chromakey Functions ====================
@@ -1324,13 +1333,13 @@ impl Gr {
         // Track chromakey changes for batched rendering
         let enabled = matches!(mode, ChromakeyMode::Enable);
         self.vertex_batch.set_chromakey(enabled);
-        log::debug!("Chromakey mode set to: {:?}", mode);
+        log::trace!("Chromakey mode set to: {:?}", mode);
     }
 
     /// grChromakeyValue - set the chroma-key reference color
     pub fn chromakey_value(&mut self, color: Color) {
         self.state.chromakey_value = color;
-        log::debug!("Chromakey value set to: {:?}", color);
+        log::trace!("Chromakey value set to: {:?}", color);
     }
 
     // ==================== Alpha Test Functions ====================
@@ -1338,13 +1347,13 @@ impl Gr {
     /// grAlphaTestFunction - set the alpha test function
     pub fn alpha_test_function(&mut self, function: CmpFnc) {
         self.state.alpha_test_function = function;
-        log::debug!("Alpha test function set to: {:?}", function);
+        log::trace!("Alpha test function set to: {:?}", function);
     }
 
     /// grAlphaTestReferenceValue - set the alpha test reference value
     pub fn alpha_test_reference_value(&mut self, value: Alpha) {
         self.state.alpha_test_reference = value;
-        log::debug!("Alpha test reference set to: {:?}", value);
+        log::trace!("Alpha test reference set to: {:?}", value);
     }
 
     // ==================== Enable/Disable Functions ====================
@@ -2970,7 +2979,7 @@ impl Gr {
 
     /// Upload LFB write data to the Vulkan framebuffer
     fn lfb_upload_to_framebuffer(&mut self) {
-        let app = match self.vulkan_app.as_mut() {
+        let _app = match self.vulkan_app.as_mut() {
             Some(app) => app,
             None => return,
         };
@@ -2982,45 +2991,9 @@ impl Gr {
         let origin = self.lfb_lock_state.origin;
         let src_data = &self.lfb_lock_state.data;
 
-        unsafe {
-            app.device
-                .queue_wait_idle(app.graphics_queue)
-                .expect("Failed to wait for graphics queue");
-
-            // Wait for and reset fence before acquire (fence might be signaled from previous frame)
-            app.device
-                .wait_for_fences(&[app.in_flight_fence], true, 0)
-                .ok(); // Ignore timeout - fence might not be signaled yet
-            app.device
-                .reset_fences(&[app.in_flight_fence])
-                .expect("Failed to reset fence before acquire");
-
-            // Acquire next swapchain image with retry loop
-            loop {
-                match app.swapchain_loader.acquire_next_image(
-                    app.swapchain,
-                    1_000_000_000,
-                    vk::Semaphore::null(),
-                    app.in_flight_fence,
-                ) {
-                    Ok((image_index, _)) => {
-                        app.current_image_index = image_index;
-                        app.device
-                            .wait_for_fences(&[app.in_flight_fence], true, u64::MAX)
-                            .expect("Failed to wait for acquire fence");
-                        app.device
-                            .reset_fences(&[app.in_flight_fence])
-                            .expect("Failed to reset fence after acquire");
-                        break;
-                    }
-                    Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        continue;
-                    }
-                    Err(e) => panic!("Failed to acquire next image: {:?}", e),
-                }
-            }
-        }
+        // No need to acquire swapchain image here anymore!
+        // We will just push vertices to draw a textured quad in the active vertex batch,
+        // and let buffer_swap handle presentation and swapchain acquisition.
 
         // Determine bytes per pixel based on write mode
         let bytes_per_pixel: u32 = match write_mode {
@@ -3032,8 +3005,8 @@ impl Gr {
             _ => 2,
         };
 
-        // Convert source data to BGRA8888
-        let mut bgra_data = vec![0u8; (width * height * 4) as usize];
+        // Convert source data to RGBA8888
+        let mut rgba_data = vec![0u8; (width * height * 4) as usize];
         for y in 0..height {
             // Handle Y-flip for lower-left origin
             let src_y = if origin == glidesys::OriginLocation::LowerLeft {
@@ -3046,7 +3019,7 @@ impl Gr {
                 let src_idx = (src_y * stride + x * bytes_per_pixel) as usize;
                 let dst_idx = ((y * width + x) * 4) as usize;
 
-                if dst_idx + 3 < bgra_data.len() {
+                if dst_idx + 3 < rgba_data.len() {
                     let (r, g, b, a) = match write_mode {
                         glidesys::LfbWriteMode::Rgb565 | glidesys::LfbWriteMode::Any => {
                             if src_idx + 1 < src_data.len() {
@@ -3127,226 +3100,64 @@ impl Gr {
                         _ => (0, 0, 0, 255),
                     };
 
-                    // Write as BGRA
-                    bgra_data[dst_idx] = b;
-                    bgra_data[dst_idx + 1] = g;
-                    bgra_data[dst_idx + 2] = r;
-                    bgra_data[dst_idx + 3] = a;
+                    // Write as RGBA
+                    rgba_data[dst_idx] = r;
+                    rgba_data[dst_idx + 1] = g;
+                    rgba_data[dst_idx + 2] = b;
+                    rgba_data[dst_idx + 3] = a;
                 }
             }
         }
 
-        unsafe {
-            let image_size = bgra_data.len() as vk::DeviceSize;
+        let tex_addr = u32::MAX;
 
-            // Create staging buffer
-            let buffer_info = vk::BufferCreateInfo::default()
-                .size(image_size)
-                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-            let staging_buffer = app
-                .device
-                .create_buffer(&buffer_info, None)
-                .expect("Failed to create staging buffer");
-
-            let mem_requirements = app.device.get_buffer_memory_requirements(staging_buffer);
-
-            // Find host-visible memory type
-            let instance = &self.vulkan_instance.instance;
-            let mem_properties =
-                instance.get_physical_device_memory_properties(app.physical_device);
-
-            let mut memory_type_index = 0;
-            for i in 0..mem_properties.memory_type_count {
-                if (mem_requirements.memory_type_bits & (1 << i)) != 0
-                    && mem_properties.memory_types[i as usize]
-                        .property_flags
-                        .contains(
-                            vk::MemoryPropertyFlags::HOST_VISIBLE
-                                | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        )
-                {
-                    memory_type_index = i;
-                    break;
-                }
-            }
-
-            let alloc_info = vk::MemoryAllocateInfo::default()
-                .allocation_size(mem_requirements.size)
-                .memory_type_index(memory_type_index);
-
-            let staging_memory = app
-                .device
-                .allocate_memory(&alloc_info, None)
-                .expect("Failed to allocate staging memory");
-
-            app.device
-                .bind_buffer_memory(staging_buffer, staging_memory, 0)
-                .expect("Failed to bind staging buffer memory");
-
-            // Copy data to staging buffer
-            let data_ptr = app
-                .device
-                .map_memory(staging_memory, 0, image_size, vk::MemoryMapFlags::empty())
-                .expect("Failed to map memory");
-
-            std::ptr::copy_nonoverlapping(bgra_data.as_ptr(), data_ptr as *mut u8, bgra_data.len());
-
-            app.device.unmap_memory(staging_memory);
-
-            // Create command buffer for copy
-            let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
-                .command_pool(app.command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-
-            let cmd_buffers = app
-                .device
-                .allocate_command_buffers(&cmd_alloc_info)
-                .expect("Failed to allocate command buffer");
-            let cmd = cmd_buffers[0];
-
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-            app.device
-                .begin_command_buffer(cmd, &begin_info)
-                .expect("Failed to begin command buffer");
-
-            // Get the target image (back buffer = current swapchain image)
-            let dst_image = app.swapchain_images[app.current_image_index as usize];
-
-            // Transition image layout for transfer
-            let barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(dst_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-
-            app.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-
-            // Copy buffer to image
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .image_extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                });
-
-            app.device.cmd_copy_buffer_to_image(
-                cmd,
-                staging_buffer,
-                dst_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
-
-            // Transition image to present layout
-            let barrier_present = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(dst_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ);
-
-            app.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier_present],
-            );
-
-            app.device
-                .end_command_buffer(cmd)
-                .expect("Failed to end command buffer");
-
-            // Submit without fence (fence is used for acquire only in LFB path)
-            let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
-
-            app.device
-                .queue_submit(app.graphics_queue, &[submit_info], vk::Fence::null())
-                .expect("Failed to submit copy command");
-
-            app.device
-                .queue_wait_idle(app.graphics_queue)
-                .expect("Failed to wait for queue");
-
-            // Present the image to return it to the swapchain pool
-            let swapchains = [app.swapchain];
-            let image_indices = [app.current_image_index];
-            let present_info = vk::PresentInfoKHR::default()
-                .swapchains(&swapchains)
-                .image_indices(&image_indices);
-
-            let _ = app
-                .swapchain_loader
-                .queue_present(app.graphics_queue, &present_info);
-
-            // Signal the fence so buffer_swap's wait_for_fences won't hang if called next
-            let empty_submit = vk::SubmitInfo::default();
-            app.device
-                .queue_submit(app.graphics_queue, &[empty_submit], app.in_flight_fence)
-                .expect("Failed to signal fence");
-
-            // Cleanup
-            app.device
-                .free_command_buffers(app.command_pool, &cmd_buffers);
-            app.device.destroy_buffer(staging_buffer, None);
-            app.device.free_memory(staging_memory, None);
-
-            log::debug!(
-                "LFB write data uploaded to framebuffer ({}x{})",
+        // Upload to cache
+        if let Some(app) = &mut self.vulkan_app {
+            app.texture_cache.upload_rgba8(
+                &app.device,
+                &self.vulkan_instance.instance,
+                app.physical_device,
+                app.command_pool,
+                app.graphics_queue,
+                tex_addr,
                 width,
-                height
+                height,
+                &rgba_data,
             );
         }
+
+        // Draw textured quad representing the LFB onto the swapchain
+        // This is safe and avoids requiring VK_IMAGE_USAGE_TRANSFER_DST_BIT on the swapchain.
+        let w_f32 = width as f32;
+        let h_f32 = height as f32;
+
+        let (s_max, t_max) = if width >= height {
+            (256.0, 256.0 * h_f32 / w_f32)
+        } else {
+            (256.0 * w_f32 / h_f32, 256.0)
+        };
+
+        // let z = 1.0; // Draw on top of everything
+        // let w = 1.0;
+        let c = [1.0, 1.0, 1.0, 1.0];
+
+        let v0 = utility::vertex::GpuVertex::new(0.0, 0.0, c[0], c[1], c[2], c[3], 0.0, 0.0);
+        let v1 = utility::vertex::GpuVertex::new(w_f32, 0.0, c[0], c[1], c[2], c[3], s_max, 0.0);
+        let v2 =
+            utility::vertex::GpuVertex::new(w_f32, h_f32, c[0], c[1], c[2], c[3], s_max, t_max);
+        let v3 = utility::vertex::GpuVertex::new(0.0, h_f32, c[0], c[1], c[2], c[3], 0.0, t_max);
+
+        // Ensure we draw using standard buffer_swap approach, turning off chromakey for LFB draws
+        self.vertex_batch.set_texture(tex_addr);
+        self.vertex_batch.set_chromakey(false);
+        self.vertex_batch.push_triangle(v0.clone(), v1, v2.clone());
+        self.vertex_batch.push_triangle(v0, v2, v3);
     }
 }
 
 #[cfg(target_os = "linux")]
 impl WindowInteraction for Gr {
-    fn draw_frame(&mut self, delta_time: f32) {
+    fn draw_frame(&mut self, _delta_time: f32) {
         // todo!()
     }
 

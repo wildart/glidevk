@@ -631,6 +631,75 @@ impl TextureCache {
         }
     }
 
+    /// Upload a raw RGBA8 texture to the cache
+    pub fn upload_rgba8(
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        texture_addr: u32,
+        width: u32,
+        height: u32,
+        rgba_data: &[u8],
+    ) {
+        // Create new Vulkan texture from RGBA data
+        let texture = VulkanTexture::new(
+            device,
+            instance,
+            physical_device,
+            command_pool,
+            queue,
+            width,
+            height,
+            rgba_data,
+        );
+
+        // Allocate descriptor set
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(std::slice::from_ref(&self.descriptor_set_layout));
+
+        let descriptor_set = unsafe {
+            device
+                .allocate_descriptor_sets(&alloc_info)
+                .expect("Failed to allocate descriptor set")[0]
+        };
+
+        // Update descriptor set
+        let image_info = vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(texture.view)
+            .sampler(self.sampler);
+
+        let descriptor_write = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&image_info));
+
+        unsafe {
+            device.update_descriptor_sets(&[descriptor_write], &[]);
+        }
+
+        // Remove old texture and descriptor set if they exist
+        if let Some(old_texture) = self.textures.remove(&texture_addr) {
+            old_texture.destroy(device);
+        }
+        if let Some(old_descriptor_set) = self.descriptor_sets.remove(&texture_addr) {
+            unsafe {
+                device
+                    .free_descriptor_sets(self.descriptor_pool, &[old_descriptor_set])
+                    .unwrap_or(());
+            }
+        }
+
+        self.textures.insert(texture_addr, texture);
+        self.descriptor_sets.insert(texture_addr, descriptor_set);
+    }
+
     /// Create the placeholder texture (1x1 white pixel)
     pub fn create_placeholder(
         &mut self,
