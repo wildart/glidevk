@@ -41,7 +41,7 @@ pub fn check_validation_layer_support(
             .enumerate_instance_layer_properties()
             .expect("Failed to enumerate Instance Layers Properties");
 
-        if layer_properties.len() <= 0 {
+        if layer_properties.is_empty() {
             log::warn!("No available layers.");
             return false;
         } else {

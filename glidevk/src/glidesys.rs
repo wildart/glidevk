@@ -340,9 +340,11 @@ impl TexInfo {
         self.format
     }
 
-    pub fn get_data(&self) -> &mut [u8] {
+    /// # Safety
+    /// `self.data` must point to a valid buffer of `self.get_size()` bytes.
+    pub unsafe fn get_data(&self) -> &[u8] {
         let size = self.get_size();
-        unsafe { std::slice::from_raw_parts_mut(self.data as *mut u8, size) }
+        unsafe { std::slice::from_raw_parts(self.data as *const u8, size) }
     }
 }
 

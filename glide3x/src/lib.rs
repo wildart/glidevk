@@ -1,4 +1,4 @@
-#![allow(non_snake_case, dead_code)]
+#![allow(non_snake_case, dead_code, clippy::not_unsafe_ptr_arg_deref)]
 
 use lazy_static::lazy_static;
 use log::{debug, trace};
@@ -166,7 +166,7 @@ macro_rules! define_vertex_array_function {
                     concat!(stringify!($api), "(mode={:?}, count={:?})"),
                     mode, count
                 );
-                gr.$func(mode, count, pointers);
+                unsafe { gr.$func(mode, count, pointers); }
             } else {
                 debug!(concat!(stringify!($api), "() called before grGlideInit!"));
             }
@@ -189,7 +189,7 @@ macro_rules! define_vertex_array_function {
                     count,
                     stride
                 );
-                gr.$func(mode, count, pointers, stride);
+                unsafe { gr.$func(mode, count, pointers, stride); }
             } else {
                 debug!(concat!(stringify!($api), "() called before grGlideInit!"));
             }
@@ -341,10 +341,10 @@ define_ptr_function!(tex_download_mipmap => grTexDownloadMipMap(tmu: ChipID, sta
 define_ptr_function!(tex_texture_mem_required => grTexTextureMemRequired(even_odd: FxU32; info: &TexInfo) -> FxU32);
 
 // Standalone API functions - implementations in glidevk::api
-define_standalone!(glidevk::api::color_combine => grColorCombine(function: CombineFunction, factor: CombineFactor, local: CombineLocal, other: CombineOther, invert: FxBool));
+define_function!(color_combine => grColorCombine(function: CombineFunction, factor: CombineFactor, local: CombineLocal, other: CombineOther, invert: FxBool));
 define_function!(vertex_layout => grVertexLayout(param: FxU32, offset: FxU32, mode: FxU32));
 define_function!(reset => grReset(what: FxU32) -> FxBool);
-define_standalone!(glidevk::api::alpha_combine => grAlphaCombine(function: CombineFunction, factor: CombineFactor, local: CombineLocal, other: CombineOther, invert: FxBool));
+define_function!(alpha_combine => grAlphaCombine(function: CombineFunction, factor: CombineFactor, local: CombineLocal, other: CombineOther, invert: FxBool));
 define_standalone!(glidevk::api::coordinate_space => grCoordinateSpace(mode: CoordinateSpaceMode));
 define_function!(dither_mode => grDitherMode(mode: DitherMode));
 define_standalone!(glidevk::api::finish => grFinish());
@@ -352,7 +352,7 @@ define_standalone!(glidevk::api::get_string => grGetString(pname: EnvironmentInf
 // Explicit grGet implementation to log return values
 #[no_mangle]
 pub extern "system" fn grGet(pname: GrGetParam, plength: FxU32, params: *mut FxI32) -> FxU32 {
-    let result = glidevk::api::get(pname, plength, params);
+    let result = unsafe { glidevk::api::get(pname, plength, params) };
     let value = if !params.is_null() && result >= 4 {
         unsafe { *params }
     } else {
@@ -364,6 +364,11 @@ pub extern "system" fn grGet(pname: GrGetParam, plength: FxU32, params: *mut FxI
     );
     result
 }
-define_standalone!(glidevk::api::get_proc_address => grGetProcAddress(proc_name: *const std::ffi::c_char) -> GrProc);
+// Manual wrapper for unsafe get_proc_address
+#[no_mangle]
+pub extern "system" fn grGetProcAddress(proc_name: *const std::ffi::c_char) -> GrProc {
+    debug!("grGetProcAddress(proc_name={:?})", proc_name);
+    unsafe { glidevk::api::get_proc_address(proc_name) }
+}
 define_standalone!(glidevk::api::load_gamma_table => grLoadGammaTable(num_entries: FxU32, red: *const FxU32, green: *const FxU32, blue: *const FxU32));
 define_standalone!(glidevk::api::gamma_correction_rgb => guGammaCorrectionRGB(gamma_red: f32, gamma_green: f32, gamma_blue: f32));

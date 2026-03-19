@@ -12,6 +12,11 @@ layout(push_constant) uniform PushConstants {
     vec2 textureSize;     // Current texture width and height
     vec3 chromakeyColor;  // Chromakey color (RGB)
     float chromakeyEnabled; // 1.0 = enabled, 0.0 = disabled
+    int colorCombineFunction; // CombineFunction enum
+    int colorCombineOther;    // CombineOther enum
+    int alphaCombineFunction; // CombineFunction enum
+    int alphaCombineLocal;    // CombineLocal enum
+    vec4 constantColor;       // Constant color (RGBA, normalized)
 } pc;
 
 // Outputs to fragment shader

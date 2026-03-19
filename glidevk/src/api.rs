@@ -15,29 +15,6 @@ static EXTENSION: &[u8] = b" \0";
 /// GrProc type - function pointer for extension functions
 pub type GrProc = Option<unsafe extern "C" fn()>;
 
-/// Color combine function (stub - always uses constant color in current implementation)
-pub fn color_combine(
-    _function: CombineFunction,
-    _factor: CombineFactor,
-    _local: CombineLocal,
-    _other: CombineOther,
-    _invert: FxBool,
-) {
-    // Current implementation always uses constant color for drawing
-    // Full color combine support would require shader modifications
-}
-
-/// Alpha combine function (stub - always uses constant alpha in current implementation)
-pub fn alpha_combine(
-    _function: CombineFunction,
-    _factor: CombineFactor,
-    _local: CombineLocal,
-    _other: CombineOther,
-    _invert: FxBool,
-) {
-    // Current implementation always uses constant alpha for drawing
-    // Full alpha combine support would require shader modifications
-}
 
 /// Coordinate space function (stub - current implementation uses window coordinates)
 pub fn coordinate_space(_mode: CoordinateSpaceMode) {
@@ -64,8 +41,10 @@ pub fn get_string(pname: EnvironmentInfo) -> *const std::ffi::c_char {
 }
 
 /// Get function - retrieves various Glide parameters
+/// # Safety
+/// `params` must point to a valid buffer of at least `plength` bytes, or be null.
 /// Reference: docs/glide3x/cvg/glide3/src/diget.c
-pub fn get(pname: GrGetParam, plength: FxU32, params: *mut FxI32) -> FxU32 {
+pub unsafe fn get(pname: GrGetParam, plength: FxU32, params: *mut FxI32) -> FxU32 {
     if params.is_null() {
         return 0;
     }
@@ -469,7 +448,9 @@ pub fn get(pname: GrGetParam, plength: FxU32, params: *mut FxI32) -> FxU32 {
 }
 
 /// GetProcAddress function - retrieves extension function pointers
-pub fn get_proc_address(proc_name: *const std::ffi::c_char) -> GrProc {
+/// # Safety
+/// `proc_name` must be a valid null-terminated C string or null.
+pub unsafe fn get_proc_address(proc_name: *const std::ffi::c_char) -> GrProc {
     // Log what function is being requested
     if !proc_name.is_null() {
         let name = unsafe { std::ffi::CStr::from_ptr(proc_name) };

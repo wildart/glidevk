@@ -98,6 +98,20 @@ pub struct State {
     // Constant color
     constant_color: Color,
 
+    // Color combine state
+    color_combine_function: CombineFunction,
+    color_combine_factor: CombineFactor,
+    color_combine_local: CombineLocal,
+    color_combine_other: CombineOther,
+    color_combine_invert: bool,
+
+    // Alpha combine state
+    alpha_combine_function: CombineFunction,
+    alpha_combine_factor: CombineFactor,
+    alpha_combine_local: CombineLocal,
+    alpha_combine_other: CombineOther,
+    alpha_combine_invert: bool,
+
     // Fog state
     fog_mode: FogMode,
     fog_color: Color,
@@ -180,6 +194,18 @@ impl Default for State {
             origin: OriginLocation::UpperLeft,
             // Default constant color: opaque white
             constant_color: Color(0xFFFFFFFF),
+            // Default color combine: ScaleOther (texture * iterated)
+            color_combine_function: CombineFunction::ScaleOther,
+            color_combine_factor: CombineFactor::Local,
+            color_combine_local: CombineLocal::Iterated,
+            color_combine_other: CombineOther::Texture,
+            color_combine_invert: false,
+            // Default alpha combine: ScaleOther
+            alpha_combine_function: CombineFunction::ScaleOther,
+            alpha_combine_factor: CombineFactor::Local,
+            alpha_combine_local: CombineLocal::Iterated,
+            alpha_combine_other: CombineOther::Iterated,
+            alpha_combine_invert: false,
             // Default fog: disabled
             fog_mode: FogMode::Disable,
             fog_color: Color(0x00000000),
@@ -906,6 +932,18 @@ impl Gr {
             .chromakey_value
             .to_rgba_f(self.state.color_format);
 
+        // Capture constant color for combine unit
+        let (cc_r, cc_g, cc_b, cc_a) = self
+            .state
+            .constant_color
+            .to_rgba_f(self.state.color_format);
+
+        // Capture combine state
+        let color_combine_function = self.state.color_combine_function as i32;
+        let color_combine_other = self.state.color_combine_other as i32;
+        let alpha_combine_function = self.state.alpha_combine_function as i32;
+        let alpha_combine_local = self.state.alpha_combine_local as i32;
+
         if let Some(app) = &mut self.vulkan_app {
             unsafe {
                 // Wait for previous frame to complete
@@ -1043,6 +1081,11 @@ impl Gr {
                                 } else {
                                     0.0
                                 },
+                                color_combine_function,
+                                color_combine_other,
+                                alpha_combine_function,
+                                alpha_combine_local,
+                                constant_color: [cc_r, cc_g, cc_b, cc_a],
                             };
                             let push_data = std::slice::from_raw_parts(
                                 &push_constants as *const _ as *const u8,
@@ -1309,6 +1352,54 @@ impl Gr {
     pub fn constant_color_value(&mut self, color: Color) {
         self.state.constant_color = color;
         log::trace!("Constant color set to: {:?}", color);
+    }
+
+    // ==================== Color/Alpha Combine Functions ====================
+
+    /// grColorCombine - configure the color combine unit
+    ///
+    /// Determines how the final pixel color (RGB) is computed from local color,
+    /// "other" color (texture or iterated), and a scale factor.
+    pub fn color_combine(
+        &mut self,
+        function: CombineFunction,
+        factor: CombineFactor,
+        local: CombineLocal,
+        other: CombineOther,
+        invert: FxBool,
+    ) {
+        self.state.color_combine_function = function;
+        self.state.color_combine_factor = factor;
+        self.state.color_combine_local = local;
+        self.state.color_combine_other = other;
+        self.state.color_combine_invert = invert == FxBool::True;
+        log::trace!(
+            "Color combine: function={:?}, factor={:?}, local={:?}, other={:?}, invert={:?}",
+            function, factor, local, other, invert
+        );
+    }
+
+    /// grAlphaCombine - configure the alpha combine unit
+    ///
+    /// Determines how the final pixel alpha is computed from local alpha,
+    /// "other" alpha (texture or iterated), and a scale factor.
+    pub fn alpha_combine(
+        &mut self,
+        function: CombineFunction,
+        factor: CombineFactor,
+        local: CombineLocal,
+        other: CombineOther,
+        invert: FxBool,
+    ) {
+        self.state.alpha_combine_function = function;
+        self.state.alpha_combine_factor = factor;
+        self.state.alpha_combine_local = local;
+        self.state.alpha_combine_other = other;
+        self.state.alpha_combine_invert = invert == FxBool::True;
+        log::trace!(
+            "Alpha combine: function={:?}, factor={:?}, local={:?}, other={:?}, invert={:?}",
+            function, factor, local, other, invert
+        );
     }
 
     // ==================== Fog Functions ====================
@@ -1869,7 +1960,7 @@ impl Gr {
         );
 
         // Copy texture data from the TexInfo
-        let data = info.get_data().to_vec();
+        let data = unsafe { info.get_data() }.to_vec();
 
         // Invalidate any existing Vulkan texture at this address (content may have changed)
         if let Some(app) = &mut self.vulkan_app {
@@ -2212,7 +2303,7 @@ impl Gr {
     }
 
     /// grDrawVertexArray - draw primitives from an array of vertex pointers
-    pub fn draw_vertex_array(
+    pub unsafe fn draw_vertex_array(
         &mut self,
         mode: PrimitiveType,
         count: FxU32,
@@ -3683,6 +3774,46 @@ mod tests {
         // Default config is 8MB per TMU
         let expected = gr.config().texture.memory.bytes() - 8;
         assert_eq!(gr.tex_max_address(ChipID::Tmu0), expected);
+    }
+
+    #[test]
+    fn test_color_combine() {
+        let mut gr = create_test_gr();
+        gr.color_combine(
+            CombineFunction::Local,
+            CombineFactor::One,
+            CombineLocal::Constant,
+            CombineOther::Iterated,
+            FxBool::True,
+        );
+        assert!(matches!(
+            gr.state.color_combine_function,
+            CombineFunction::Local
+        ));
+        assert!(matches!(gr.state.color_combine_factor, CombineFactor::One));
+        assert!(matches!(gr.state.color_combine_local, CombineLocal::Constant));
+        assert!(matches!(gr.state.color_combine_other, CombineOther::Iterated));
+        assert!(gr.state.color_combine_invert);
+    }
+
+    #[test]
+    fn test_alpha_combine() {
+        let mut gr = create_test_gr();
+        gr.alpha_combine(
+            CombineFunction::ScaleOther,
+            CombineFactor::Local,
+            CombineLocal::Iterated,
+            CombineOther::Texture,
+            FxBool::False,
+        );
+        assert!(matches!(
+            gr.state.alpha_combine_function,
+            CombineFunction::ScaleOther
+        ));
+        assert!(matches!(gr.state.alpha_combine_factor, CombineFactor::Local));
+        assert!(matches!(gr.state.alpha_combine_local, CombineLocal::Iterated));
+        assert!(matches!(gr.state.alpha_combine_other, CombineOther::Texture));
+        assert!(!gr.state.alpha_combine_invert);
     }
 
     // ==================== grVertexLayout Tests ====================

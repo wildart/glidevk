@@ -18,8 +18,12 @@ else
     BUILD_DIR = debug
 endif
 
+.PHONY: shaders
+shaders:
+	cd shaders && bash compile.sh
+
 .PHONY: build
-build:
+build: shaders
 	cargo build --workspace $(RELEASE_FLAG)
 
 .PHONY: build-win

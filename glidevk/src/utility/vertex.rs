@@ -158,6 +158,13 @@ pub struct PushConstants {
     pub texture_size: [f32; 2],
     pub chromakey_color: [f32; 3],
     pub chromakey_enabled: f32, // 1.0 = enabled, 0.0 = disabled
+    // Color/alpha combine mode (integer enums passed as i32)
+    pub color_combine_function: i32,
+    pub color_combine_other: i32,
+    pub alpha_combine_function: i32,
+    pub alpha_combine_local: i32,
+    // Constant color (RGBA, normalized 0.0-1.0)
+    pub constant_color: [f32; 4],
 }
 
 /// A single draw call with its associated texture and render state
@@ -417,8 +424,10 @@ mod tests {
 
     #[test]
     fn test_push_constants_size() {
-        // Push constants: screen_size(8) + texture_size(8) + chromakey_color(12) + chromakey_enabled(4) = 32 bytes
-        assert_eq!(std::mem::size_of::<PushConstants>(), 32);
+        // Push constants: screen_size(8) + texture_size(8) + chromakey_color(12) + chromakey_enabled(4)
+        //   + color_combine_function(4) + color_combine_other(4) + alpha_combine_function(4) + alpha_combine_local(4)
+        //   + constant_color(16) = 64 bytes
+        assert_eq!(std::mem::size_of::<PushConstants>(), 64);
     }
 
     #[test]
