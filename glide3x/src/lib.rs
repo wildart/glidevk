@@ -29,6 +29,9 @@ macro_rules! define_function {
     ($func:ident => $api:ident($($arg:ident: $arg_type:ty),*)) => {
         define_function!($func => $api($($arg: $arg_type),*) -> ());
     };
+    ($func:ident => $api:ident($($arg:ident: $arg_type:ty),*), trace) => {
+        define_function!($func => $api($($arg: $arg_type),*) -> (), trace);
+    };
     ($func:ident => $api:ident($($arg:ident: $arg_type:ty),*), $debug:expr) => {
         define_function!($func => $api($($arg: $arg_type),*) -> (), $debug);
     };
@@ -52,6 +55,19 @@ macro_rules! define_function {
     };
     ($func:ident => $api:ident($($arg:ident: $arg_type:ty),*) -> $type:ty) => {
         define_function!($func => $api($($arg: $arg_type),*) -> $type, concat!($(stringify!($arg), "={:?}, "),*));
+    };
+    ($func:ident => $api:ident($($arg:ident: $arg_type:ty),*) -> $type:ty, trace) => {
+        #[no_mangle]
+        pub extern "system" fn $api($($arg: $arg_type),*) -> $type {
+            let mut gr = GR.lock().unwrap();
+            if let Some(gr) = (*gr).as_mut() {
+                trace!(concat!(stringify!($api), "(", $(stringify!($arg), "={:?}, "),*, ")"), $($arg),*);
+                gr.$func($($arg),*)
+            } else {
+                debug!(concat!(stringify!($api), "() called before grGlideInit!"));
+                Default::default()
+            }
+        }
     };
     ($func:ident => $api:ident($($arg:ident: $arg_type:ty),*) -> $type:ty, $debug:expr) => {
         #[no_mangle]
@@ -298,11 +314,11 @@ define_function!(depth_buffer_mode => grDepthBufferMode(mode: DepthBufferMode));
 define_function!(depth_buffer_function => grDepthBufferFunction(fnc: CmpFnc));
 define_function!(depth_mask => grDepthMask(mask: FxBool));
 define_function!(color_mask => grColorMask(rgb: FxBool, alpha: FxBool));
-define_function!(alpha_blend_function => grAlphaBlendFunction(rgb_src: AlphaBlendFnc, rgb_dst: AlphaBlendFnc, alpha_src: AlphaBlendFnc, alpha_dst: AlphaBlendFnc));
+define_function!(alpha_blend_function => grAlphaBlendFunction(rgb_src: AlphaBlendFnc, rgb_dst: AlphaBlendFnc, alpha_src: AlphaBlendFnc, alpha_dst: AlphaBlendFnc), trace);
 define_function!(cull_mode => grCullMode(mode: CullMode));
 define_function!(render_buffer => grRenderBuffer(buffer: Buffer));
 define_function!(sst_origin => grSstOrigin(origin: OriginLocation));
-define_function!(constant_color_value => grConstantColorValue(color: Color));
+define_function!(constant_color_value => grConstantColorValue(color: Color), trace);
 define_function!(fog_mode => grFogMode(mode: FogMode));
 define_function!(fog_color_value => grFogColorValue(color: Color));
 define_function!(chromakey_mode => grChromakeyMode(mode: ChromakeyMode));
@@ -344,9 +360,9 @@ define_ptr_function!(tex_texture_mem_required => grTexTextureMemRequired(even_od
 define_function!(color_combine => grColorCombine(function: CombineFunction, factor: CombineFactor, local: CombineLocal, other: CombineOther, invert: FxBool));
 define_function!(vertex_layout => grVertexLayout(param: FxU32, offset: FxU32, mode: FxU32));
 define_function!(reset => grReset(what: FxU32) -> FxBool);
-define_function!(alpha_combine => grAlphaCombine(function: CombineFunction, factor: CombineFactor, local: CombineLocal, other: CombineOther, invert: FxBool));
+define_function!(alpha_combine => grAlphaCombine(function: CombineFunction, factor: CombineFactor, local: CombineLocal, other: CombineOther, invert: FxBool), trace);
 define_standalone!(glidevk::api::coordinate_space => grCoordinateSpace(mode: CoordinateSpaceMode));
-define_function!(dither_mode => grDitherMode(mode: DitherMode));
+define_function!(dither_mode => grDitherMode(mode: DitherMode), trace);
 define_standalone!(glidevk::api::finish => grFinish());
 define_standalone!(glidevk::api::get_string => grGetString(pname: EnvironmentInfo) -> *const std::ffi::c_char);
 // Explicit grGet implementation to log return values

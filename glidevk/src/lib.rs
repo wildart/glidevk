@@ -3092,7 +3092,7 @@ impl Gr {
             return FxBool::False;
         }
 
-        // For write locks, upload data to framebuffer and present immediately
+        // For write locks, upload data directly to swapchain image and present
         if lock_type == glidesys::LfbLock::WriteOnly {
             self.lfb_upload_to_framebuffer();
         }
@@ -3104,9 +3104,10 @@ impl Gr {
         FxBool::True
     }
 
-    /// Upload LFB write data to the Vulkan framebuffer
+    /// Upload LFB write data directly to the swapchain image and present.
+    /// Uses vkCmdCopyBufferToImage to bypass the shader pipeline entirely.
     fn lfb_upload_to_framebuffer(&mut self) {
-        let _app = match self.vulkan_app.as_mut() {
+        let app = match self.vulkan_app.as_mut() {
             Some(app) => app,
             None => return,
         };
@@ -3118,9 +3119,43 @@ impl Gr {
         let origin = self.lfb_lock_state.origin;
         let src_data = &self.lfb_lock_state.data;
 
-        // No need to acquire swapchain image here anymore!
-        // We will just push vertices to draw a textured quad in the active vertex batch,
-        // and let buffer_swap handle presentation and swapchain acquisition.
+        let frame = app.current_frame;
+        unsafe {
+            app.device
+                .queue_wait_idle(app.graphics_queue)
+                .expect("Failed to wait for graphics queue");
+            app.device
+                .wait_for_fences(&[app.in_flight_fences[frame]], true, 0)
+                .ok();
+            app.device
+                .reset_fences(&[app.in_flight_fences[frame]])
+                .expect("Failed to reset fence before acquire");
+
+            loop {
+                match app.swapchain_loader.acquire_next_image(
+                    app.swapchain,
+                    1_000_000_000,
+                    vk::Semaphore::null(),
+                    app.in_flight_fences[frame],
+                ) {
+                    Ok((image_index, _)) => {
+                        app.current_image_index = image_index;
+                        app.device
+                            .wait_for_fences(&[app.in_flight_fences[frame]], true, u64::MAX)
+                            .expect("Failed to wait for acquire fence");
+                        app.device
+                            .reset_fences(&[app.in_flight_fences[frame]])
+                            .expect("Failed to reset fence after acquire");
+                        break;
+                    }
+                    Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(e) => panic!("Failed to acquire next image: {:?}", e),
+                }
+            }
+        }
 
         // Determine bytes per pixel based on write mode
         let bytes_per_pixel: u32 = match write_mode {
@@ -3132,10 +3167,9 @@ impl Gr {
             _ => 2,
         };
 
-        // Convert source data to RGBA8888
-        let mut rgba_data = vec![0u8; (width * height * 4) as usize];
+        // Convert source data to BGRA8888 (matching swapchain format B8G8R8A8_UNORM)
+        let mut bgra_data = vec![0u8; (width * height * 4) as usize];
         for y in 0..height {
-            // Handle Y-flip for lower-left origin
             let src_y = if origin == glidesys::OriginLocation::LowerLeft {
                 height - 1 - y
             } else {
@@ -3146,7 +3180,7 @@ impl Gr {
                 let src_idx = (src_y * stride + x * bytes_per_pixel) as usize;
                 let dst_idx = ((y * width + x) * 4) as usize;
 
-                if dst_idx + 3 < rgba_data.len() {
+                if dst_idx + 3 < bgra_data.len() {
                     let (r, g, b, a) = match write_mode {
                         glidesys::LfbWriteMode::Rgb565 | glidesys::LfbWriteMode::Any => {
                             if src_idx + 1 < src_data.len() {
@@ -3202,24 +3236,14 @@ impl Gr {
                         }
                         glidesys::LfbWriteMode::Rgb888 => {
                             if src_idx + 2 < src_data.len() {
-                                (
-                                    src_data[src_idx + 2], // R
-                                    src_data[src_idx + 1], // G
-                                    src_data[src_idx],     // B
-                                    255u8,
-                                )
+                                (src_data[src_idx + 2], src_data[src_idx + 1], src_data[src_idx], 255u8)
                             } else {
                                 (0, 0, 0, 255)
                             }
                         }
                         glidesys::LfbWriteMode::Argb8888 => {
                             if src_idx + 3 < src_data.len() {
-                                (
-                                    src_data[src_idx + 2], // R
-                                    src_data[src_idx + 1], // G
-                                    src_data[src_idx],     // B
-                                    src_data[src_idx + 3], // A
-                                )
+                                (src_data[src_idx + 2], src_data[src_idx + 1], src_data[src_idx], src_data[src_idx + 3])
                             } else {
                                 (0, 0, 0, 255)
                             }
@@ -3227,58 +3251,182 @@ impl Gr {
                         _ => (0, 0, 0, 255),
                     };
 
-                    // Write as RGBA
-                    rgba_data[dst_idx] = r;
-                    rgba_data[dst_idx + 1] = g;
-                    rgba_data[dst_idx + 2] = b;
-                    rgba_data[dst_idx + 3] = a;
+                    // Write as BGRA (matching swapchain B8G8R8A8_UNORM)
+                    bgra_data[dst_idx] = b;
+                    bgra_data[dst_idx + 1] = g;
+                    bgra_data[dst_idx + 2] = r;
+                    bgra_data[dst_idx + 3] = a;
                 }
             }
         }
 
-        let tex_addr = u32::MAX;
+        // Copy BGRA data directly to swapchain image via staging buffer
+        unsafe {
+            let image_size = bgra_data.len() as vk::DeviceSize;
 
-        // Upload to cache
-        if let Some(app) = &mut self.vulkan_app {
-            app.texture_cache.upload_rgba8(
-                &app.device,
-                &self.vulkan_instance.instance,
-                app.physical_device,
-                app.command_pool,
-                app.graphics_queue,
-                tex_addr,
-                width,
-                height,
-                &rgba_data,
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(image_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            let staging_buffer = app
+                .device
+                .create_buffer(&buffer_info, None)
+                .expect("Failed to create staging buffer");
+
+            let mem_requirements = app.device.get_buffer_memory_requirements(staging_buffer);
+
+            let instance = &self.vulkan_instance.instance;
+            let mem_properties =
+                instance.get_physical_device_memory_properties(app.physical_device);
+
+            let mut memory_type_index = 0;
+            for i in 0..mem_properties.memory_type_count {
+                if (mem_requirements.memory_type_bits & (1 << i)) != 0
+                    && mem_properties.memory_types[i as usize]
+                        .property_flags
+                        .contains(
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )
+                {
+                    memory_type_index = i;
+                    break;
+                }
+            }
+
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_requirements.size)
+                .memory_type_index(memory_type_index);
+
+            let staging_memory = app
+                .device
+                .allocate_memory(&alloc_info, None)
+                .expect("Failed to allocate staging memory");
+
+            app.device
+                .bind_buffer_memory(staging_buffer, staging_memory, 0)
+                .expect("Failed to bind staging buffer memory");
+
+            let data_ptr = app
+                .device
+                .map_memory(staging_memory, 0, image_size, vk::MemoryMapFlags::empty())
+                .expect("Failed to map memory");
+
+            std::ptr::copy_nonoverlapping(bgra_data.as_ptr(), data_ptr as *mut u8, bgra_data.len());
+
+            app.device.unmap_memory(staging_memory);
+
+            // Record command buffer: transition → copy → transition → present
+            let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(app.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+
+            let cmd_buffers = app
+                .device
+                .allocate_command_buffers(&cmd_alloc_info)
+                .expect("Failed to allocate command buffer");
+            let cmd = cmd_buffers[0];
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+            app.device.begin_command_buffer(cmd, &begin_info).expect("Failed to begin command buffer");
+
+            let dst_image = app.swapchain_images[app.current_image_index as usize];
+
+            // Transition to TRANSFER_DST
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(dst_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0, level_count: 1,
+                    base_array_layer: 0, layer_count: 1,
+                })
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+            app.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[], &[], &[barrier],
             );
+
+            // Copy buffer to image
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0, base_array_layer: 0, layer_count: 1,
+                })
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+
+            app.device.cmd_copy_buffer_to_image(
+                cmd, staging_buffer, dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region],
+            );
+
+            // Transition to PRESENT_SRC
+            let barrier_present = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(dst_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0, level_count: 1,
+                    base_array_layer: 0, layer_count: 1,
+                })
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ);
+
+            app.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[], &[], &[barrier_present],
+            );
+
+            app.device.end_command_buffer(cmd).expect("Failed to end command buffer");
+
+            // Submit and wait
+            let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
+            app.device
+                .queue_submit(app.graphics_queue, &[submit_info], vk::Fence::null())
+                .expect("Failed to submit copy command");
+
+            app.device.queue_wait_idle(app.graphics_queue).expect("Failed to wait for queue");
+
+            // Present
+            let swapchains = [app.swapchain];
+            let image_indices = [app.current_image_index];
+            let present_info = vk::PresentInfoKHR::default()
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+
+            let _ = app.swapchain_loader.queue_present(app.graphics_queue, &present_info);
+
+            // Signal fence so next buffer_swap won't hang
+            let empty_submit = vk::SubmitInfo::default();
+            app.device
+                .queue_submit(app.graphics_queue, &[empty_submit], app.in_flight_fences[frame])
+                .expect("Failed to signal fence");
+
+            // Cleanup
+            app.device.free_command_buffers(app.command_pool, &cmd_buffers);
+            app.device.destroy_buffer(staging_buffer, None);
+            app.device.free_memory(staging_memory, None);
+
+            log::debug!("LFB write uploaded to framebuffer ({}x{})", width, height);
         }
-
-        // Draw textured quad representing the LFB onto the swapchain
-        // This is safe and avoids requiring VK_IMAGE_USAGE_TRANSFER_DST_BIT on the swapchain.
-        let w_f32 = width as f32;
-        let h_f32 = height as f32;
-
-        let (s_max, t_max) = if width >= height {
-            (256.0, 256.0 * h_f32 / w_f32)
-        } else {
-            (256.0 * w_f32 / h_f32, 256.0)
-        };
-
-        // let z = 1.0; // Draw on top of everything
-        // let w = 1.0;
-        let c = [1.0, 1.0, 1.0, 1.0];
-
-        let v0 = utility::vertex::GpuVertex::new(0.0, 0.0, c[0], c[1], c[2], c[3], 0.0, 0.0);
-        let v1 = utility::vertex::GpuVertex::new(w_f32, 0.0, c[0], c[1], c[2], c[3], s_max, 0.0);
-        let v2 =
-            utility::vertex::GpuVertex::new(w_f32, h_f32, c[0], c[1], c[2], c[3], s_max, t_max);
-        let v3 = utility::vertex::GpuVertex::new(0.0, h_f32, c[0], c[1], c[2], c[3], 0.0, t_max);
-
-        // Ensure we draw using standard buffer_swap approach, turning off chromakey for LFB draws
-        self.vertex_batch.set_texture(tex_addr);
-        self.vertex_batch.set_chromakey(false);
-        self.vertex_batch.push_triangle(v0.clone(), v1, v2.clone());
-        self.vertex_batch.push_triangle(v0, v2, v3);
     }
 }
 
