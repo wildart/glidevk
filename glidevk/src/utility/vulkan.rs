@@ -403,12 +403,13 @@ pub struct VulkanApp {
     pub command_pool: vk::CommandPool,
     pub command_buffers: Vec<vk::CommandBuffer>,
 
-    // Synchronization objects
-    pub image_available_semaphore: vk::Semaphore,
-    pub render_finished_semaphore: vk::Semaphore,
-    pub in_flight_fence: vk::Fence,
+    // Synchronization objects (one per frame-in-flight)
+    pub image_available_semaphores: Vec<vk::Semaphore>,
+    pub render_finished_semaphores: Vec<vk::Semaphore>,
+    pub in_flight_fences: Vec<vk::Fence>,
 
     // Current frame state
+    pub current_frame: usize,
     pub current_image_index: u32,
 
     // Vertex buffer for dynamic geometry
@@ -518,11 +519,15 @@ impl Drop for VulkanApp {
                 .expect("Failed to wait for device idle");
 
             // Destroy sync objects
-            self.device
-                .destroy_semaphore(self.image_available_semaphore, None);
-            self.device
-                .destroy_semaphore(self.render_finished_semaphore, None);
-            self.device.destroy_fence(self.in_flight_fence, None);
+            for &sem in &self.image_available_semaphores {
+                self.device.destroy_semaphore(sem, None);
+            }
+            for &sem in &self.render_finished_semaphores {
+                self.device.destroy_semaphore(sem, None);
+            }
+            for &fence in &self.in_flight_fences {
+                self.device.destroy_fence(fence, None);
+            }
 
             // Destroy vertex buffer if present
             if let Some(ref vb) = self.vertex_buffer {

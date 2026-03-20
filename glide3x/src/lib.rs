@@ -189,7 +189,7 @@ macro_rules! define_vertex_array_function {
                     count,
                     stride
                 );
-                unsafe { gr.$func(mode, count, pointers, stride); }
+                gr.$func(mode, count, pointers, stride);
             } else {
                 debug!(concat!(stringify!($api), "() called before grGlideInit!"));
             }

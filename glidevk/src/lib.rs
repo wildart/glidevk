@@ -300,6 +300,11 @@ pub struct Gr {
 /// Maximum vertices per frame (enough for ~21k triangles)
 const MAX_VERTICES: usize = 65536;
 
+/// Maximum number of frames that can be rendered concurrently.
+/// Each frame-in-flight gets its own synchronization objects to avoid
+/// semaphore reuse while a previous frame is still being presented.
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
 impl Gr {
     pub fn init(window: Option<Window>) -> Gr {
         // Load configuration from glidevk.toml (or use defaults)
@@ -729,20 +734,42 @@ impl Gr {
             );
             log::debug!("Created command buffers");
 
-            // Create synchronization objects
+            // Create synchronization objects:
+            // - image_available + fences: per-frame-in-flight (indexed by current_frame)
+            // - render_finished: per-swapchain-image (indexed by acquired image_index)
+            //   because the swapchain holds the semaphore until the image is re-acquired
             let semaphore_info = vk::SemaphoreCreateInfo::default();
-            let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED); // Start signaled so first frame works
-
-            let image_available_semaphore = logical_device
-                .create_semaphore(&semaphore_info, None)
-                .expect("Failed to create image available semaphore");
-            let render_finished_semaphore = logical_device
-                .create_semaphore(&semaphore_info, None)
-                .expect("Failed to create render finished semaphore");
-            let in_flight_fence = logical_device
-                .create_fence(&fence_info, None)
-                .expect("Failed to create in-flight fence");
-            log::debug!("Created synchronization objects");
+            let fence_info =
+                vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+            let mut image_available_semaphores = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+            let mut in_flight_fences = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+            for _ in 0..MAX_FRAMES_IN_FLIGHT {
+                image_available_semaphores.push(unsafe {
+                    logical_device
+                        .create_semaphore(&semaphore_info, None)
+                        .expect("Failed to create image available semaphore")
+                });
+                in_flight_fences.push(unsafe {
+                    logical_device
+                        .create_fence(&fence_info, None)
+                        .expect("Failed to create in-flight fence")
+                });
+            }
+            let swapchain_image_count = swapchain_images.len();
+            let mut render_finished_semaphores =
+                Vec::with_capacity(swapchain_image_count);
+            for _ in 0..swapchain_image_count {
+                render_finished_semaphores.push(unsafe {
+                    logical_device
+                        .create_semaphore(&semaphore_info, None)
+                        .expect("Failed to create render finished semaphore")
+                });
+            }
+            log::debug!(
+                "Created synchronization objects ({} frames in flight, {} swapchain images)",
+                MAX_FRAMES_IN_FLIGHT,
+                swapchain_image_count
+            );
 
             // Create vertex buffer for dynamic geometry
             let vertex_buffer_size = (MAX_VERTICES
@@ -787,9 +814,10 @@ impl Gr {
                 command_pool,
                 command_buffers,
 
-                image_available_semaphore,
-                render_finished_semaphore,
-                in_flight_fence,
+                image_available_semaphores,
+                render_finished_semaphores,
+                in_flight_fences,
+                current_frame: 0,
                 current_image_index: 0,
 
                 vertex_buffer: Some(vertex_buffer),
@@ -946,12 +974,13 @@ impl Gr {
 
         if let Some(app) = &mut self.vulkan_app {
             unsafe {
-                // Wait for previous frame to complete
+                // Wait for this frame-in-flight slot to be available
+                let frame = app.current_frame;
                 app.device
-                    .wait_for_fences(&[app.in_flight_fence], true, u64::MAX)
+                    .wait_for_fences(&[app.in_flight_fences[frame]], true, u64::MAX)
                     .expect("Failed to wait for fence");
                 app.device
-                    .reset_fences(&[app.in_flight_fence])
+                    .reset_fences(&[app.in_flight_fences[frame]])
                     .expect("Failed to reset fence");
 
                 // Acquire next swapchain image with retry loop for NOT_READY
@@ -959,7 +988,7 @@ impl Gr {
                     match app.swapchain_loader.acquire_next_image(
                         app.swapchain,
                         u64::MAX,
-                        app.image_available_semaphore,
+                        app.image_available_semaphores[frame],
                         vk::Fence::null(),
                     ) {
                         Ok((idx, _)) => {
@@ -1138,9 +1167,9 @@ impl Gr {
                     .expect("Failed to end command buffer");
 
                 // Submit command buffer
-                let wait_semaphores = [app.image_available_semaphore];
+                let wait_semaphores = [app.image_available_semaphores[frame]];
                 let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-                let signal_semaphores = [app.render_finished_semaphore];
+                let signal_semaphores = [app.render_finished_semaphores[image_index as usize]];
                 let command_buffers = [cmd];
 
                 let submit_info = vk::SubmitInfo::default()
@@ -1150,7 +1179,7 @@ impl Gr {
                     .signal_semaphores(&signal_semaphores);
 
                 app.device
-                    .queue_submit(app.graphics_queue, &[submit_info], app.in_flight_fence)
+                    .queue_submit(app.graphics_queue, &[submit_info], app.in_flight_fences[frame])
                     .expect("Failed to submit draw command buffer");
 
                 // Present the image
@@ -1164,6 +1193,9 @@ impl Gr {
                 app.swapchain_loader
                     .queue_present(app.present_queue, &present_info)
                     .expect("Failed to present");
+
+                // Advance to next frame-in-flight slot
+                app.current_frame = (app.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
             }
             Some(())
         } else {
@@ -1184,7 +1216,8 @@ impl Gr {
 
                 // Wait for the image_available semaphore (from acquire in lfb_upload)
                 // and present directly
-                let wait_semaphores = [app.image_available_semaphore];
+                let frame = app.current_frame;
+                let wait_semaphores = [app.image_available_semaphores[frame]];
                 let swapchains = [app.swapchain];
                 let image_indices = [image_index];
                 let present_info = vk::PresentInfoKHR::default()
@@ -1200,6 +1233,9 @@ impl Gr {
                 app.device
                     .queue_wait_idle(app.present_queue)
                     .expect("Failed to wait for present queue");
+
+                // Advance to next frame-in-flight slot
+                app.current_frame = (app.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
             }
             Some(())
         } else {
