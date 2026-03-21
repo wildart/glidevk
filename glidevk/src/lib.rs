@@ -933,6 +933,15 @@ impl Gr {
         // Finalize vertex batch and get draw calls (copy to avoid borrow issues)
         let draw_calls: Vec<utility::vertex::DrawCall> = self.vertex_batch.finalize().to_vec();
 
+        // Evict unused textures before uploading, protecting textures needed this frame
+        {
+            let needed: std::collections::HashSet<u32> =
+                draw_calls.iter().map(|dc| dc.texture_addr).collect();
+            if let Some(app) = &mut self.vulkan_app {
+                app.texture_cache.evict_if_needed(&app.device, &needed);
+            }
+        }
+
         // Ensure all textures referenced in draw calls are uploaded to Vulkan
         for draw_call in &draw_calls {
             self.ensure_texture_uploaded_by_addr(draw_call.texture_addr);

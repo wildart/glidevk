@@ -538,6 +538,9 @@ impl VulkanTexture {
     }
 }
 
+/// Maximum number of textures in the Vulkan cache before eviction.
+const MAX_CACHED_TEXTURES: usize = 2048;
+
 /// Cache of Vulkan textures keyed by Glide address
 pub struct TextureCache {
     textures: HashMap<u32, VulkanTexture>,
@@ -545,6 +548,8 @@ pub struct TextureCache {
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     descriptor_sets: HashMap<u32, vk::DescriptorSet>,
+    /// Insertion order for LRU eviction (oldest first)
+    insertion_order: Vec<u32>,
     /// Placeholder texture (1x1 white) for when no texture is bound
     placeholder: Option<VulkanTexture>,
     placeholder_descriptor: vk::DescriptorSet,
@@ -596,11 +601,11 @@ impl TextureCache {
         // Use FREE_DESCRIPTOR_SET_BIT to allow freeing individual descriptor sets
         let pool_size = vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1024);
+            .descriptor_count(MAX_CACHED_TEXTURES as u32 + 1);
 
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(std::slice::from_ref(&pool_size))
-            .max_sets(1024)
+            .max_sets(MAX_CACHED_TEXTURES as u32 + 1)
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
 
         let descriptor_pool = unsafe {
@@ -626,6 +631,7 @@ impl TextureCache {
             descriptor_set_layout,
             descriptor_pool,
             descriptor_sets: HashMap::new(),
+            insertion_order: Vec::new(),
             placeholder: None,
             placeholder_descriptor,
         }
@@ -687,6 +693,7 @@ impl TextureCache {
         // Remove old texture and descriptor set if they exist
         if let Some(old_texture) = self.textures.remove(&texture_addr) {
             old_texture.destroy(device);
+            self.insertion_order.retain(|&a| a != texture_addr);
         }
         if let Some(old_descriptor_set) = self.descriptor_sets.remove(&texture_addr) {
             unsafe {
@@ -698,6 +705,7 @@ impl TextureCache {
 
         self.textures.insert(texture_addr, texture);
         self.descriptor_sets.insert(texture_addr, descriptor_set);
+        self.insertion_order.push(texture_addr);
     }
 
     /// Create the placeholder texture (1x1 white pixel)
@@ -801,6 +809,7 @@ impl TextureCache {
         // Remove old texture and descriptor set if they exist
         if let Some(old_texture) = self.textures.remove(&address) {
             old_texture.destroy(device);
+            self.insertion_order.retain(|&a| a != address);
         }
         if let Some(old_descriptor_set) = self.descriptor_sets.remove(&address) {
             unsafe {
@@ -812,6 +821,7 @@ impl TextureCache {
 
         self.textures.insert(address, texture);
         self.descriptor_sets.insert(address, descriptor_set);
+        self.insertion_order.push(address);
 
         log::trace!(
             "Texture cache: {} textures, {} descriptor sets",
@@ -820,8 +830,15 @@ impl TextureCache {
         );
     }
 
-    /// Get descriptor set for a texture address
-    pub fn get_descriptor_set(&self, address: u32) -> vk::DescriptorSet {
+    /// Get descriptor set for a texture address (marks as recently used for LRU)
+    pub fn get_descriptor_set(&mut self, address: u32) -> vk::DescriptorSet {
+        if self.descriptor_sets.contains_key(&address) {
+            // Move to back of LRU order
+            if let Some(pos) = self.insertion_order.iter().position(|&a| a == address) {
+                self.insertion_order.remove(pos);
+                self.insertion_order.push(address);
+            }
+        }
         self.descriptor_sets
             .get(&address)
             .copied()
@@ -846,6 +863,53 @@ impl TextureCache {
         }
     }
 
+    /// Evict least-recently-used textures, protecting those needed by the current frame.
+    /// Called at frame boundaries before texture uploads.
+    pub fn evict_if_needed(
+        &mut self,
+        device: &ash::Device,
+        protected: &std::collections::HashSet<u32>,
+    ) {
+        if self.textures.len() < MAX_CACHED_TEXTURES {
+            return;
+        }
+
+        // Evict oldest entries that aren't in the protected set
+        let target = MAX_CACHED_TEXTURES / 2;
+        let mut evicted = 0;
+        let mut new_order = Vec::with_capacity(self.insertion_order.len());
+
+        for addr in self.insertion_order.drain(..) {
+            if self.textures.len() - evicted <= target {
+                new_order.push(addr);
+                continue;
+            }
+            if protected.contains(&addr) {
+                new_order.push(addr);
+                continue;
+            }
+            // Evict this texture
+            if let Some(descriptor_set) = self.descriptor_sets.remove(&addr) {
+                unsafe {
+                    let _ = device.free_descriptor_sets(self.descriptor_pool, &[descriptor_set]);
+                }
+            }
+            if let Some(texture) = self.textures.remove(&addr) {
+                texture.destroy(device);
+            }
+            evicted += 1;
+        }
+        self.insertion_order = new_order;
+
+        if evicted > 0 {
+            log::debug!(
+                "Texture cache eviction: removed {}, remaining {}",
+                evicted,
+                self.textures.len()
+            );
+        }
+    }
+
     /// Invalidate (remove) a texture from the cache
     /// Call this when the game downloads new texture data to an address
     pub fn invalidate_texture(&mut self, device: &ash::Device, address: u32) {
@@ -858,6 +922,7 @@ impl TextureCache {
         // Destroy and remove the texture
         if let Some(texture) = self.textures.remove(&address) {
             texture.destroy(device);
+            self.insertion_order.retain(|&a| a != address);
             log::trace!("Invalidated texture at {:#x}", address);
         }
     }
