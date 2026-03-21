@@ -109,7 +109,7 @@ void main() {
     // Evaluate alpha combine function (simplified for common cases)
     float resultA;
     if (pc.alphaCombineFunction == CF_ZERO) {
-        resultA = 0.0;
+        resultA = 1.0; // Zero alpha means opaque (no alpha blending)
     } else if (pc.alphaCombineFunction == CF_LOCAL) {
         resultA = a_local;
     } else if (pc.alphaCombineFunction == CF_LOCAL_ALPHA) {

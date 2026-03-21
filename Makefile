@@ -27,7 +27,7 @@ build: shaders
 	cargo build --workspace $(RELEASE_FLAG)
 
 .PHONY: build-win
-build-win:
+build-win: shaders
 	cross build --workspace $(RELEASE_FLAG) --target $(TARGET_ARCH)
 # ifeq ($(RELEASE_TYPE),release)
 	cp target/$(TARGET_ARCH)/$(BUILD_DIR)/$(LIB).dll $(TESTS)/
