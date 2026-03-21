@@ -812,11 +812,50 @@ fn spv_to_words(bytes: &[u8]) -> Vec<u32> {
 }
 
 /// Creates a graphics pipeline with vertex input for Glide rendering
-pub fn create_glide_graphics_pipeline(
+/// Create all graphics pipeline variants for different blend modes.
+/// Returns a HashMap of BlendMode → Pipeline, plus the shared PipelineLayout.
+pub fn create_glide_graphics_pipelines(
     device: &ash::Device,
     render_pass: vk::RenderPass,
     swapchain_extent: vk::Extent2D,
     descriptor_set_layout: vk::DescriptorSetLayout,
+) -> (std::collections::HashMap<vertex::BlendMode, vk::Pipeline>, vk::PipelineLayout) {
+    use vertex::BlendMode;
+
+    let blend_configs: [(BlendMode, vk::BlendFactor, vk::BlendFactor); 4] = [
+        (BlendMode::Opaque, vk::BlendFactor::ONE, vk::BlendFactor::ZERO),
+        (BlendMode::AlphaBlend, vk::BlendFactor::SRC_ALPHA, vk::BlendFactor::ONE_MINUS_SRC_ALPHA),
+        (BlendMode::Additive, vk::BlendFactor::ONE, vk::BlendFactor::ONE),
+        (BlendMode::Multiplicative, vk::BlendFactor::ZERO, vk::BlendFactor::SRC_COLOR),
+    ];
+
+    let (first_pipeline, pipeline_layout) = create_glide_graphics_pipeline_with_blend(
+        device, render_pass, swapchain_extent, descriptor_set_layout,
+        blend_configs[0].1, blend_configs[0].2, None,
+    );
+
+    let mut pipelines = std::collections::HashMap::new();
+    pipelines.insert(blend_configs[0].0, first_pipeline);
+
+    for &(mode, src, dst) in &blend_configs[1..] {
+        let (pipeline, _) = create_glide_graphics_pipeline_with_blend(
+            device, render_pass, swapchain_extent, descriptor_set_layout,
+            src, dst, Some(pipeline_layout),
+        );
+        pipelines.insert(mode, pipeline);
+    }
+
+    (pipelines, pipeline_layout)
+}
+
+fn create_glide_graphics_pipeline_with_blend(
+    device: &ash::Device,
+    render_pass: vk::RenderPass,
+    swapchain_extent: vk::Extent2D,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    src_color_blend: vk::BlendFactor,
+    dst_color_blend: vk::BlendFactor,
+    existing_layout: Option<vk::PipelineLayout>,
 ) -> (vk::Pipeline, vk::PipelineLayout) {
     let vert_shader_code = spv_to_words(GLIDE_VERT_SPV);
     let frag_shader_code = spv_to_words(GLIDE_FRAG_SPV);
@@ -886,12 +925,11 @@ pub fn create_glide_graphics_pipeline(
         .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
         .stencil_test_enable(false);
 
-    // Enable alpha blending
     let color_blend_attachment_states = [vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(true)
         .color_write_mask(vk::ColorComponentFlags::RGBA)
-        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .src_color_blend_factor(src_color_blend)
+        .dst_color_blend_factor(dst_color_blend)
         .color_blend_op(vk::BlendOp::ADD)
         .src_alpha_blend_factor(vk::BlendFactor::ONE)
         .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
@@ -912,10 +950,14 @@ pub fn create_glide_graphics_pipeline(
         .set_layouts(&set_layouts)
         .push_constant_ranges(std::slice::from_ref(&push_constant_range));
 
-    let pipeline_layout = unsafe {
-        device
-            .create_pipeline_layout(&pipeline_layout_create_info, None)
-            .expect("Failed to create pipeline layout!")
+    let pipeline_layout = if let Some(layout) = existing_layout {
+        layout
+    } else {
+        unsafe {
+            device
+                .create_pipeline_layout(&pipeline_layout_create_info, None)
+                .expect("Failed to create pipeline layout!")
+        }
     };
 
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];

@@ -391,7 +391,7 @@ pub struct VulkanApp {
 
     pub render_pass: vk::RenderPass,
     pub pipeline_layout: vk::PipelineLayout,
-    pub graphics_pipeline: vk::Pipeline,
+    pub graphics_pipelines: std::collections::HashMap<super::vertex::BlendMode, vk::Pipeline>,
 
     pub swapchain_loader: ash::khr::swapchain::Device,
     pub swapchain: vk::SwapchainKHR,
@@ -440,7 +440,9 @@ impl VulkanApp {
                 self.device.destroy_framebuffer(framebuffer, None);
             }
 
-            self.device.destroy_pipeline(self.graphics_pipeline, None);
+            for (_, pipeline) in &self.graphics_pipelines {
+                self.device.destroy_pipeline(*pipeline, None);
+            }
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_render_pass(self.render_pass, None);

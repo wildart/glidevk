@@ -167,6 +167,19 @@ pub struct PushConstants {
     pub constant_color: [f32; 4],
 }
 
+/// Blend mode for a draw call — maps Glide's grAlphaBlendFunction to a pipeline variant
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BlendMode {
+    /// src*1 + dst*0 — opaque replacement
+    Opaque,
+    /// src*srcAlpha + dst*(1-srcAlpha) — standard transparency
+    AlphaBlend,
+    /// src*srcAlpha + dst*1 — additive glow (lightning, spell effects)
+    Additive,
+    /// src*0 + dst*srcColor — multiplicative darkening (shadows)
+    Multiplicative,
+}
+
 /// A single draw call with its associated texture and render state
 #[derive(Clone, Copy, Debug)]
 pub struct DrawCall {
@@ -174,6 +187,7 @@ pub struct DrawCall {
     pub start_vertex: u32,
     pub vertex_count: u32,
     pub chromakey_enabled: bool,
+    pub blend_mode: BlendMode,
 }
 
 /// Vertex batch for collecting draw calls
@@ -184,6 +198,7 @@ pub struct VertexBatch {
     current_texture: u32,
     current_start: u32,
     current_chromakey: bool,
+    current_blend_mode: BlendMode,
 }
 
 impl VertexBatch {
@@ -195,6 +210,7 @@ impl VertexBatch {
             current_texture: 0,
             current_start: 0,
             current_chromakey: false,
+            current_blend_mode: BlendMode::Opaque,
         }
     }
 
@@ -214,6 +230,7 @@ impl VertexBatch {
                     start_vertex: self.current_start,
                     vertex_count: current_count,
                     chromakey_enabled: self.current_chromakey,
+                    blend_mode: self.current_blend_mode,
                 });
                 self.current_start = self.vertices.len() as u32;
             }
@@ -232,11 +249,30 @@ impl VertexBatch {
                     start_vertex: self.current_start,
                     vertex_count: current_count,
                     chromakey_enabled: self.current_chromakey,
+                    blend_mode: self.current_blend_mode,
                 });
                 self.current_start = self.vertices.len() as u32;
             }
         }
         self.current_chromakey = enabled;
+    }
+
+    /// Set the blend mode for subsequent vertices
+    pub fn set_blend_mode(&mut self, mode: BlendMode) {
+        if mode != self.current_blend_mode && !self.vertices.is_empty() {
+            let current_count = self.vertices.len() as u32 - self.current_start;
+            if current_count > 0 {
+                self.draw_calls.push(DrawCall {
+                    texture_addr: self.current_texture,
+                    start_vertex: self.current_start,
+                    vertex_count: current_count,
+                    chromakey_enabled: self.current_chromakey,
+                    blend_mode: self.current_blend_mode,
+                });
+                self.current_start = self.vertices.len() as u32;
+            }
+        }
+        self.current_blend_mode = mode;
     }
 
     pub fn push_triangle(&mut self, v0: GpuVertex, v1: GpuVertex, v2: GpuVertex) -> bool {
@@ -258,6 +294,7 @@ impl VertexBatch {
                 start_vertex: self.current_start,
                 vertex_count: current_count,
                 chromakey_enabled: self.current_chromakey,
+                blend_mode: self.current_blend_mode,
             });
             self.current_start = self.vertices.len() as u32;
         }

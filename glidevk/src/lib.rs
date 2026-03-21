@@ -702,7 +702,7 @@ impl Gr {
             let mut texture_cache = utility::texture::TextureCache::new(&logical_device);
             log::debug!("Created texture cache");
 
-            let (graphics_pipeline, pipeline_layout) = utility::create_glide_graphics_pipeline(
+            let (graphics_pipelines, pipeline_layout) = utility::create_glide_graphics_pipelines(
                 &logical_device,
                 render_pass,
                 extent,
@@ -727,7 +727,7 @@ impl Gr {
             let command_buffers = vulkan::create_command_buffers(
                 &logical_device,
                 command_pool,
-                graphics_pipeline,
+                vk::Pipeline::null(), // unused param
                 &swapchain_framebuffers,
                 render_pass,
                 extent,
@@ -804,7 +804,7 @@ impl Gr {
 
                 render_pass,
                 pipeline_layout,
-                graphics_pipeline,
+                graphics_pipelines,
 
                 swapchain_format: swapchain_create_info.image_format,
                 swapchain_extent: swapchain_create_info.image_extent,
@@ -1064,12 +1064,14 @@ impl Gr {
                     vk::SubpassContents::INLINE,
                 );
 
-                // Bind pipeline
+                // Bind initial pipeline (will switch per draw call if blend mode changes)
+                let default_pipeline = app.graphics_pipelines[&utility::vertex::BlendMode::Opaque];
                 app.device.cmd_bind_pipeline(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
-                    app.graphics_pipeline,
+                    default_pipeline,
                 );
+                let mut current_blend_mode = utility::vertex::BlendMode::Opaque;
 
                 // Set viewport and scissor
                 let viewport = vk::Viewport {
@@ -1095,8 +1097,19 @@ impl Gr {
                         app.device
                             .cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer.buffer], &[0]);
 
-                        // Issue draw calls with per-draw texture binding and push constants
+                        // Issue draw calls with per-draw texture binding, blend mode, and push constants
                         for draw_call in &draw_calls {
+                            // Switch pipeline if blend mode changed
+                            if draw_call.blend_mode != current_blend_mode {
+                                if let Some(&pipeline) = app.graphics_pipelines.get(&draw_call.blend_mode) {
+                                    app.device.cmd_bind_pipeline(
+                                        cmd,
+                                        vk::PipelineBindPoint::GRAPHICS,
+                                        pipeline,
+                                    );
+                                    current_blend_mode = draw_call.blend_mode;
+                                }
+                            }
                             // Get texture size for this draw call
                             let (tex_width, tex_height) =
                                 app.texture_cache.get_texture_size(draw_call.texture_addr);
@@ -1356,12 +1369,24 @@ impl Gr {
         self.state.alpha_blend_rgb_dst = rgb_df;
         self.state.alpha_blend_alpha_src = alpha_sf;
         self.state.alpha_blend_alpha_dst = alpha_df;
+
+        // Map Glide blend args to a pipeline blend mode
+        let blend_mode = match (rgb_sf, rgb_df) {
+            (AlphaBlendFnc::One, AlphaBlendFnc::Zero) => utility::vertex::BlendMode::Opaque,
+            (AlphaBlendFnc::One, AlphaBlendFnc::One) => utility::vertex::BlendMode::Additive,
+            (AlphaBlendFnc::Zero, AlphaBlendFnc::SrcColor) => utility::vertex::BlendMode::Multiplicative,
+            (AlphaBlendFnc::SrcAlpha, AlphaBlendFnc::OneMinusSrcAlpha) => utility::vertex::BlendMode::AlphaBlend,
+            _ => utility::vertex::BlendMode::AlphaBlend, // fallback
+        };
+        self.vertex_batch.set_blend_mode(blend_mode);
+
         log::trace!(
-            "Alpha blend function set to: RGB({:?}, {:?}), Alpha({:?}, {:?})",
+            "Alpha blend function set to: RGB({:?}, {:?}), Alpha({:?}, {:?}) → {:?}",
             rgb_sf,
             rgb_df,
             alpha_sf,
-            alpha_df
+            alpha_df,
+            blend_mode
         );
     }
 
