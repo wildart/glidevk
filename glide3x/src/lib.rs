@@ -299,6 +299,8 @@ define_ptr_function!(lfb_read_region_rgb565 => grLfbReadRegion(src_buffer: Buffe
 define_ptr_function!(lfb_lock => grLfbLock(lock_type: LfbLock, buffer: Buffer, write_mode: LfbWriteMode, origin: OriginLocation, pixel_pipeline: FxBool; info: &mut LfbInfo) -> FxBool);
 define_function!(lfb_unlock => grLfbUnlock(lock_type: LfbLock, buffer: Buffer) -> FxBool);
 
+define_function!(lfb_write_region => grLfbWriteRegion(dst_buffer: Buffer, dst_x: FxU32, dst_y: FxU32, src_format: LfbWriteMode, src_width: FxU32, src_height: FxU32, pixel_pipeline: FxBool, src_stride: FxI32, src_data: *const std::ffi::c_void) -> FxBool);
+
 define_function!(sst_select => grSstSelect(which_sst: i32) -> Option<()>);
 define_function!(sst_win_open => grSstWinOpen(hwnd: FxU32, res: ScreenResolution, refresh: ScreenRefresh, cformat: ColorFormat, origin: OriginLocation, num_buffers: i32, num_aux_buffers: i32) -> GrContext);
 define_function!(sst_win_close => grSstWinClose(ctx: GrContext) -> FxBool);
@@ -321,6 +323,7 @@ define_function!(sst_origin => grSstOrigin(origin: OriginLocation));
 define_function!(constant_color_value => grConstantColorValue(color: Color));
 define_function!(fog_mode => grFogMode(mode: FogMode));
 define_function!(fog_color_value => grFogColorValue(color: Color));
+define_function!(fog_table => grFogTable(table: *const u8));
 define_function!(chromakey_mode => grChromakeyMode(mode: ChromakeyMode));
 define_function!(chromakey_value => grChromakeyValue(color: Color));
 define_function!(alpha_test_function => grAlphaTestFunction(fnc: CmpFnc));

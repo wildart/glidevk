@@ -150,21 +150,31 @@ impl GpuVertex {
     }
 }
 
-/// Push constants for the shaders
+/// Push constants for the shaders.
+/// New fields added after constant_color use only int/float (no vec3)
+/// to avoid GLSL std430 vec3 alignment ambiguity.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PushConstants {
     pub screen_size: [f32; 2],
     pub texture_size: [f32; 2],
     pub chromakey_color: [f32; 3],
-    pub chromakey_enabled: f32, // 1.0 = enabled, 0.0 = disabled
+    pub chromakey_enabled: f32,
     // Color/alpha combine mode (integer enums passed as i32)
     pub color_combine_function: i32,
     pub color_combine_other: i32,
     pub alpha_combine_function: i32,
     pub alpha_combine_local: i32,
     // Constant color (RGBA, normalized 0.0-1.0)
-    pub constant_color: [f32; 4],
+    pub constant_color: [f32; 4],       // offset 48 (16-byte aligned)
+    // Combine factors
+    pub color_combine_factor: i32,
+    pub alpha_combine_factor: i32,
+    // Fog state (separate floats, not vec3, to avoid std430 padding)
+    pub fog_mode: i32,
+    pub fog_color_r: f32,
+    pub fog_color_g: f32,
+    pub fog_color_b: f32,
 }
 
 /// Blend mode for a draw call — maps Glide's grAlphaBlendFunction to a pipeline variant
@@ -461,10 +471,9 @@ mod tests {
 
     #[test]
     fn test_push_constants_size() {
-        // Push constants: screen_size(8) + texture_size(8) + chromakey_color(12) + chromakey_enabled(4)
-        //   + color_combine_function(4) + color_combine_other(4) + alpha_combine_function(4) + alpha_combine_local(4)
-        //   + constant_color(16) = 64 bytes
-        assert_eq!(std::mem::size_of::<PushConstants>(), 64);
+        // screen_size(8) + texture_size(8) + chromakey_color(12) + chromakey_enabled(4)
+        // + constant_color(16) + fog_color(12) + 7 ints(28) = 88 bytes
+        assert_eq!(std::mem::size_of::<PushConstants>(), 88);
     }
 
     #[test]

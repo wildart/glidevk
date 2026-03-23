@@ -8,20 +8,27 @@ layout(location = 3) in float inOow;      // Reciprocal W (1/w) for depth
 
 // Push constants for screen dimensions and rendering state
 layout(push_constant) uniform PushConstants {
-    vec2 screenSize;      // Screen width and height
-    vec2 textureSize;     // Current texture width and height
-    vec3 chromakeyColor;  // Chromakey color (RGB)
-    float chromakeyEnabled; // 1.0 = enabled, 0.0 = disabled
-    int colorCombineFunction; // CombineFunction enum
-    int colorCombineOther;    // CombineOther enum
-    int alphaCombineFunction; // CombineFunction enum
-    int alphaCombineLocal;    // CombineLocal enum
-    vec4 constantColor;       // Constant color (RGBA, normalized)
+    vec2 screenSize;
+    vec2 textureSize;
+    vec3 chromakeyColor;
+    float chromakeyEnabled;
+    int colorCombineFunction;
+    int colorCombineOther;
+    int alphaCombineFunction;
+    int alphaCombineLocal;
+    vec4 constantColor;
+    int colorCombineFactor;
+    int alphaCombineFactor;
+    int fogMode;
+    float fogColorR;
+    float fogColorG;
+    float fogColorB;
 } pc;
 
 // Outputs to fragment shader
 layout(location = 0) out vec4 fragColor;
 layout(location = 1) out vec2 fragTexCoord;
+layout(location = 2) out float fragOow;
 
 void main() {
     // Convert screen coordinates to normalized device coordinates
@@ -42,4 +49,7 @@ void main() {
 
     // Pass texture coordinates as-is - normalize in fragment shader
     fragTexCoord = inTexCoord;
+
+    // Pass oow to fragment shader for fog calculation
+    fragOow = inOow;
 }

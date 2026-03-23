@@ -115,6 +115,7 @@ pub struct State {
     // Fog state
     fog_mode: FogMode,
     fog_color: Color,
+    fog_table: [u8; 64],
 
     // Chromakey state
     chromakey_mode: ChromakeyMode,
@@ -209,6 +210,7 @@ impl Default for State {
             // Default fog: disabled
             fog_mode: FogMode::Disable,
             fog_color: Color(0x00000000),
+            fog_table: [0u8; 64],
             // Default chromakey: disabled
             chromakey_mode: ChromakeyMode::Disable,
             chromakey_value: Color(0x00000000),
@@ -980,6 +982,15 @@ impl Gr {
         let color_combine_other = self.state.color_combine_other as i32;
         let alpha_combine_function = self.state.alpha_combine_function as i32;
         let alpha_combine_local = self.state.alpha_combine_local as i32;
+        let color_combine_factor = self.state.color_combine_factor as i32;
+        let alpha_combine_factor = self.state.alpha_combine_factor as i32;
+
+        // Capture fog state
+        let fog_mode = self.state.fog_mode as i32;
+        let (fog_r, fog_g, fog_b, _) = self
+            .state
+            .fog_color
+            .to_rgba_f(self.state.color_format);
 
         if let Some(app) = &mut self.vulkan_app {
             unsafe {
@@ -1137,6 +1148,12 @@ impl Gr {
                                 alpha_combine_function,
                                 alpha_combine_local,
                                 constant_color: [cc_r, cc_g, cc_b, cc_a],
+                                color_combine_factor,
+                                alpha_combine_factor,
+                                fog_mode,
+                                fog_color_r: fog_r,
+                                fog_color_g: fog_g,
+                                fog_color_b: fog_b,
                             };
                             let push_data = std::slice::from_raw_parts(
                                 &push_constants as *const _ as *const u8,
@@ -1484,6 +1501,17 @@ impl Gr {
     pub fn fog_color_value(&mut self, color: Color) {
         self.state.fog_color = color;
         log::trace!("Fog color set to: {:?}", color);
+    }
+
+    /// grFogTable - download a fog table
+    pub fn fog_table(&mut self, table: *const u8) {
+        if table.is_null() {
+            return;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(table, self.state.fog_table.as_mut_ptr(), 64);
+        }
+        log::debug!("Fog table downloaded (64 entries)");
     }
 
     // ==================== Chromakey Functions ====================
@@ -3136,6 +3164,70 @@ impl Gr {
         self.lfb_lock_state.data.clear();
 
         FxBool::True
+    }
+
+    /// grLfbWriteRegion - write a pixel rectangle to the frame buffer
+    pub fn lfb_write_region(
+        &mut self,
+        dst_buffer: glidesys::Buffer,
+        dst_x: FxU32,
+        dst_y: FxU32,
+        src_format: glidesys::LfbWriteMode,
+        src_width: FxU32,
+        src_height: FxU32,
+        _pixel_pipeline: FxBool,
+        src_stride: i32,
+        src_data: *const std::ffi::c_void,
+    ) -> FxBool {
+        if src_data.is_null() || src_width == 0 || src_height == 0 {
+            return FxBool::False;
+        }
+
+        // Lock the LFB
+        let mut info = glidesys::LfbInfo {
+            size: std::mem::size_of::<glidesys::LfbInfo>() as i32,
+            lfb_ptr: std::ptr::null_mut(),
+            stride_in_bytes: 0,
+            write_mode: glidesys::LfbWriteMode::Any,
+            origin: glidesys::OriginLocation::UpperLeft,
+        };
+
+        if self.lfb_lock(
+            glidesys::LfbLock::WriteOnly,
+            dst_buffer,
+            src_format,
+            glidesys::OriginLocation::UpperLeft,
+            FxBool::False,
+            &mut info,
+        ) != FxBool::True
+        {
+            return FxBool::False;
+        }
+
+        // Calculate bytes per pixel
+        let bpp: u32 = match src_format {
+            glidesys::LfbWriteMode::Rgb565
+            | glidesys::LfbWriteMode::Rgb555
+            | glidesys::LfbWriteMode::Argb1555 => 2,
+            glidesys::LfbWriteMode::Rgb888 => 3,
+            glidesys::LfbWriteMode::Argb8888 => 4,
+            _ => 2,
+        };
+
+        // Copy row by row from source to locked buffer
+        let dst_stride = info.stride_in_bytes;
+        unsafe {
+            let src_ptr = src_data as *const u8;
+            let dst_ptr = info.lfb_ptr as *mut u8;
+            for y in 0..src_height {
+                let src_row = src_ptr.add((y as i32 * src_stride) as usize);
+                let dst_row = dst_ptr.add(((dst_y + y) * dst_stride + dst_x * bpp) as usize);
+                std::ptr::copy_nonoverlapping(src_row, dst_row, (src_width * bpp) as usize);
+            }
+        }
+
+        // Unlock triggers upload
+        self.lfb_unlock(glidesys::LfbLock::WriteOnly, dst_buffer)
     }
 
     /// Upload LFB write data directly to the swapchain image and present.
