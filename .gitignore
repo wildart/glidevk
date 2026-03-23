@@ -4,3 +4,7 @@ src/tmp
 *.exe
 *.dll
 old-docs
+*.spv
+*.log
+tests/
+Makefile.*
