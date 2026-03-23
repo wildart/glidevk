@@ -19,6 +19,8 @@ layout(push_constant) uniform PushConstants {
     vec4 constantColor;
     int colorCombineFactor;
     int alphaCombineFactor;
+    int colorCombineLocal;
+    int alphaCombineOther;
     int fogMode;
     float fogColorR;
     float fogColorG;

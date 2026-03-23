@@ -821,6 +821,7 @@ impl Gr {
                 in_flight_fences,
                 current_frame: 0,
                 current_image_index: 0,
+                last_presented_image_index: 0,
 
                 vertex_buffer: Some(vertex_buffer),
                 physical_device,
@@ -925,24 +926,20 @@ impl Gr {
     }
 
     pub fn buffer_swap(&mut self, _interval: i32) -> Option<()> {
-        // Check if LFB write was performed - if so, just present (image already acquired and written)
-        let lfb_written = self.lfb_lock_state.lfb_written;
-        if lfb_written {
+        // If LFB write was performed, the image was already presented in lfb_unlock.
+        // Just clear the flag and skip the normal render path.
+        if self.lfb_lock_state.lfb_written {
             self.lfb_lock_state.lfb_written = false;
-            return self.buffer_swap_lfb();
+            self.vertex_batch.clear();
+            return Some(());
         }
 
         // Finalize vertex batch and get draw calls (copy to avoid borrow issues)
         let draw_calls: Vec<utility::vertex::DrawCall> = self.vertex_batch.finalize().to_vec();
 
-        // Evict unused textures before uploading, protecting textures needed this frame
-        {
-            let needed: std::collections::HashSet<u32> =
-                draw_calls.iter().map(|dc| dc.texture_addr).collect();
-            if let Some(app) = &mut self.vulkan_app {
-                app.texture_cache.evict_if_needed(&app.device, &needed);
-            }
-        }
+        // Collect textures needed this frame (for eviction protection)
+        let needed_textures: std::collections::HashSet<u32> =
+            draw_calls.iter().map(|dc| dc.texture_addr).collect();
 
         // Ensure all textures referenced in draw calls are uploaded to Vulkan
         for draw_call in &draw_calls {
@@ -984,6 +981,8 @@ impl Gr {
         let alpha_combine_local = self.state.alpha_combine_local as i32;
         let color_combine_factor = self.state.color_combine_factor as i32;
         let alpha_combine_factor = self.state.alpha_combine_factor as i32;
+        let color_combine_local = self.state.color_combine_local as i32;
+        let alpha_combine_other = self.state.alpha_combine_other as i32;
 
         // Capture fog state
         let fog_mode = self.state.fog_mode as i32;
@@ -1002,6 +1001,17 @@ impl Gr {
                 app.device
                     .reset_fences(&[app.in_flight_fences[frame]])
                     .expect("Failed to reset fence");
+
+                // Evict unused textures — must happen after fence wait so no
+                // in-flight frame in THIS slot is still referencing them.
+                // Wait for ALL slots to ensure the other slot is also done.
+                if app.texture_cache.needs_eviction() {
+                    for fence in &app.in_flight_fences {
+                        let _ = app.device.wait_for_fences(&[*fence], true, u64::MAX);
+                    }
+                    app.texture_cache
+                        .evict_if_needed(&app.device, &needed_textures);
+                }
 
                 // Acquire next swapchain image with retry loop for NOT_READY
                 let image_index: u32 = loop {
@@ -1150,6 +1160,8 @@ impl Gr {
                                 constant_color: [cc_r, cc_g, cc_b, cc_a],
                                 color_combine_factor,
                                 alpha_combine_factor,
+                                color_combine_local,
+                                alpha_combine_other,
                                 fog_mode,
                                 fog_color_r: fog_r,
                                 fog_color_g: fog_g,
@@ -1233,6 +1245,8 @@ impl Gr {
                     .queue_present(app.present_queue, &present_info)
                     .expect("Failed to present");
 
+                app.last_presented_image_index = image_index;
+
                 // Advance to next frame-in-flight slot
                 app.current_frame = (app.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
             }
@@ -1267,6 +1281,8 @@ impl Gr {
                 app.swapchain_loader
                     .queue_present(app.present_queue, &present_info)
                     .expect("Failed to present");
+
+                app.last_presented_image_index = image_index;
 
                 // Wait for present to complete so next frame's fence wait doesn't hang
                 app.device
@@ -2850,8 +2866,12 @@ impl Gr {
                 .begin_command_buffer(cmd, &begin_info)
                 .expect("Failed to begin command buffer");
 
-            // Transition image layout for transfer
-            let src_image = app.swapchain_images[app.current_image_index as usize];
+            // Read from the last presented image (front buffer)
+            log::debug!(
+                "lfb_read_region: reading from image index {} (last_presented={}, current={})",
+                app.last_presented_image_index, app.last_presented_image_index, app.current_image_index
+            );
+            let src_image = app.swapchain_images[app.last_presented_image_index as usize];
 
             let barrier = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
@@ -3157,6 +3177,7 @@ impl Gr {
         // For write locks, upload data directly to swapchain image and present
         if lock_type == glidesys::LfbLock::WriteOnly {
             self.lfb_upload_to_framebuffer();
+            self.lfb_lock_state.lfb_written = true;
         }
 
         // Clear lock state
@@ -3540,6 +3561,12 @@ impl Gr {
 
             let _ = app.swapchain_loader.queue_present(app.graphics_queue, &present_info);
 
+            app.last_presented_image_index = app.current_image_index;
+            log::debug!(
+                "lfb_upload: set last_presented={} (current={})",
+                app.last_presented_image_index, app.current_image_index
+            );
+
             // Signal fence so next buffer_swap won't hang
             let empty_submit = vk::SubmitInfo::default();
             app.device
@@ -3551,7 +3578,10 @@ impl Gr {
             app.device.destroy_buffer(staging_buffer, None);
             app.device.free_memory(staging_memory, None);
 
-            log::debug!("LFB write uploaded to framebuffer ({}x{})", width, height);
+            log::debug!(
+                "LFB write uploaded to framebuffer ({}x{}, image_index={})",
+                width, height, app.current_image_index
+            );
         }
     }
 }

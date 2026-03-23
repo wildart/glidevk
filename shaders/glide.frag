@@ -19,6 +19,8 @@ layout(push_constant) uniform PushConstants {
     vec4 constantColor;
     int colorCombineFactor;
     int alphaCombineFactor;
+    int colorCombineLocal;
+    int alphaCombineOther;
     int fogMode;
     float fogColorR;
     float fogColorG;
@@ -119,39 +121,12 @@ void main() {
         c_other = fragColor.rgb; // CO_ITERATED
     }
 
-    // "local" color is always iterated vertex color for color combine
-    vec3 c_local = fragColor.rgb;
-
-    // Compute factor from CombineFactor enum
-    vec3 c_factor = computeColorFactor(pc.colorCombineFactor, c_local, fragColor.a, fragColor.a, texColor);
-
-    // Evaluate color combine function
-    vec3 resultRGB;
-    if (pc.colorCombineFunction == CF_ZERO) {
-        resultRGB = vec3(0.0);
-    } else if (pc.colorCombineFunction == CF_LOCAL) {
-        resultRGB = c_local;
-    } else if (pc.colorCombineFunction == CF_LOCAL_ALPHA) {
-        resultRGB = vec3(fragColor.a);
-    } else if (pc.colorCombineFunction == CF_SCALE_OTHER) {
-        resultRGB = c_factor * c_other;
-    } else if (pc.colorCombineFunction == CF_SCALE_OTHER_ADD_LOCAL) {
-        resultRGB = c_factor * c_other + c_local;
-    } else if (pc.colorCombineFunction == CF_SCALE_OTHER_ADD_LOCAL_ALPHA) {
-        resultRGB = c_factor * c_other + vec3(fragColor.a);
-    } else if (pc.colorCombineFunction == CF_SCALE_OTHER_MINUS_LOCAL) {
-        resultRGB = c_factor * (c_other - c_local);
-    } else if (pc.colorCombineFunction == CF_SCALE_OTHER_MINUS_LOCAL_ADD_LOCAL) {
-        resultRGB = c_factor * (c_other - c_local) + c_local;
-    } else if (pc.colorCombineFunction == CF_SCALE_OTHER_MINUS_LOCAL_ADD_LOCAL_ALPHA) {
-        resultRGB = c_factor * (c_other - c_local) + vec3(fragColor.a);
-    } else if (pc.colorCombineFunction == CF_SCALE_MINUS_LOCAL_ADD_LOCAL) {
-        resultRGB = c_factor * (vec3(1.0) - c_local) + c_local;
-    } else if (pc.colorCombineFunction == CF_SCALE_MINUS_LOCAL_ADD_LOCAL_ALPHA) {
-        resultRGB = c_factor * (vec3(1.0) - c_local) + vec3(fragColor.a);
+    // Determine "local" color source (respects GR_COMBINE_LOCAL_CONSTANT)
+    vec3 c_local;
+    if (pc.colorCombineLocal == CL_CONSTANT) {
+        c_local = pc.constantColor.rgb;
     } else {
-        // Default fallback: texture * iterated
-        resultRGB = texColor.rgb * fragColor.rgb;
+        c_local = fragColor.rgb; // CL_ITERATED
     }
 
     // --- Alpha Combine ---
@@ -163,16 +138,58 @@ void main() {
         a_local = fragColor.a; // CL_ITERATED
     }
 
-    // Determine "other" alpha source (texture alpha for alpha combine)
-    float a_other = texColor.a;
+    // Determine "other" alpha source (respects GR_COMBINE_OTHER_* for alpha)
+    float a_other;
+    if (pc.alphaCombineOther == CO_TEXTURE) {
+        a_other = texColor.a;
+    } else if (pc.alphaCombineOther == CO_CONSTANT) {
+        a_other = pc.constantColor.a;
+    } else {
+        a_other = fragColor.a; // CO_ITERATED
+    }
 
-    // Compute alpha factor from CombineFactor enum
+    // Compute color factor — A_local in the spec refers to the alpha combine's local alpha
+    vec3 c_factor = computeColorFactor(pc.colorCombineFactor, c_local, a_local, a_local, texColor);
+
+    // Evaluate color combine function
+    // Spec formulas use: f=factor, local, other, A_local (alpha combine's local alpha)
+    vec3 resultRGB;
+    if (pc.colorCombineFunction == CF_ZERO) {
+        resultRGB = vec3(0.0);
+    } else if (pc.colorCombineFunction == CF_LOCAL) {
+        resultRGB = c_local;
+    } else if (pc.colorCombineFunction == CF_LOCAL_ALPHA) {
+        resultRGB = vec3(a_local);
+    } else if (pc.colorCombineFunction == CF_SCALE_OTHER) {
+        resultRGB = c_factor * c_other;
+    } else if (pc.colorCombineFunction == CF_SCALE_OTHER_ADD_LOCAL) {
+        resultRGB = c_factor * c_other + c_local;
+    } else if (pc.colorCombineFunction == CF_SCALE_OTHER_ADD_LOCAL_ALPHA) {
+        resultRGB = c_factor * c_other + vec3(a_local);
+    } else if (pc.colorCombineFunction == CF_SCALE_OTHER_MINUS_LOCAL) {
+        resultRGB = c_factor * (c_other - c_local);
+    } else if (pc.colorCombineFunction == CF_SCALE_OTHER_MINUS_LOCAL_ADD_LOCAL) {
+        resultRGB = c_factor * (c_other - c_local) + c_local;
+    } else if (pc.colorCombineFunction == CF_SCALE_OTHER_MINUS_LOCAL_ADD_LOCAL_ALPHA) {
+        resultRGB = c_factor * (c_other - c_local) + vec3(a_local);
+    } else if (pc.colorCombineFunction == CF_SCALE_MINUS_LOCAL_ADD_LOCAL) {
+        // Spec: f * (-local) + local = (1 - f) * local
+        resultRGB = (vec3(1.0) - c_factor) * c_local;
+    } else if (pc.colorCombineFunction == CF_SCALE_MINUS_LOCAL_ADD_LOCAL_ALPHA) {
+        // Spec: f * (-local) + A_local = A_local - f * local
+        resultRGB = vec3(a_local) - c_factor * c_local;
+    } else {
+        // Default fallback: texture * iterated
+        resultRGB = texColor.rgb * fragColor.rgb;
+    }
+
+    // Compute alpha factor
     float a_factor = computeAlphaFactor(pc.alphaCombineFactor, a_local, a_other, texColor);
 
     // Evaluate alpha combine function
     float resultA;
     if (pc.alphaCombineFunction == CF_ZERO) {
-        resultA = 1.0; // Zero alpha means opaque (no alpha blending)
+        resultA = 0.0;
     } else if (pc.alphaCombineFunction == CF_LOCAL) {
         resultA = a_local;
     } else if (pc.alphaCombineFunction == CF_LOCAL_ALPHA) {
@@ -182,17 +199,19 @@ void main() {
     } else if (pc.alphaCombineFunction == CF_SCALE_OTHER_ADD_LOCAL) {
         resultA = a_factor * a_other + a_local;
     } else if (pc.alphaCombineFunction == CF_SCALE_OTHER_ADD_LOCAL_ALPHA) {
-        resultA = a_factor * a_other + fragColor.a;
+        resultA = a_factor * a_other + a_local;
     } else if (pc.alphaCombineFunction == CF_SCALE_OTHER_MINUS_LOCAL) {
         resultA = a_factor * (a_other - a_local);
     } else if (pc.alphaCombineFunction == CF_SCALE_OTHER_MINUS_LOCAL_ADD_LOCAL) {
         resultA = a_factor * (a_other - a_local) + a_local;
     } else if (pc.alphaCombineFunction == CF_SCALE_OTHER_MINUS_LOCAL_ADD_LOCAL_ALPHA) {
-        resultA = a_factor * (a_other - a_local) + fragColor.a;
+        resultA = a_factor * (a_other - a_local) + a_local;
     } else if (pc.alphaCombineFunction == CF_SCALE_MINUS_LOCAL_ADD_LOCAL) {
-        resultA = a_factor * (1.0 - a_local) + a_local;
+        // Spec: f * (-local) + local = (1 - f) * local
+        resultA = (1.0 - a_factor) * a_local;
     } else if (pc.alphaCombineFunction == CF_SCALE_MINUS_LOCAL_ADD_LOCAL_ALPHA) {
-        resultA = a_factor * (1.0 - a_local) + fragColor.a;
+        // Spec: f * (-local) + A_local = A_local - f * local
+        resultA = a_local - a_factor * a_local;
     } else {
         // Default fallback
         resultA = texColor.a * fragColor.a;

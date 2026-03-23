@@ -411,6 +411,8 @@ pub struct VulkanApp {
     // Current frame state
     pub current_frame: usize,
     pub current_image_index: u32,
+    /// The swapchain image index that was last presented (for front buffer reads)
+    pub last_presented_image_index: u32,
 
     // Vertex buffer for dynamic geometry
     pub vertex_buffer: Option<super::vertex::VertexBuffer>,

@@ -167,9 +167,11 @@ pub struct PushConstants {
     pub alpha_combine_local: i32,
     // Constant color (RGBA, normalized 0.0-1.0)
     pub constant_color: [f32; 4],       // offset 48 (16-byte aligned)
-    // Combine factors
+    // Combine factors and sources
     pub color_combine_factor: i32,
     pub alpha_combine_factor: i32,
+    pub color_combine_local: i32,
+    pub alpha_combine_other: i32,
     // Fog state (separate floats, not vec3, to avoid std430 padding)
     pub fog_mode: i32,
     pub fog_color_r: f32,
@@ -472,8 +474,8 @@ mod tests {
     #[test]
     fn test_push_constants_size() {
         // screen_size(8) + texture_size(8) + chromakey_color(12) + chromakey_enabled(4)
-        // + constant_color(16) + fog_color(12) + 7 ints(28) = 88 bytes
-        assert_eq!(std::mem::size_of::<PushConstants>(), 88);
+        // + 4 combine ints(16) + constant_color(16) + 4 ints(16) + fog(16) = 96 bytes
+        assert_eq!(std::mem::size_of::<PushConstants>(), 96);
     }
 
     #[test]

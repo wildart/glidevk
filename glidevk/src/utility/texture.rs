@@ -863,8 +863,13 @@ impl TextureCache {
         }
     }
 
+    /// Check if eviction is needed without actually evicting
+    pub fn needs_eviction(&self) -> bool {
+        self.textures.len() >= MAX_CACHED_TEXTURES
+    }
+
     /// Evict least-recently-used textures, protecting those needed by the current frame.
-    /// Called at frame boundaries before texture uploads.
+    /// Must be called only after all in-flight GPU work using these textures has completed.
     pub fn evict_if_needed(
         &mut self,
         device: &ash::Device,
