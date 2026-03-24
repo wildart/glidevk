@@ -1054,10 +1054,50 @@ impl Gr {
         let needed_textures: std::collections::HashSet<u32> =
             draw_calls.iter().map(|dc| dc.texture_addr).collect();
 
-        // Upload textures BEFORE the fence wait so GPU upload overlaps with
-        // the previous frame's rendering (pipeline parallelism)
-        for &addr in &needed_textures {
-            self.ensure_texture_uploaded_by_addr(addr);
+        // Batch-upload all missing textures in a single GPU submission
+        {
+            let mut to_upload: Vec<(u32, utility::texture::TextureData, Option<utility::texture::PaletteTable>)> = Vec::new();
+
+            for &addr in &needed_textures {
+                if addr == 0 {
+                    continue;
+                }
+                let needs_upload = self.vulkan_app.as_ref()
+                    .map(|app| !app.texture_cache.has_texture(addr))
+                    .unwrap_or(false);
+
+                if needs_upload {
+                    // Find which TMU has this texture and get its data
+                    for tmu_idx in 0..GLIDE_NUM_TMU {
+                        if let Some(tex) = self.texture_memory[tmu_idx].get_texture(addr) {
+                            let palette = self.texture_memory[tmu_idx]
+                                .get_palette(0)
+                                .map(|p| utility::texture::PaletteTable { entries: p.entries.clone() });
+                            to_upload.push((
+                                addr,
+                                utility::texture::TextureData::new(
+                                    tex.width, tex.height, tex.format, tex.data.clone(),
+                                ),
+                                palette,
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !to_upload.is_empty() {
+                if let Some(app) = &mut self.vulkan_app {
+                    app.texture_cache.batch_upload(
+                        &app.device,
+                        &self.vulkan_instance.instance,
+                        app.physical_device,
+                        app.command_pool,
+                        app.graphics_queue,
+                        to_upload,
+                    );
+                }
+            }
         }
 
         log::trace!(

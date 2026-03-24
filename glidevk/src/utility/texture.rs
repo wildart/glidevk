@@ -379,6 +379,120 @@ impl VulkanTexture {
         }
     }
 
+    /// Create a texture and record upload commands into an external command buffer.
+    /// Returns the texture and staging resources to be cleaned up after the cmd buffer completes.
+    pub fn new_into_cmd(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        cmd: vk::CommandBuffer,
+        width: u32,
+        height: u32,
+        rgba_data: &[u8],
+    ) -> (Self, vk::Buffer, vk::DeviceMemory) {
+        let image_size = (width * height * 4) as vk::DeviceSize;
+
+        let (staging_buffer, staging_memory) = Self::create_buffer(
+            device, instance, physical_device, image_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+
+        unsafe {
+            let data_ptr = device
+                .map_memory(staging_memory, 0, image_size, vk::MemoryMapFlags::empty())
+                .expect("Failed to map staging buffer");
+            std::ptr::copy_nonoverlapping(rgba_data.as_ptr(), data_ptr as *mut u8, rgba_data.len());
+            device.unmap_memory(staging_memory);
+        }
+
+        let image_create_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .samples(vk::SampleCountFlags::TYPE_1);
+
+        let image = unsafe {
+            device.create_image(&image_create_info, None).expect("Failed to create texture image")
+        };
+
+        let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
+        let memory_type = Self::find_memory_type(
+            instance, physical_device, mem_requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_requirements.size)
+            .memory_type_index(memory_type);
+
+        let memory = unsafe {
+            device.allocate_memory(&alloc_info, None).expect("Failed to allocate texture memory")
+        };
+
+        unsafe {
+            device.bind_image_memory(image, memory, 0).expect("Failed to bind texture memory");
+        }
+
+        // Record barriers + copy into the provided command buffer
+        let subresource_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1,
+        };
+
+        let barrier_to_dst = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(subresource_range)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0, base_array_layer: 0, layer_count: 1,
+            })
+            .image_extent(vk::Extent3D { width, height, depth: 1 });
+
+        let barrier_to_shader = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(subresource_range)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+
+        unsafe {
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[barrier_to_dst]);
+            device.cmd_copy_buffer_to_image(cmd, staging_buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &[barrier_to_shader]);
+        }
+
+        let view_create_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .subresource_range(subresource_range);
+
+        let view = unsafe {
+            device.create_image_view(&view_create_info, None).expect("Failed to create image view")
+        };
+
+        let texture = VulkanTexture { image, memory, view, width, height };
+        (texture, staging_buffer, staging_memory)
+    }
+
     fn create_buffer(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -943,6 +1057,87 @@ impl TextureCache {
             self.textures.len(),
             self.descriptor_sets.len()
         );
+    }
+
+    /// Batch-upload multiple textures in a single command buffer submission.
+    /// Much faster than individual uploads when loading many textures per frame.
+    pub fn batch_upload(
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        graphics_queue: vk::Queue,
+        textures: Vec<(u32, TextureData, Option<PaletteTable>)>,
+    ) {
+        if textures.is_empty() {
+            return;
+        }
+
+        let cmd = VulkanTexture::begin_single_time_commands(device, command_pool);
+        let mut staging_resources: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
+
+        for (address, texture_data, palette) in &textures {
+            let rgba_data = convert_to_rgba8(texture_data, palette.as_ref());
+
+            let (texture, staging_buf, staging_mem) = VulkanTexture::new_into_cmd(
+                device, instance, physical_device, cmd,
+                texture_data.width, texture_data.height, &rgba_data,
+            );
+            staging_resources.push((staging_buf, staging_mem));
+
+            // Create and update descriptor set
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.descriptor_pool)
+                .set_layouts(std::slice::from_ref(&self.descriptor_set_layout));
+
+            let descriptor_set = unsafe {
+                device.allocate_descriptor_sets(&alloc_info)
+                    .expect("Failed to allocate descriptor set")[0]
+            };
+
+            let image_info = vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(texture.view)
+                .sampler(self.sampler);
+
+            let descriptor_write = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&image_info));
+
+            unsafe {
+                device.update_descriptor_sets(&[descriptor_write], &[]);
+            }
+
+            // Defer old texture/descriptor destruction
+            let old_descriptor = self.descriptor_sets.remove(address);
+            if let Some(old_texture) = self.textures.remove(address) {
+                self.pending_destroy.push((old_texture, old_descriptor));
+                self.insertion_order.retain(|&a| a != *address);
+            }
+
+            self.textures.insert(*address, texture);
+            self.descriptor_sets.insert(*address, descriptor_set);
+            self.insertion_order.push(*address);
+        }
+
+        // Single submission for all texture uploads
+        VulkanTexture::end_single_time_commands_with_fence(
+            device, command_pool, graphics_queue, cmd, self.upload_fence,
+        );
+
+        // Cleanup all staging buffers
+        unsafe {
+            for (buf, mem) in staging_resources {
+                device.destroy_buffer(buf, None);
+                device.free_memory(mem, None);
+            }
+        }
+
+        log::debug!("Batch uploaded {} textures", textures.len());
     }
 
     /// Get descriptor set for a texture address (marks as recently used for LRU)
