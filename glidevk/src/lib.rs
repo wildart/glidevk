@@ -1050,13 +1050,14 @@ impl Gr {
         // Finalize vertex batch and get draw calls (copy to avoid borrow issues)
         let draw_calls: Vec<utility::vertex::DrawCall> = self.vertex_batch.finalize().to_vec();
 
-        // Collect textures needed this frame (for eviction protection)
+        // Collect textures needed this frame (for eviction protection and upload)
         let needed_textures: std::collections::HashSet<u32> =
             draw_calls.iter().map(|dc| dc.texture_addr).collect();
 
-        // Ensure all textures referenced in draw calls are uploaded to Vulkan
-        for draw_call in &draw_calls {
-            self.ensure_texture_uploaded_by_addr(draw_call.texture_addr);
+        // Upload textures BEFORE the fence wait so GPU upload overlaps with
+        // the previous frame's rendering (pipeline parallelism)
+        for &addr in &needed_textures {
+            self.ensure_texture_uploaded_by_addr(addr);
         }
 
         log::trace!(
