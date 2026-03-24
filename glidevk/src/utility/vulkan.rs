@@ -414,8 +414,8 @@ pub struct VulkanApp {
     /// The swapchain image index that was last presented (for front buffer reads)
     pub last_presented_image_index: u32,
 
-    // Vertex buffer for dynamic geometry
-    pub vertex_buffer: Option<super::vertex::VertexBuffer>,
+    // Vertex buffers for dynamic geometry (one per frame-in-flight to avoid data races)
+    pub vertex_buffers: Vec<super::vertex::VertexBuffer>,
     pub physical_device: vk::PhysicalDevice,
 
     // Depth buffer resources
@@ -533,8 +533,8 @@ impl Drop for VulkanApp {
                 self.device.destroy_fence(fence, None);
             }
 
-            // Destroy vertex buffer if present
-            if let Some(ref vb) = self.vertex_buffer {
+            // Destroy vertex buffers
+            for vb in &self.vertex_buffers {
                 vb.destroy(&self.device);
             }
             

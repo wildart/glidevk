@@ -515,16 +515,24 @@ impl VulkanTexture {
                 .end_command_buffer(command_buffer)
                 .expect("Failed to end command buffer");
 
+            // Use a fence instead of queue_wait_idle to avoid blocking on
+            // unrelated in-flight render/present work on the same queue
+            let fence_info = vk::FenceCreateInfo::default();
+            let fence = device
+                .create_fence(&fence_info, None)
+                .expect("Failed to create upload fence");
+
             let submit_info =
                 vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
 
             device
-                .queue_submit(queue, &[submit_info], vk::Fence::null())
+                .queue_submit(queue, &[submit_info], fence)
                 .expect("Failed to submit command buffer");
             device
-                .queue_wait_idle(queue)
-                .expect("Failed to wait for queue");
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .expect("Failed to wait for upload fence");
 
+            device.destroy_fence(fence, None);
             device.free_command_buffers(command_pool, &[command_buffer]);
         }
     }
@@ -553,6 +561,8 @@ pub struct TextureCache {
     /// Placeholder texture (1x1 white) for when no texture is bound
     placeholder: Option<VulkanTexture>,
     placeholder_descriptor: vk::DescriptorSet,
+    /// Textures/descriptors pending destruction (deferred until GPU is idle)
+    pending_destroy: Vec<(VulkanTexture, Option<vk::DescriptorSet>)>,
 }
 
 impl TextureCache {
@@ -634,6 +644,7 @@ impl TextureCache {
             insertion_order: Vec::new(),
             placeholder: None,
             placeholder_descriptor,
+            pending_destroy: Vec::new(),
         }
     }
 
@@ -806,17 +817,11 @@ impl TextureCache {
             device.update_descriptor_sets(&[descriptor_write], &[]);
         }
 
-        // Remove old texture and descriptor set if they exist
+        // Defer destruction of old texture/descriptor (may still be in-flight)
+        let old_descriptor = self.descriptor_sets.remove(&address);
         if let Some(old_texture) = self.textures.remove(&address) {
-            old_texture.destroy(device);
+            self.pending_destroy.push((old_texture, old_descriptor));
             self.insertion_order.retain(|&a| a != address);
-        }
-        if let Some(old_descriptor_set) = self.descriptor_sets.remove(&address) {
-            unsafe {
-                device
-                    .free_descriptor_sets(self.descriptor_pool, &[old_descriptor_set])
-                    .ok(); // Ignore errors - might fail if pool was created without FREE flag
-            }
         }
 
         self.textures.insert(address, texture);
@@ -915,20 +920,28 @@ impl TextureCache {
         }
     }
 
-    /// Invalidate (remove) a texture from the cache
-    /// Call this when the game downloads new texture data to an address
-    pub fn invalidate_texture(&mut self, device: &ash::Device, address: u32) {
-        // Free the descriptor set first
-        if let Some(descriptor_set) = self.descriptor_sets.remove(&address) {
-            unsafe {
-                let _ = device.free_descriptor_sets(self.descriptor_pool, &[descriptor_set]);
-            }
-        }
-        // Destroy and remove the texture
+    /// Invalidate (remove) a texture from the cache.
+    /// Destruction is deferred until flush_pending_destroy() is called after
+    /// all in-flight GPU work referencing this texture has completed.
+    pub fn invalidate_texture(&mut self, _device: &ash::Device, address: u32) {
+        let descriptor = self.descriptor_sets.remove(&address);
         if let Some(texture) = self.textures.remove(&address) {
-            texture.destroy(device);
+            self.pending_destroy.push((texture, descriptor));
             self.insertion_order.retain(|&a| a != address);
-            log::trace!("Invalidated texture at {:#x}", address);
+            log::trace!("Invalidated texture at {:#x} (deferred destroy)", address);
+        }
+    }
+
+    /// Destroy textures that were previously invalidated.
+    /// Must only be called after all in-flight GPU work has completed.
+    pub fn flush_pending_destroy(&mut self, device: &ash::Device) {
+        for (texture, descriptor) in self.pending_destroy.drain(..) {
+            if let Some(ds) = descriptor {
+                unsafe {
+                    let _ = device.free_descriptor_sets(self.descriptor_pool, &[ds]);
+                }
+            }
+            texture.destroy(device);
         }
     }
 

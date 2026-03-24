@@ -773,19 +773,27 @@ impl Gr {
                 swapchain_image_count
             );
 
-            // Create vertex buffer for dynamic geometry
+            // Create vertex buffers (one per frame-in-flight to avoid data races)
             let vertex_buffer_size = (MAX_VERTICES
                 * std::mem::size_of::<utility::vertex::GpuVertex>())
                 as vk::DeviceSize;
-            let vertex_buffer = utility::vertex::VertexBuffer::new(
-                &logical_device,
-                instance,
-                physical_device,
-                vertex_buffer_size,
-                vk::BufferUsageFlags::VERTEX_BUFFER,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            let mut vertex_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+            for _ in 0..MAX_FRAMES_IN_FLIGHT {
+                vertex_buffers.push(utility::vertex::VertexBuffer::new(
+                    &logical_device,
+                    instance,
+                    physical_device,
+                    vertex_buffer_size,
+                    vk::BufferUsageFlags::VERTEX_BUFFER,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                ));
+            }
+            log::debug!(
+                "Created {} vertex buffers ({} bytes each)",
+                MAX_FRAMES_IN_FLIGHT,
+                vertex_buffer_size
             );
-            log::debug!("Created vertex buffer ({} bytes)", vertex_buffer_size);
 
             // Create placeholder texture for the texture cache
             texture_cache.create_placeholder(
@@ -823,7 +831,7 @@ impl Gr {
                 current_image_index: 0,
                 last_presented_image_index: 0,
 
-                vertex_buffer: Some(vertex_buffer),
+                vertex_buffers,
                 physical_device,
 
                 depth_image,
@@ -1002,6 +1010,10 @@ impl Gr {
                     .reset_fences(&[app.in_flight_fences[frame]])
                     .expect("Failed to reset fence");
 
+                // Flush deferred texture/descriptor destruction now that this
+                // frame slot's GPU work is complete
+                app.texture_cache.flush_pending_destroy(&app.device);
+
                 // Evict unused textures — must happen after fence wait so no
                 // in-flight frame in THIS slot is still referencing them.
                 // Wait for ALL slots to ensure the other slot is also done.
@@ -1034,11 +1046,13 @@ impl Gr {
                     }
                 };
 
-                // Upload vertex data to GPU buffer
+                // Upload vertex data to this frame's vertex buffer
                 if vertex_count > 0 {
-                    if let Some(ref vertex_buffer) = app.vertex_buffer {
-                        utility::vertex::upload_to_buffer(&app.device, vertex_buffer, &vertex_data);
-                    }
+                    utility::vertex::upload_to_buffer(
+                        &app.device,
+                        &app.vertex_buffers[frame],
+                        &vertex_data,
+                    );
                 }
 
                 // Record command buffer for this frame
@@ -1113,10 +1127,14 @@ impl Gr {
 
                 // Draw triangles if we have any
                 if vertex_count > 0 && !draw_calls.is_empty() {
-                    if let Some(ref vertex_buffer) = app.vertex_buffer {
-                        // Bind vertex buffer
-                        app.device
-                            .cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer.buffer], &[0]);
+                    {
+                        // Bind this frame's vertex buffer
+                        app.device.cmd_bind_vertex_buffers(
+                            cmd,
+                            0,
+                            &[app.vertex_buffers[frame].buffer],
+                            &[0],
+                        );
 
                         // Issue draw calls with per-draw texture binding, blend mode, and push constants
                         for draw_call in &draw_calls {
