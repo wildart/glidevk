@@ -1140,15 +1140,10 @@ impl TextureCache {
         log::debug!("Batch uploaded {} textures", textures.len());
     }
 
-    /// Get descriptor set for a texture address (marks as recently used for LRU)
-    pub fn get_descriptor_set(&mut self, address: u32) -> vk::DescriptorSet {
-        if self.descriptor_sets.contains_key(&address) {
-            // Move to back of LRU order
-            if let Some(pos) = self.insertion_order.iter().position(|&a| a == address) {
-                self.insertion_order.remove(pos);
-                self.insertion_order.push(address);
-            }
-        }
+    /// Get descriptor set for a texture address
+    pub fn get_descriptor_set(&self, address: u32) -> vk::DescriptorSet {
+        // Skip LRU reordering here — it's O(n) per call and called hundreds of
+        // times per frame. Eviction uses insertion order which is good enough.
         self.descriptor_sets
             .get(&address)
             .copied()

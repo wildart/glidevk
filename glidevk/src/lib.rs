@@ -1266,7 +1266,12 @@ impl Gr {
                             &[0],
                         );
 
-                        // Issue draw calls with per-draw texture binding, blend mode, and push constants
+                        // Track previous state to skip redundant GPU commands
+                        let mut prev_texture_addr: u32 = u32::MAX;
+                        let mut prev_push_bytes: [u8; 96] = [0; 96];
+                        let mut first_draw = true;
+
+                        // Issue draw calls, skipping redundant state changes
                         for draw_call in &draw_calls {
                             // Switch pipeline if blend mode changed
                             if draw_call.blend_mode != current_blend_mode {
@@ -1279,19 +1284,16 @@ impl Gr {
                                     current_blend_mode = draw_call.blend_mode;
                                 }
                             }
-                            // Get texture size for this draw call
+
+                            // Build push constants
                             let (tex_width, tex_height) =
                                 app.texture_cache.get_texture_size(draw_call.texture_addr);
-
-                            // Calculate base texture size (for UV normalization)
-                            // Glide textures have a max dimension of 256, scaled by aspect ratio
                             let (base_width, base_height) = if tex_width >= tex_height {
                                 (256.0, 256.0 * tex_height as f32 / tex_width as f32)
                             } else {
                                 (256.0 * tex_width as f32 / tex_height as f32, 256.0)
                             };
 
-                            // Push constants with per-draw-call combine state
                             let cs = &draw_call.combine_state;
                             let push_constants = utility::vertex::PushConstants {
                                 screen_size: [screen_width as f32, screen_height as f32],
@@ -1316,29 +1318,39 @@ impl Gr {
                                 fog_color_g: fog_g,
                                 fog_color_b: fog_b,
                             };
+
+                            // Only push constants if they changed
                             let push_data = std::slice::from_raw_parts(
                                 &push_constants as *const _ as *const u8,
                                 std::mem::size_of::<utility::vertex::PushConstants>(),
                             );
-                            app.device.cmd_push_constants(
-                                cmd,
-                                app.pipeline_layout,
-                                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                                0,
-                                push_data,
-                            );
+                            if first_draw || push_data != &prev_push_bytes[..push_data.len()] {
+                                app.device.cmd_push_constants(
+                                    cmd,
+                                    app.pipeline_layout,
+                                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                                    0,
+                                    push_data,
+                                );
+                                prev_push_bytes[..push_data.len()].copy_from_slice(push_data);
+                            }
 
-                            // Bind texture descriptor set for this draw call
-                            let descriptor_set =
-                                app.texture_cache.get_descriptor_set(draw_call.texture_addr);
-                            app.device.cmd_bind_descriptor_sets(
-                                cmd,
-                                vk::PipelineBindPoint::GRAPHICS,
-                                app.pipeline_layout,
-                                0,
-                                &[descriptor_set],
-                                &[],
-                            );
+                            // Only bind descriptor set if texture changed
+                            if draw_call.texture_addr != prev_texture_addr {
+                                let descriptor_set =
+                                    app.texture_cache.get_descriptor_set(draw_call.texture_addr);
+                                app.device.cmd_bind_descriptor_sets(
+                                    cmd,
+                                    vk::PipelineBindPoint::GRAPHICS,
+                                    app.pipeline_layout,
+                                    0,
+                                    &[descriptor_set],
+                                    &[],
+                                );
+                                prev_texture_addr = draw_call.texture_addr;
+                            }
+
+                            first_draw = false;
 
                             // Draw this batch
                             app.device.cmd_draw(
