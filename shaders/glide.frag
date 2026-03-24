@@ -189,7 +189,10 @@ void main() {
     // Evaluate alpha combine function
     float resultA;
     if (pc.alphaCombineFunction == CF_ZERO) {
-        resultA = 0.0;
+        // Spec says 0, but some games use CF_ZERO to mean "alpha doesn't matter"
+        // and rely on blend functions for opacity. Outputting 0 makes everything
+        // invisible with srcAlpha blending. Output 1.0 for compatibility.
+        resultA = 1.0;
     } else if (pc.alphaCombineFunction == CF_LOCAL) {
         resultA = a_local;
     } else if (pc.alphaCombineFunction == CF_LOCAL_ALPHA) {
