@@ -45,12 +45,15 @@ fn push_quad(
     x1: f32, y1: f32, x2: f32, y2: f32,
     color: [f32; 4],
 ) {
+    // CF_LOCAL(1) for both color and alpha, all other fields 0
+    let fps_flags: u32 = 1 | (1 << 5);
     let v = |x: f32, y: f32| utility::vertex::GpuVertex {
         position: [x, y],
         color,
         tex_coord: [0.0, 0.0],
         oow: 1.0,
         constant_color: color,
+        combine_flags: fps_flags,
     };
     vertices.push(v(x1, y1));
     vertices.push(v(x2, y1));
@@ -1297,7 +1300,6 @@ impl Gr {
                                 (256.0 * tex_width as f32 / tex_height as f32, 256.0)
                             };
 
-                            let cs = &draw_call.combine_state;
                             let push_constants = utility::vertex::PushConstants {
                                 screen_size: [screen_width as f32, screen_height as f32],
                                 texture_size: [base_width, base_height],
@@ -1307,14 +1309,6 @@ impl Gr {
                                 } else {
                                     0.0
                                 },
-                                color_combine_function: cs.color_combine_function,
-                                color_combine_other: cs.color_combine_other,
-                                alpha_combine_function: cs.alpha_combine_function,
-                                alpha_combine_local: cs.alpha_combine_local,
-                                color_combine_factor: cs.color_combine_factor,
-                                alpha_combine_factor: cs.alpha_combine_factor,
-                                color_combine_local: cs.color_combine_local,
-                                alpha_combine_other: cs.alpha_combine_other,
                                 fog_mode,
                                 fog_color_r: fog_r,
                                 fog_color_g: fog_g,
@@ -1464,14 +1458,6 @@ impl Gr {
                                 texture_size: [1.0, 1.0],
                                 chromakey_color: [0.0, 0.0, 0.0],
                                 chromakey_enabled: 0.0,
-                                color_combine_function: 1, // CF_LOCAL
-                                color_combine_other: 0,
-                                alpha_combine_function: 1, // CF_LOCAL
-                                alpha_combine_local: 0,
-                                color_combine_factor: 0,
-                                alpha_combine_factor: 0,
-                                color_combine_local: 0,
-                                alpha_combine_other: 0,
                                 fog_mode: 0,
                                 fog_color_r: 0.0,
                                 fog_color_g: 0.0,
@@ -1788,7 +1774,6 @@ impl Gr {
         self.state.color_combine_local = local;
         self.state.color_combine_other = other;
         self.state.color_combine_invert = invert == FxBool::True;
-        self.sync_combine_state();
         log::trace!(
             "Color combine: function={:?}, factor={:?}, local={:?}, other={:?}, invert={:?}",
             function, factor, local, other, invert
@@ -1796,9 +1781,6 @@ impl Gr {
     }
 
     /// grAlphaCombine - configure the alpha combine unit
-    ///
-    /// Determines how the final pixel alpha is computed from local alpha,
-    /// "other" alpha (texture or iterated), and a scale factor.
     pub fn alpha_combine(
         &mut self,
         function: CombineFunction,
@@ -1812,32 +1794,29 @@ impl Gr {
         self.state.alpha_combine_local = local;
         self.state.alpha_combine_other = other;
         self.state.alpha_combine_invert = invert == FxBool::True;
-        self.sync_combine_state();
         log::trace!(
             "Alpha combine: function={:?}, factor={:?}, local={:?}, other={:?}, invert={:?}",
             function, factor, local, other, invert
         );
     }
 
+    /// Pack current combine state into a u32 for per-vertex storage
+    fn current_combine_flags(&self) -> u32 {
+        let ccf = self.state.color_combine_function as u32 & 0x1F;
+        let acf = (self.state.alpha_combine_function as u32 & 0x1F) << 5;
+        let ccfr = (self.state.color_combine_factor as u32 & 0xF) << 10;
+        let acfr = (self.state.alpha_combine_factor as u32 & 0xF) << 14;
+        let cco = (self.state.color_combine_other as u32 & 0x3) << 18;
+        let acl = (self.state.alpha_combine_local as u32 & 0x3) << 20;
+        let ccl = (self.state.color_combine_local as u32 & 0x3) << 22;
+        let aco = (self.state.alpha_combine_other as u32 & 0x3) << 24;
+        ccf | acf | ccfr | acfr | cco | acl | ccl | aco
+    }
+
     /// Get the current constant color as normalized RGBA floats
     fn current_constant_color(&self) -> [f32; 4] {
         let (r, g, b, a) = self.state.constant_color.to_rgba_f(self.state.color_format);
         [r, g, b, a]
-    }
-
-    /// Push current combine mode state to the vertex batch (combine modes only, not constant color)
-    fn sync_combine_state(&mut self) {
-        let state = utility::vertex::CombineState {
-            color_combine_function: self.state.color_combine_function as i32,
-            color_combine_other: self.state.color_combine_other as i32,
-            alpha_combine_function: self.state.alpha_combine_function as i32,
-            alpha_combine_local: self.state.alpha_combine_local as i32,
-            color_combine_factor: self.state.color_combine_factor as i32,
-            alpha_combine_factor: self.state.alpha_combine_factor as i32,
-            color_combine_local: self.state.color_combine_local as i32,
-            alpha_combine_other: self.state.alpha_combine_other as i32,
-        };
-        self.vertex_batch.set_combine_state(state);
     }
 
     // ==================== Fog Functions ====================
@@ -2623,14 +2602,15 @@ impl Gr {
             }
         }
 
-        // Convert Glide vertices to GPU vertices, stamp constant color per-vertex
+        // Stamp per-vertex state (constant color + packed combine flags)
         let cc = self.current_constant_color();
+        let cf = self.current_combine_flags();
         let mut v0 = utility::vertex::GpuVertex::from_glide_vertex(&a);
         let mut v1 = utility::vertex::GpuVertex::from_glide_vertex(&b);
         let mut v2 = utility::vertex::GpuVertex::from_glide_vertex(&c);
-        v0.constant_color = cc;
-        v1.constant_color = cc;
-        v2.constant_color = cc;
+        v0.constant_color = cc; v0.combine_flags = cf;
+        v1.constant_color = cc; v1.combine_flags = cf;
+        v2.constant_color = cc; v2.combine_flags = cf;
 
         if !self.vertex_batch.push_triangle(v0, v1, v2) {
             log::warn!("Vertex batch full, triangle dropped");
@@ -2654,6 +2634,7 @@ impl Gr {
 
         let mut gpu_v = utility::vertex::GpuVertex::from_glide_vertex(&pt);
         gpu_v.constant_color = self.current_constant_color();
+        gpu_v.combine_flags = self.current_combine_flags();
         let x = gpu_v.position[0];
         let y = gpu_v.position[1];
 
@@ -2703,10 +2684,11 @@ impl Gr {
         const LINE_WIDTH: f32 = 0.5;
 
         let cc = self.current_constant_color();
+        let cf = self.current_combine_flags();
         let mut gpu_v1 = utility::vertex::GpuVertex::from_glide_vertex(&v1);
         let mut gpu_v2 = utility::vertex::GpuVertex::from_glide_vertex(&v2);
-        gpu_v1.constant_color = cc;
-        gpu_v2.constant_color = cc;
+        gpu_v1.constant_color = cc; gpu_v1.combine_flags = cf;
+        gpu_v2.constant_color = cc; gpu_v2.combine_flags = cf;
 
         let x1 = gpu_v1.position[0];
         let y1 = gpu_v1.position[1];
@@ -2773,6 +2755,7 @@ impl Gr {
         let cull_mode = self.state.cull_mode;
         let vertex_size = layout.vertex_size();
         let cc = self.current_constant_color();
+        let cf = self.current_combine_flags();
 
         // Extract vertices using the configured layout
         let gpu_vertices: Vec<utility::vertex::GpuVertex> = (0..count as usize)
@@ -2794,6 +2777,7 @@ impl Gr {
                     x, y, r, g, b, a, s, t, oow,
                 );
                 v.constant_color = cc;
+                v.combine_flags = cf;
                 Some(v)
             })
             .collect();
@@ -2820,6 +2804,7 @@ impl Gr {
         let cull_mode = self.state.cull_mode;
         let current_texture = self.vertex_batch.current_texture();
         let cc = self.current_constant_color();
+        let cf = self.current_combine_flags();
 
         // Log small texture draws (likely glyphs) for debugging
         static LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2873,6 +2858,7 @@ impl Gr {
 
                 let mut v = utility::vertex::GpuVertex::from_layout_data(x, y, r, g, b, a, s, t, oow);
                 v.constant_color = cc;
+                v.combine_flags = cf;
                 v
             })
             .collect();
