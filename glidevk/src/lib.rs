@@ -25,6 +25,98 @@ const RENDERER: &[u8] = b"Glide\0";
 const VENDOR: &[u8] = b"3Dfx Interactive\0";
 const VERSION: &[u8] = b"3.0\0";
 
+// --- FPS overlay helpers ---
+
+fn fps_digits(mut fps: u32) -> Vec<u8> {
+    if fps == 0 {
+        return vec![0];
+    }
+    let mut digits = Vec::new();
+    while fps > 0 {
+        digits.push((fps % 10) as u8);
+        fps /= 10;
+    }
+    digits.reverse();
+    digits
+}
+
+fn push_quad(
+    vertices: &mut Vec<utility::vertex::GpuVertex>,
+    x1: f32, y1: f32, x2: f32, y2: f32,
+    color: [f32; 4],
+) {
+    let v = |x: f32, y: f32| utility::vertex::GpuVertex {
+        position: [x, y],
+        color,
+        tex_coord: [0.0, 0.0],
+        oow: 1.0,
+    };
+    vertices.push(v(x1, y1));
+    vertices.push(v(x2, y1));
+    vertices.push(v(x1, y2));
+    vertices.push(v(x2, y1));
+    vertices.push(v(x2, y2));
+    vertices.push(v(x1, y2));
+}
+
+/// Draw a digit (0-9) as a 7-segment display using colored quads
+fn draw_7seg_digit(
+    vertices: &mut Vec<utility::vertex::GpuVertex>,
+    x: f32, y: f32, w: f32, h: f32, digit: u8,
+    color: [f32; 4],
+) {
+    // Segments: top, top-left, top-right, middle, bottom-left, bottom-right, bottom
+    //  _        segment 0
+    // |_|       segments 1,3,2
+    // |_|       segments 4,6,5
+    let t = 1.5; // segment thickness
+    let mid = h / 2.0;
+
+    // Segment bitmask per digit: bits = 0:top 1:top-left 2:top-right 3:mid 4:bot-left 5:bot-right 6:bot
+    let segments: [u8; 10] = [
+        0b1110111, // 0
+        0b0000110, // 1
+        0b1011101, // 2
+        0b1001111, // 3
+        0b0101110, // 4
+        0b1101011, // 5
+        0b1111011, // 6
+        0b0000111, // 7
+        0b1111111, // 8
+        0b1101111, // 9
+    ];
+    let s = segments[digit as usize % 10];
+
+    // Top horizontal
+    if s & (1 << 0) != 0 {
+        push_quad(vertices, x, y, x + w, y + t, color);
+    }
+    // Top-left vertical
+    if s & (1 << 1) != 0 {
+        push_quad(vertices, x, y, x + t, y + mid, color);
+    }
+    // Top-right vertical
+    if s & (1 << 2) != 0 {
+        push_quad(vertices, x + w - t, y, x + w, y + mid, color);
+    }
+    // Middle horizontal
+    if s & (1 << 3) != 0 {
+        push_quad(vertices, x, y + mid - t / 2.0, x + w, y + mid + t / 2.0, color);
+    }
+    // Bottom-left vertical
+    if s & (1 << 4) != 0 {
+        push_quad(vertices, x, y + mid, x + t, y + h, color);
+    }
+    // Bottom-right vertical
+    if s & (1 << 5) != 0 {
+        push_quad(vertices, x + w - t, y + mid, x + w, y + h, color);
+    }
+    // Bottom horizontal
+    if s & (1 << 6) != 0 {
+        push_quad(vertices, x, y + h - t, x + w, y + h, color);
+    }
+}
+
 //  error management
 extern "C" fn error_callback(string: *const c_char, fatal: FxBool) {
     let qualifier = if fatal == FxBool::True {
@@ -297,6 +389,14 @@ pub struct Gr {
     texture_memory: [utility::texture::TextureMemory; GLIDE_NUM_TMU],
     /// LFB lock state
     lfb_lock_state: LfbLockState,
+    /// FPS counter state
+    fps_counter: FpsCounter,
+}
+
+struct FpsCounter {
+    last_time: std::time::Instant,
+    frame_count: u32,
+    display_fps: u32,
 }
 
 /// Maximum vertices per frame (enough for ~21k triangles)
@@ -335,6 +435,11 @@ impl Gr {
                 utility::texture::TextureMemory::new(texture_memory_bytes),
             ],
             lfb_lock_state: LfbLockState::default(),
+            fps_counter: FpsCounter {
+                last_time: std::time::Instant::now(),
+                frame_count: 0,
+                display_fps: 0,
+            },
         }
     }
 
@@ -1226,6 +1331,147 @@ impl Gr {
                             );
                         }
                         log::trace!("buffer_swap: completed {} draw calls", draw_calls.len());
+                    }
+                }
+
+                // Draw FPS counter overlay if enabled
+                if self.config.render.fps != config::FpsPosition::Off {
+                    self.fps_counter.frame_count += 1;
+                    let now = std::time::Instant::now();
+                    let elapsed = now.duration_since(self.fps_counter.last_time);
+                    if elapsed.as_secs_f32() >= 1.0 {
+                        self.fps_counter.display_fps = (self.fps_counter.frame_count as f32
+                            / elapsed.as_secs_f32())
+                            as u32;
+                        self.fps_counter.frame_count = 0;
+                        self.fps_counter.last_time = now;
+                    }
+
+                    let fps = self.fps_counter.display_fps;
+                    if fps > 0 {
+                        let sw = screen_width as f32;
+                        let sh = screen_height as f32;
+                        let digits = fps_digits(fps);
+                        let digit_w = 6.0;
+                        let digit_h = 10.0;
+                        let padding = 2.0;
+                        let total_w =
+                            digits.len() as f32 * (digit_w + padding) - padding + padding * 2.0;
+
+                        let (start_x, start_y) = match self.config.render.fps {
+                            config::FpsPosition::TopLeft => (padding, padding),
+                            config::FpsPosition::TopRight => (sw - total_w - padding, padding),
+                            config::FpsPosition::BottomLeft => (padding, sh - digit_h - padding * 3.0),
+                            config::FpsPosition::BottomRight => {
+                                (sw - total_w - padding, sh - digit_h - padding * 3.0)
+                            }
+                            config::FpsPosition::Off => unreachable!(),
+                        };
+
+                        // Build FPS overlay vertices
+                        let mut fps_vertices = Vec::new();
+                        // Background quad
+                        let bg_x1 = start_x - padding;
+                        let bg_y1 = start_y - padding;
+                        let bg_x2 = start_x + total_w;
+                        let bg_y2 = start_y + digit_h + padding;
+                        push_quad(
+                            &mut fps_vertices,
+                            bg_x1, bg_y1, bg_x2, bg_y2,
+                            [0.0, 0.0, 0.0, 0.6],
+                        );
+                        // Digit quads (7-segment)
+                        let mut cx = start_x;
+                        for &d in &digits {
+                            draw_7seg_digit(
+                                &mut fps_vertices,
+                                cx, start_y, digit_w, digit_h, d,
+                                [0.0, 1.0, 0.0, 1.0],
+                            );
+                            cx += digit_w + padding;
+                        }
+
+                        // Upload FPS vertices to current frame's buffer (appended after game vertices)
+                        let fps_start = vertex_count as u32;
+                        let fps_count = fps_vertices.len() as u32;
+                        let fps_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(
+                                fps_vertices.as_ptr() as *const u8,
+                                fps_vertices.len()
+                                    * std::mem::size_of::<utility::vertex::GpuVertex>(),
+                            )
+                        };
+                        let offset = vertex_count
+                            * std::mem::size_of::<utility::vertex::GpuVertex>();
+                        let vb = &app.vertex_buffers[frame];
+                        if offset + fps_bytes.len() <= vb.size as usize {
+                            let data_ptr = app.device.map_memory(
+                                vb.memory,
+                                offset as vk::DeviceSize,
+                                fps_bytes.len() as vk::DeviceSize,
+                                vk::MemoryMapFlags::empty(),
+                            ).expect("Failed to map memory for FPS overlay");
+                            std::ptr::copy_nonoverlapping(
+                                fps_bytes.as_ptr(),
+                                data_ptr as *mut u8,
+                                fps_bytes.len(),
+                            );
+                            app.device.unmap_memory(vb.memory);
+
+                            // Draw with CF_LOCAL (vertex color only), alpha blend, placeholder texture
+                            let fps_push = utility::vertex::PushConstants {
+                                screen_size: [sw, sh],
+                                texture_size: [1.0, 1.0],
+                                chromakey_color: [0.0, 0.0, 0.0],
+                                chromakey_enabled: 0.0,
+                                color_combine_function: 1, // CF_LOCAL
+                                color_combine_other: 0,
+                                alpha_combine_function: 1, // CF_LOCAL
+                                alpha_combine_local: 0,
+                                constant_color: [0.0; 4],
+                                color_combine_factor: 0,
+                                alpha_combine_factor: 0,
+                                color_combine_local: 0,
+                                alpha_combine_other: 0,
+                                fog_mode: 0,
+                                fog_color_r: 0.0,
+                                fog_color_g: 0.0,
+                                fog_color_b: 0.0,
+                            };
+                            let fps_push_data = std::slice::from_raw_parts(
+                                &fps_push as *const _ as *const u8,
+                                std::mem::size_of::<utility::vertex::PushConstants>(),
+                            );
+                            app.device.cmd_push_constants(
+                                cmd,
+                                app.pipeline_layout,
+                                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                                0,
+                                fps_push_data,
+                            );
+
+                            // Switch to alpha blend pipeline for transparent background
+                            let blend_pipeline =
+                                app.graphics_pipelines[&utility::vertex::BlendMode::AlphaBlend];
+                            app.device.cmd_bind_pipeline(
+                                cmd,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                blend_pipeline,
+                            );
+
+                            // Bind placeholder texture (1x1 white)
+                            let placeholder_ds = app.texture_cache.get_descriptor_set(0);
+                            app.device.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                app.pipeline_layout,
+                                0,
+                                &[placeholder_ds],
+                                &[],
+                            );
+
+                            app.device.cmd_draw(cmd, fps_count, 1, fps_start, 0);
+                        }
                     }
                 }
 

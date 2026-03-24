@@ -199,6 +199,23 @@ impl Default for TextureConfig {
     }
 }
 
+/// FPS counter position
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FpsPosition {
+    /// Disabled
+    #[default]
+    Off,
+    /// Top-left corner
+    TopLeft,
+    /// Top-right corner
+    TopRight,
+    /// Bottom-left corner
+    BottomLeft,
+    /// Bottom-right corner
+    BottomRight,
+}
+
 /// Rendering quality settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -213,6 +230,10 @@ pub struct RenderConfig {
 
     /// Supersampling factor (1 = disabled, 2 = 2x, 4 = 4x)
     pub supersampling: u32,
+
+    /// Show FPS counter
+    /// Options: "off", "top-left", "top-right", "bottom-left", "bottom-right"
+    pub fps: FpsPosition,
 }
 
 impl Default for RenderConfig {
@@ -221,6 +242,7 @@ impl Default for RenderConfig {
             bilinear_filtering: true,
             vsync: true,
             supersampling: 1,
+            fps: FpsPosition::Off,
         }
     }
 }
