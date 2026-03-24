@@ -165,7 +165,6 @@ pub struct VulkanTexture {
 }
 
 impl VulkanTexture {
-    /// Create a new Vulkan texture from RGBA8 data
     pub fn new(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -175,6 +174,7 @@ impl VulkanTexture {
         width: u32,
         height: u32,
         rgba_data: &[u8],
+        upload_fence: Option<vk::Fence>,
     ) -> Self {
         let image_size = (width * height * 4) as vk::DeviceSize;
 
@@ -336,7 +336,13 @@ impl VulkanTexture {
             }
 
             // Single submission for all operations
-            Self::end_single_time_commands(device, command_pool, graphics_queue, cmd);
+            if let Some(fence) = upload_fence {
+                Self::end_single_time_commands_with_fence(
+                    device, command_pool, graphics_queue, cmd, fence,
+                );
+            } else {
+                Self::end_single_time_commands(device, command_pool, graphics_queue, cmd);
+            }
         }
 
         // Cleanup staging buffer
@@ -575,17 +581,42 @@ impl VulkanTexture {
         queue: vk::Queue,
         command_buffer: vk::CommandBuffer,
     ) {
+        // Uses queue_wait_idle since this is called during init (placeholder texture).
+        // For frame-time uploads, use end_single_time_commands_with_fence.
         unsafe {
             device
                 .end_command_buffer(command_buffer)
                 .expect("Failed to end command buffer");
 
-            // Use a fence instead of queue_wait_idle to avoid blocking on
-            // unrelated in-flight render/present work on the same queue
-            let fence_info = vk::FenceCreateInfo::default();
-            let fence = device
-                .create_fence(&fence_info, None)
-                .expect("Failed to create upload fence");
+            let submit_info =
+                vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
+
+            device
+                .queue_submit(queue, &[submit_info], vk::Fence::null())
+                .expect("Failed to submit command buffer");
+            device
+                .queue_wait_idle(queue)
+                .expect("Failed to wait for queue");
+
+            device.free_command_buffers(command_pool, &[command_buffer]);
+        }
+    }
+
+    fn end_single_time_commands_with_fence(
+        device: &ash::Device,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        command_buffer: vk::CommandBuffer,
+        fence: vk::Fence,
+    ) {
+        unsafe {
+            device
+                .end_command_buffer(command_buffer)
+                .expect("Failed to end command buffer");
+
+            device
+                .reset_fences(&[fence])
+                .expect("Failed to reset upload fence");
 
             let submit_info =
                 vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
@@ -597,7 +628,6 @@ impl VulkanTexture {
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .expect("Failed to wait for upload fence");
 
-            device.destroy_fence(fence, None);
             device.free_command_buffers(command_pool, &[command_buffer]);
         }
     }
@@ -628,6 +658,8 @@ pub struct TextureCache {
     placeholder_descriptor: vk::DescriptorSet,
     /// Textures/descriptors pending destruction (deferred until GPU is idle)
     pending_destroy: Vec<(VulkanTexture, Option<vk::DescriptorSet>)>,
+    /// Reusable fence for texture upload submissions (avoids create/destroy per upload)
+    upload_fence: vk::Fence,
 }
 
 impl TextureCache {
@@ -700,6 +732,15 @@ impl TextureCache {
                 .expect("Failed to allocate placeholder descriptor set")[0]
         };
 
+        let upload_fence = unsafe {
+            // Start signaled so first reset_fences succeeds
+            let fence_info = vk::FenceCreateInfo::default()
+                .flags(vk::FenceCreateFlags::SIGNALED);
+            device
+                .create_fence(&fence_info, None)
+                .expect("Failed to create upload fence")
+        };
+
         TextureCache {
             textures: HashMap::new(),
             sampler,
@@ -710,6 +751,7 @@ impl TextureCache {
             placeholder: None,
             placeholder_descriptor,
             pending_destroy: Vec::new(),
+            upload_fence,
         }
     }
 
@@ -736,6 +778,7 @@ impl TextureCache {
             width,
             height,
             rgba_data,
+            None, // init-time upload, no reusable fence
         );
 
         // Allocate descriptor set
@@ -805,6 +848,7 @@ impl TextureCache {
             1,
             1,
             &white_pixel,
+            None, // init-time upload
         );
 
         // Update placeholder descriptor set
@@ -842,7 +886,7 @@ impl TextureCache {
         // Convert texture to RGBA8
         let rgba_data = convert_to_rgba8(texture_data, palette);
 
-        // Create Vulkan texture
+        // Create Vulkan texture (use reusable fence for frame-time uploads)
         let texture = VulkanTexture::new(
             device,
             instance,
@@ -852,6 +896,7 @@ impl TextureCache {
             texture_data.width,
             texture_data.height,
             &rgba_data,
+            Some(self.upload_fence),
         );
 
         // Allocate descriptor set
