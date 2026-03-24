@@ -1677,7 +1677,7 @@ impl Gr {
         };
         self.vertex_batch.set_blend_mode(blend_mode);
 
-        log::trace!(
+        log::debug!(
             "Alpha blend function set to: RGB({:?}, {:?}), Alpha({:?}, {:?}) → {:?}",
             rgb_sf,
             rgb_df,

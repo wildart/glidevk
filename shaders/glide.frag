@@ -189,10 +189,10 @@ void main() {
     // Evaluate alpha combine function
     float resultA;
     if (pc.alphaCombineFunction == CF_ZERO) {
-        // Spec says 0, but games use CF_ZERO to mean "alpha combine is irrelevant".
-        // Pass through texture alpha so srcAlpha blending still works for
-        // semi-transparent UI surfaces.
-        resultA = texColor.a;
+        // Spec says 0, but on real Voodoo hardware CF_ZERO bypasses the combine
+        // unit and passes iterated vertex alpha to the blender. Legacy Glide
+        // games use per-vertex alpha for UI background transparency.
+        resultA = fragColor.a;
     } else if (pc.alphaCombineFunction == CF_LOCAL) {
         resultA = a_local;
     } else if (pc.alphaCombineFunction == CF_LOCAL_ALPHA) {
