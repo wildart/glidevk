@@ -192,6 +192,36 @@ pub enum BlendMode {
     Multiplicative,
 }
 
+/// Per-draw-call combine/color state (captured when state changes during a frame)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CombineState {
+    pub color_combine_function: i32,
+    pub color_combine_other: i32,
+    pub alpha_combine_function: i32,
+    pub alpha_combine_local: i32,
+    pub color_combine_factor: i32,
+    pub alpha_combine_factor: i32,
+    pub color_combine_local: i32,
+    pub alpha_combine_other: i32,
+    pub constant_color: [f32; 4],
+}
+
+impl Default for CombineState {
+    fn default() -> Self {
+        Self {
+            color_combine_function: 3, // ScaleOther
+            color_combine_other: 1,    // Texture
+            alpha_combine_function: 3, // ScaleOther
+            alpha_combine_local: 0,    // Iterated
+            color_combine_factor: 1,   // Local
+            alpha_combine_factor: 1,   // Local
+            color_combine_local: 0,    // Iterated
+            alpha_combine_other: 0,    // Iterated
+            constant_color: [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+}
+
 /// A single draw call with its associated texture and render state
 #[derive(Clone, Copy, Debug)]
 pub struct DrawCall {
@@ -200,6 +230,7 @@ pub struct DrawCall {
     pub vertex_count: u32,
     pub chromakey_enabled: bool,
     pub blend_mode: BlendMode,
+    pub combine_state: CombineState,
 }
 
 /// Vertex batch for collecting draw calls
@@ -211,6 +242,7 @@ pub struct VertexBatch {
     current_start: u32,
     current_chromakey: bool,
     current_blend_mode: BlendMode,
+    current_combine_state: CombineState,
 }
 
 impl VertexBatch {
@@ -223,6 +255,7 @@ impl VertexBatch {
             current_start: 0,
             current_chromakey: false,
             current_blend_mode: BlendMode::Opaque,
+            current_combine_state: CombineState::default(),
         }
     }
 
@@ -243,6 +276,7 @@ impl VertexBatch {
                     vertex_count: current_count,
                     chromakey_enabled: self.current_chromakey,
                     blend_mode: self.current_blend_mode,
+                    combine_state: self.current_combine_state,
                 });
                 self.current_start = self.vertices.len() as u32;
             }
@@ -262,6 +296,7 @@ impl VertexBatch {
                     vertex_count: current_count,
                     chromakey_enabled: self.current_chromakey,
                     blend_mode: self.current_blend_mode,
+                    combine_state: self.current_combine_state,
                 });
                 self.current_start = self.vertices.len() as u32;
             }
@@ -280,11 +315,31 @@ impl VertexBatch {
                     vertex_count: current_count,
                     chromakey_enabled: self.current_chromakey,
                     blend_mode: self.current_blend_mode,
+                    combine_state: self.current_combine_state,
                 });
                 self.current_start = self.vertices.len() as u32;
             }
         }
         self.current_blend_mode = mode;
+    }
+
+    /// Set the combine/constant color state for subsequent vertices
+    pub fn set_combine_state(&mut self, state: CombineState) {
+        if state != self.current_combine_state && !self.vertices.is_empty() {
+            let current_count = self.vertices.len() as u32 - self.current_start;
+            if current_count > 0 {
+                self.draw_calls.push(DrawCall {
+                    texture_addr: self.current_texture,
+                    start_vertex: self.current_start,
+                    vertex_count: current_count,
+                    chromakey_enabled: self.current_chromakey,
+                    blend_mode: self.current_blend_mode,
+                    combine_state: self.current_combine_state,
+                });
+                self.current_start = self.vertices.len() as u32;
+            }
+        }
+        self.current_combine_state = state;
     }
 
     pub fn push_triangle(&mut self, v0: GpuVertex, v1: GpuVertex, v2: GpuVertex) -> bool {
@@ -307,6 +362,7 @@ impl VertexBatch {
                 vertex_count: current_count,
                 chromakey_enabled: self.current_chromakey,
                 blend_mode: self.current_blend_mode,
+                combine_state: self.current_combine_state,
             });
             self.current_start = self.vertices.len() as u32;
         }

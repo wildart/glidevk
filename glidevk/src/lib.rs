@@ -1082,22 +1082,6 @@ impl Gr {
             .chromakey_value
             .to_rgba_f(self.state.color_format);
 
-        // Capture constant color for combine unit
-        let (cc_r, cc_g, cc_b, cc_a) = self
-            .state
-            .constant_color
-            .to_rgba_f(self.state.color_format);
-
-        // Capture combine state
-        let color_combine_function = self.state.color_combine_function as i32;
-        let color_combine_other = self.state.color_combine_other as i32;
-        let alpha_combine_function = self.state.alpha_combine_function as i32;
-        let alpha_combine_local = self.state.alpha_combine_local as i32;
-        let color_combine_factor = self.state.color_combine_factor as i32;
-        let alpha_combine_factor = self.state.alpha_combine_factor as i32;
-        let color_combine_local = self.state.color_combine_local as i32;
-        let alpha_combine_other = self.state.alpha_combine_other as i32;
-
         // Capture fog state
         let fog_mode = self.state.fog_mode as i32;
         let (fog_r, fog_g, fog_b, _) = self
@@ -1267,7 +1251,8 @@ impl Gr {
                                 (256.0 * tex_width as f32 / tex_height as f32, 256.0)
                             };
 
-                            // Push constants with screen size, texture size, and per-draw chromakey
+                            // Push constants with per-draw-call combine state
+                            let cs = &draw_call.combine_state;
                             let push_constants = utility::vertex::PushConstants {
                                 screen_size: [screen_width as f32, screen_height as f32],
                                 texture_size: [base_width, base_height],
@@ -1277,15 +1262,15 @@ impl Gr {
                                 } else {
                                     0.0
                                 },
-                                color_combine_function,
-                                color_combine_other,
-                                alpha_combine_function,
-                                alpha_combine_local,
-                                constant_color: [cc_r, cc_g, cc_b, cc_a],
-                                color_combine_factor,
-                                alpha_combine_factor,
-                                color_combine_local,
-                                alpha_combine_other,
+                                color_combine_function: cs.color_combine_function,
+                                color_combine_other: cs.color_combine_other,
+                                alpha_combine_function: cs.alpha_combine_function,
+                                alpha_combine_local: cs.alpha_combine_local,
+                                constant_color: cs.constant_color,
+                                color_combine_factor: cs.color_combine_factor,
+                                alpha_combine_factor: cs.alpha_combine_factor,
+                                color_combine_local: cs.color_combine_local,
+                                alpha_combine_other: cs.alpha_combine_other,
                                 fog_mode,
                                 fog_color_r: fog_r,
                                 fog_color_g: fog_g,
@@ -1719,6 +1704,7 @@ impl Gr {
     /// grConstantColorValue - set the constant color
     pub fn constant_color_value(&mut self, color: Color) {
         self.state.constant_color = color;
+        self.sync_combine_state();
         log::trace!("Constant color set to: {:?}", color);
     }
 
@@ -1741,6 +1727,7 @@ impl Gr {
         self.state.color_combine_local = local;
         self.state.color_combine_other = other;
         self.state.color_combine_invert = invert == FxBool::True;
+        self.sync_combine_state();
         log::trace!(
             "Color combine: function={:?}, factor={:?}, local={:?}, other={:?}, invert={:?}",
             function, factor, local, other, invert
@@ -1764,10 +1751,31 @@ impl Gr {
         self.state.alpha_combine_local = local;
         self.state.alpha_combine_other = other;
         self.state.alpha_combine_invert = invert == FxBool::True;
+        self.sync_combine_state();
         log::trace!(
             "Alpha combine: function={:?}, factor={:?}, local={:?}, other={:?}, invert={:?}",
             function, factor, local, other, invert
         );
+    }
+
+    /// Push current combine/constant color state to the vertex batch
+    fn sync_combine_state(&mut self) {
+        let (cc_r, cc_g, cc_b, cc_a) = self
+            .state
+            .constant_color
+            .to_rgba_f(self.state.color_format);
+        let state = utility::vertex::CombineState {
+            color_combine_function: self.state.color_combine_function as i32,
+            color_combine_other: self.state.color_combine_other as i32,
+            alpha_combine_function: self.state.alpha_combine_function as i32,
+            alpha_combine_local: self.state.alpha_combine_local as i32,
+            color_combine_factor: self.state.color_combine_factor as i32,
+            alpha_combine_factor: self.state.alpha_combine_factor as i32,
+            color_combine_local: self.state.color_combine_local as i32,
+            alpha_combine_other: self.state.alpha_combine_other as i32,
+            constant_color: [cc_r, cc_g, cc_b, cc_a],
+        };
+        self.vertex_batch.set_combine_state(state);
     }
 
     // ==================== Fog Functions ====================
