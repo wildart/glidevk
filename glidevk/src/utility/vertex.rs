@@ -6,10 +6,11 @@ use std::mem::offset_of;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuVertex {
-    pub position: [f32; 2],  // Screen-space x, y
-    pub color: [f32; 4],     // RGBA color (normalized 0.0-1.0)
-    pub tex_coord: [f32; 2], // Texture S, T coordinates
-    pub oow: f32,            // Reciprocal W (1/w) for depth, 0.0-1.0 range
+    pub position: [f32; 2],        // Screen-space x, y
+    pub color: [f32; 4],           // RGBA color (iterated vertex color, normalized)
+    pub tex_coord: [f32; 2],       // Texture S, T coordinates
+    pub oow: f32,                  // Reciprocal W (1/w) for depth
+    pub constant_color: [f32; 4],  // Constant color from grConstantColorValue (per-vertex)
 }
 
 impl GpuVertex {
@@ -18,7 +19,8 @@ impl GpuVertex {
             position: [x, y],
             color: [r, g, b, a],
             tex_coord: [s, t],
-            oow: 1.0, // Default depth (near)
+            oow: 1.0,
+            constant_color: [1.0, 1.0, 1.0, 1.0],
         }
     }
 
@@ -47,6 +49,7 @@ impl GpuVertex {
             color: [v.r / 255.0, v.g / 255.0, v.b / 255.0, v.a / 255.0],
             tex_coord: [s, t],
             oow: depth,
+            constant_color: [1.0, 1.0, 1.0, 1.0],
         }
     }
 
@@ -80,6 +83,7 @@ impl GpuVertex {
             color: [r, g, b, a],
             tex_coord: [s, t],
             oow: depth,
+            constant_color: [1.0, 1.0, 1.0, 1.0],
         }
     }
 
@@ -110,6 +114,7 @@ impl GpuVertex {
             color: [r / 255.0, g / 255.0, b / 255.0, a / 255.0],
             tex_coord: [s_corrected, t_corrected],
             oow: oow.clamp(0.0, 1.0),
+            constant_color: [1.0, 1.0, 1.0, 1.0],
         }
     }
 
@@ -120,7 +125,7 @@ impl GpuVertex {
             .input_rate(vk::VertexInputRate::VERTEX)
     }
 
-    pub fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 4] {
+    pub fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 5] {
         [
             // Position attribute
             vk::VertexInputAttributeDescription::default()
@@ -128,7 +133,7 @@ impl GpuVertex {
                 .location(0)
                 .format(vk::Format::R32G32_SFLOAT)
                 .offset(offset_of!(GpuVertex, position) as u32),
-            // Color attribute
+            // Iterated color attribute
             vk::VertexInputAttributeDescription::default()
                 .binding(0)
                 .location(1)
@@ -146,13 +151,18 @@ impl GpuVertex {
                 .location(3)
                 .format(vk::Format::R32_SFLOAT)
                 .offset(offset_of!(GpuVertex, oow) as u32),
+            // Constant color attribute (from grConstantColorValue, per-vertex)
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(4)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .offset(offset_of!(GpuVertex, constant_color) as u32),
         ]
     }
 }
 
 /// Push constants for the shaders.
-/// New fields added after constant_color use only int/float (no vec3)
-/// to avoid GLSL std430 vec3 alignment ambiguity.
+/// Constant color moved to vertex attribute to avoid draw call breaks.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PushConstants {
@@ -165,8 +175,6 @@ pub struct PushConstants {
     pub color_combine_other: i32,
     pub alpha_combine_function: i32,
     pub alpha_combine_local: i32,
-    // Constant color (RGBA, normalized 0.0-1.0)
-    pub constant_color: [f32; 4],       // offset 48 (16-byte aligned)
     // Combine factors and sources
     pub color_combine_factor: i32,
     pub alpha_combine_factor: i32,
@@ -192,7 +200,8 @@ pub enum BlendMode {
     Multiplicative,
 }
 
-/// Per-draw-call combine/color state (captured when state changes during a frame)
+/// Per-draw-call combine mode state (captured when combine mode changes during a frame).
+/// Constant color is NOT here — it's per-vertex to avoid draw call breaks.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CombineState {
     pub color_combine_function: i32,
@@ -203,7 +212,6 @@ pub struct CombineState {
     pub alpha_combine_factor: i32,
     pub color_combine_local: i32,
     pub alpha_combine_other: i32,
-    pub constant_color: [f32; 4],
 }
 
 impl Default for CombineState {
@@ -217,7 +225,6 @@ impl Default for CombineState {
             alpha_combine_factor: 1,   // Local
             color_combine_local: 0,    // Iterated
             alpha_combine_other: 0,    // Iterated
-            constant_color: [1.0, 1.0, 1.0, 1.0],
         }
     }
 }
@@ -522,16 +529,15 @@ mod tests {
 
     #[test]
     fn test_gpu_vertex_size() {
-        // Ensure vertex size is as expected for buffer calculations
-        // 2 floats (position) + 4 floats (color) + 2 floats (texcoord) + 1 float (oow) = 9 floats = 36 bytes
-        assert_eq!(std::mem::size_of::<GpuVertex>(), 36);
+        // 2 (position) + 4 (color) + 2 (texcoord) + 1 (oow) + 4 (constant_color) = 13 floats = 52 bytes
+        assert_eq!(std::mem::size_of::<GpuVertex>(), 52);
     }
 
     #[test]
     fn test_push_constants_size() {
         // screen_size(8) + texture_size(8) + chromakey_color(12) + chromakey_enabled(4)
-        // + 4 combine ints(16) + constant_color(16) + 4 ints(16) + fog(16) = 96 bytes
-        assert_eq!(std::mem::size_of::<PushConstants>(), 96);
+        // + 4 combine ints(16) + 4 ints(16) + fog(16) = 80 bytes
+        assert_eq!(std::mem::size_of::<PushConstants>(), 80);
     }
 
     #[test]
@@ -600,35 +606,31 @@ mod tests {
 
         let bytes = batch.as_bytes();
         // 3 vertices * 36 bytes each = 108 bytes
-        assert_eq!(bytes.len(), 108);
+        // 3 vertices * 52 bytes each = 156 bytes
+        assert_eq!(bytes.len(), 156);
     }
 
     #[test]
     fn test_binding_description() {
         let binding = GpuVertex::get_binding_description();
         assert_eq!(binding.binding, 0);
-        assert_eq!(binding.stride, 36); // size of GpuVertex
+        assert_eq!(binding.stride, 52); // size of GpuVertex
     }
 
     #[test]
     fn test_attribute_descriptions() {
         let attrs = GpuVertex::get_attribute_descriptions();
-        assert_eq!(attrs.len(), 4);
+        assert_eq!(attrs.len(), 5);
 
-        // Position at location 0, offset 0
-        assert_eq!(attrs[0].location, 0);
+        assert_eq!(attrs[0].location, 0); // position at 0
         assert_eq!(attrs[0].offset, 0);
-
-        // Color at location 1, offset 8 (after 2 floats)
-        assert_eq!(attrs[1].location, 1);
+        assert_eq!(attrs[1].location, 1); // color at 8
         assert_eq!(attrs[1].offset, 8);
-
-        // TexCoord at location 2, offset 24 (after 2 + 4 floats)
-        assert_eq!(attrs[2].location, 2);
+        assert_eq!(attrs[2].location, 2); // texcoord at 24
         assert_eq!(attrs[2].offset, 24);
-
-        // Oow at location 3, offset 32 (after 2 + 4 + 2 floats)
-        assert_eq!(attrs[3].location, 3);
+        assert_eq!(attrs[3].location, 3); // oow at 32
         assert_eq!(attrs[3].offset, 32);
+        assert_eq!(attrs[4].location, 4); // constant_color at 36
+        assert_eq!(attrs[4].offset, 36);
     }
 }

@@ -50,6 +50,7 @@ fn push_quad(
         color,
         tex_coord: [0.0, 0.0],
         oow: 1.0,
+        constant_color: color,
     };
     vertices.push(v(x1, y1));
     vertices.push(v(x2, y1));
@@ -1047,6 +1048,8 @@ impl Gr {
             return Some(());
         }
 
+        let frame_start = std::time::Instant::now();
+
         // Finalize vertex batch and get draw calls (copy to avoid borrow issues)
         let draw_calls: Vec<utility::vertex::DrawCall> = self.vertex_batch.finalize().to_vec();
 
@@ -1308,7 +1311,6 @@ impl Gr {
                                 color_combine_other: cs.color_combine_other,
                                 alpha_combine_function: cs.alpha_combine_function,
                                 alpha_combine_local: cs.alpha_combine_local,
-                                constant_color: cs.constant_color,
                                 color_combine_factor: cs.color_combine_factor,
                                 alpha_combine_factor: cs.alpha_combine_factor,
                                 color_combine_local: cs.color_combine_local,
@@ -1466,7 +1468,6 @@ impl Gr {
                                 color_combine_other: 0,
                                 alpha_combine_function: 1, // CF_LOCAL
                                 alpha_combine_local: 0,
-                                constant_color: [0.0; 4],
                                 color_combine_factor: 0,
                                 alpha_combine_factor: 0,
                                 color_combine_local: 0,
@@ -1551,6 +1552,14 @@ impl Gr {
 
                 // Advance to next frame-in-flight slot
                 app.current_frame = (app.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+                let frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+                if frame_ms > 18.0 {
+                    log::warn!(
+                        "Slow frame: {:.1}ms, {} draw calls, {} vertices",
+                        frame_ms, draw_calls.len(), vertex_count
+                    );
+                }
             }
             Some(())
         } else {
@@ -1754,9 +1763,9 @@ impl Gr {
     // ==================== Constant Color Functions ====================
 
     /// grConstantColorValue - set the constant color
+    /// Stored in state; written into vertex data at draw time (no draw call break)
     pub fn constant_color_value(&mut self, color: Color) {
         self.state.constant_color = color;
-        self.sync_combine_state();
         log::trace!("Constant color set to: {:?}", color);
     }
 
@@ -1810,12 +1819,14 @@ impl Gr {
         );
     }
 
-    /// Push current combine/constant color state to the vertex batch
+    /// Get the current constant color as normalized RGBA floats
+    fn current_constant_color(&self) -> [f32; 4] {
+        let (r, g, b, a) = self.state.constant_color.to_rgba_f(self.state.color_format);
+        [r, g, b, a]
+    }
+
+    /// Push current combine mode state to the vertex batch (combine modes only, not constant color)
     fn sync_combine_state(&mut self) {
-        let (cc_r, cc_g, cc_b, cc_a) = self
-            .state
-            .constant_color
-            .to_rgba_f(self.state.color_format);
         let state = utility::vertex::CombineState {
             color_combine_function: self.state.color_combine_function as i32,
             color_combine_other: self.state.color_combine_other as i32,
@@ -1825,7 +1836,6 @@ impl Gr {
             alpha_combine_factor: self.state.alpha_combine_factor as i32,
             color_combine_local: self.state.color_combine_local as i32,
             alpha_combine_other: self.state.alpha_combine_other as i32,
-            constant_color: [cc_r, cc_g, cc_b, cc_a],
         };
         self.vertex_batch.set_combine_state(state);
     }
@@ -2613,11 +2623,14 @@ impl Gr {
             }
         }
 
-        // Convert Glide vertices to GPU vertices using per-vertex (iterated) colors
-        // This is the correct behavior for legacy Glide text and UI rendering
-        let v0 = utility::vertex::GpuVertex::from_glide_vertex(&a);
-        let v1 = utility::vertex::GpuVertex::from_glide_vertex(&b);
-        let v2 = utility::vertex::GpuVertex::from_glide_vertex(&c);
+        // Convert Glide vertices to GPU vertices, stamp constant color per-vertex
+        let cc = self.current_constant_color();
+        let mut v0 = utility::vertex::GpuVertex::from_glide_vertex(&a);
+        let mut v1 = utility::vertex::GpuVertex::from_glide_vertex(&b);
+        let mut v2 = utility::vertex::GpuVertex::from_glide_vertex(&c);
+        v0.constant_color = cc;
+        v1.constant_color = cc;
+        v2.constant_color = cc;
 
         if !self.vertex_batch.push_triangle(v0, v1, v2) {
             log::warn!("Vertex batch full, triangle dropped");
@@ -2639,8 +2652,8 @@ impl Gr {
         // Render point as a 1-pixel quad (2 triangles)
         const POINT_SIZE: f32 = 0.5;
 
-        // Use per-vertex (iterated) colors
-        let gpu_v = utility::vertex::GpuVertex::from_glide_vertex(&pt);
+        let mut gpu_v = utility::vertex::GpuVertex::from_glide_vertex(&pt);
+        gpu_v.constant_color = self.current_constant_color();
         let x = gpu_v.position[0];
         let y = gpu_v.position[1];
 
@@ -2689,9 +2702,11 @@ impl Gr {
         // Render line as a thin quad (2 triangles)
         const LINE_WIDTH: f32 = 0.5;
 
-        // Use per-vertex (iterated) colors
-        let gpu_v1 = utility::vertex::GpuVertex::from_glide_vertex(&v1);
-        let gpu_v2 = utility::vertex::GpuVertex::from_glide_vertex(&v2);
+        let cc = self.current_constant_color();
+        let mut gpu_v1 = utility::vertex::GpuVertex::from_glide_vertex(&v1);
+        let mut gpu_v2 = utility::vertex::GpuVertex::from_glide_vertex(&v2);
+        gpu_v1.constant_color = cc;
+        gpu_v2.constant_color = cc;
 
         let x1 = gpu_v1.position[0];
         let y1 = gpu_v1.position[1];
@@ -2757,6 +2772,7 @@ impl Gr {
         let screen_height = self.state.screen_height as f32;
         let cull_mode = self.state.cull_mode;
         let vertex_size = layout.vertex_size();
+        let cc = self.current_constant_color();
 
         // Extract vertices using the configured layout
         let gpu_vertices: Vec<utility::vertex::GpuVertex> = (0..count as usize)
@@ -2774,9 +2790,11 @@ impl Gr {
                     y = screen_height - y;
                 }
 
-                Some(utility::vertex::GpuVertex::from_layout_data(
+                let mut v = utility::vertex::GpuVertex::from_layout_data(
                     x, y, r, g, b, a, s, t, oow,
-                ))
+                );
+                v.constant_color = cc;
+                Some(v)
             })
             .collect();
 
@@ -2801,6 +2819,7 @@ impl Gr {
         let screen_height = self.state.screen_height as f32;
         let cull_mode = self.state.cull_mode;
         let current_texture = self.vertex_batch.current_texture();
+        let cc = self.current_constant_color();
 
         // Log small texture draws (likely glyphs) for debugging
         static LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2852,7 +2871,9 @@ impl Gr {
                     y = screen_height - y;
                 }
 
-                utility::vertex::GpuVertex::from_layout_data(x, y, r, g, b, a, s, t, oow)
+                let mut v = utility::vertex::GpuVertex::from_layout_data(x, y, r, g, b, a, s, t, oow);
+                v.constant_color = cc;
+                v
             })
             .collect();
 
