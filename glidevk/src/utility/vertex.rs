@@ -12,6 +12,7 @@ pub struct GpuVertex {
     pub oow: f32,                  // Reciprocal W (1/w) for depth
     pub constant_color: [f32; 4],  // Constant color from grConstantColorValue (per-vertex)
     pub combine_flags: u32,        // Packed combine state (per-vertex, avoids draw call breaks)
+    pub texture_index: u32,        // Index into descriptor array (per-vertex, avoids draw call breaks)
 }
 
 impl GpuVertex {
@@ -23,6 +24,7 @@ impl GpuVertex {
             oow: 1.0,
             constant_color: [1.0, 1.0, 1.0, 1.0],
             combine_flags: 0,
+            texture_index: 0,
         }
     }
 
@@ -53,6 +55,7 @@ impl GpuVertex {
             oow: depth,
             constant_color: [1.0, 1.0, 1.0, 1.0],
             combine_flags: 0,
+            texture_index: 0,
         }
     }
 
@@ -88,6 +91,7 @@ impl GpuVertex {
             oow: depth,
             constant_color: [1.0, 1.0, 1.0, 1.0],
             combine_flags: 0,
+            texture_index: 0,
         }
     }
 
@@ -120,6 +124,7 @@ impl GpuVertex {
             oow: oow.clamp(0.0, 1.0),
             constant_color: [1.0, 1.0, 1.0, 1.0],
             combine_flags: 0,
+            texture_index: 0,
         }
     }
 
@@ -130,7 +135,7 @@ impl GpuVertex {
             .input_rate(vk::VertexInputRate::VERTEX)
     }
 
-    pub fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 6] {
+    pub fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 7] {
         [
             // Position attribute
             vk::VertexInputAttributeDescription::default()
@@ -168,17 +173,23 @@ impl GpuVertex {
                 .location(5)
                 .format(vk::Format::R32_UINT)
                 .offset(offset_of!(GpuVertex, combine_flags) as u32),
+            // Texture array index (per-vertex, for descriptor indexing)
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(6)
+                .format(vk::Format::R32_UINT)
+                .offset(offset_of!(GpuVertex, texture_index) as u32),
         ]
     }
 }
 
 /// Push constants for the shaders.
 /// Constant color moved to vertex attribute to avoid draw call breaks.
+/// texture_size removed: computed per-vertex in the shader via textureSize().
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PushConstants {
     pub screen_size: [f32; 2],
-    pub texture_size: [f32; 2],
     pub chromakey_color: [f32; 3],
     pub chromakey_enabled: f32,
     // Fog state (separate floats, not vec3, to avoid std430 padding)
@@ -201,23 +212,24 @@ pub enum BlendMode {
     Multiplicative,
 }
 
-/// A single draw call with its associated texture and render state.
+/// A single draw call with render state that requires a pipeline/descriptor change.
+/// Texture selection is per-vertex (via texture_index), not per-draw-call.
 /// Combine state is per-vertex (in combine_flags), not per-draw-call.
 #[derive(Clone, Copy, Debug)]
 pub struct DrawCall {
-    pub texture_addr: u32,
     pub start_vertex: u32,
     pub vertex_count: u32,
     pub chromakey_enabled: bool,
     pub blend_mode: BlendMode,
 }
 
-/// Vertex batch for collecting draw calls
+/// Vertex batch for collecting draw calls.
+/// Draw calls only break on blend_mode or chromakey changes.
+/// Texture selection is per-vertex via texture_index.
 pub struct VertexBatch {
     pub vertices: Vec<GpuVertex>,
     pub draw_calls: Vec<DrawCall>,
     max_vertices: usize,
-    current_texture: u32,
     current_start: u32,
     current_chromakey: bool,
     current_blend_mode: BlendMode,
@@ -229,35 +241,10 @@ impl VertexBatch {
             vertices: Vec::with_capacity(max_vertices),
             draw_calls: Vec::with_capacity(256),
             max_vertices,
-            current_texture: 0,
             current_start: 0,
             current_chromakey: false,
             current_blend_mode: BlendMode::Opaque,
         }
-    }
-
-    /// Get the current texture address
-    pub fn current_texture(&self) -> u32 {
-        self.current_texture
-    }
-
-    /// Set the current texture for subsequent vertices
-    pub fn set_texture(&mut self, texture_addr: u32) {
-        if texture_addr != self.current_texture && !self.vertices.is_empty() {
-            // Texture changed - finalize current draw call if we have vertices
-            let current_count = self.vertices.len() as u32 - self.current_start;
-            if current_count > 0 {
-                self.draw_calls.push(DrawCall {
-                    texture_addr: self.current_texture,
-                    start_vertex: self.current_start,
-                    vertex_count: current_count,
-                    chromakey_enabled: self.current_chromakey,
-                    blend_mode: self.current_blend_mode,
-                });
-                self.current_start = self.vertices.len() as u32;
-            }
-        }
-        self.current_texture = texture_addr;
     }
 
     /// Set the chromakey mode for subsequent vertices
@@ -267,7 +254,6 @@ impl VertexBatch {
             let current_count = self.vertices.len() as u32 - self.current_start;
             if current_count > 0 {
                 self.draw_calls.push(DrawCall {
-                    texture_addr: self.current_texture,
                     start_vertex: self.current_start,
                     vertex_count: current_count,
                     chromakey_enabled: self.current_chromakey,
@@ -285,7 +271,6 @@ impl VertexBatch {
             let current_count = self.vertices.len() as u32 - self.current_start;
             if current_count > 0 {
                 self.draw_calls.push(DrawCall {
-                    texture_addr: self.current_texture,
                     start_vertex: self.current_start,
                     vertex_count: current_count,
                     chromakey_enabled: self.current_chromakey,
@@ -312,7 +297,6 @@ impl VertexBatch {
         let current_count = self.vertices.len() as u32 - self.current_start;
         if current_count > 0 {
             self.draw_calls.push(DrawCall {
-                texture_addr: self.current_texture,
                 start_vertex: self.current_start,
                 vertex_count: current_count,
                 chromakey_enabled: self.current_chromakey,
@@ -476,14 +460,14 @@ mod tests {
 
     #[test]
     fn test_gpu_vertex_size() {
-        // 2+4+2+1 (position,color,texcoord,oow) + 4 (constant_color) + 1 (combine_flags u32) = 56 bytes
-        assert_eq!(std::mem::size_of::<GpuVertex>(), 56);
+        // 2+4+2+1 (position,color,texcoord,oow) + 4 (constant_color) + 1 (combine_flags) + 1 (texture_index) = 60 bytes
+        assert_eq!(std::mem::size_of::<GpuVertex>(), 60);
     }
 
     #[test]
     fn test_push_constants_size() {
-        // screen_size(8) + texture_size(8) + chromakey_color(12) + chromakey_enabled(4) + fog(16) = 48
-        assert_eq!(std::mem::size_of::<PushConstants>(), 48);
+        // screen_size(8) + chromakey_color(12) + chromakey_enabled(4) + fog(16) = 40
+        assert_eq!(std::mem::size_of::<PushConstants>(), 40);
     }
 
     #[test]
@@ -551,22 +535,21 @@ mod tests {
         batch.push_triangle(v, v, v);
 
         let bytes = batch.as_bytes();
-        // 3 vertices * 36 bytes each = 108 bytes
-        // 3 vertices * 56 bytes each = 168 bytes
-        assert_eq!(bytes.len(), 168);
+        // 3 vertices * 60 bytes each = 180 bytes
+        assert_eq!(bytes.len(), 180);
     }
 
     #[test]
     fn test_binding_description() {
         let binding = GpuVertex::get_binding_description();
         assert_eq!(binding.binding, 0);
-        assert_eq!(binding.stride, 56); // size of GpuVertex
+        assert_eq!(binding.stride, 60); // size of GpuVertex
     }
 
     #[test]
     fn test_attribute_descriptions() {
         let attrs = GpuVertex::get_attribute_descriptions();
-        assert_eq!(attrs.len(), 6);
+        assert_eq!(attrs.len(), 7);
 
         assert_eq!(attrs[0].location, 0); // position at 0
         assert_eq!(attrs[0].offset, 0);
@@ -580,5 +563,7 @@ mod tests {
         assert_eq!(attrs[4].offset, 36);
         assert_eq!(attrs[5].location, 5); // combine_flags at 52
         assert_eq!(attrs[5].offset, 52);
+        assert_eq!(attrs[6].location, 6); // texture_index at 56
+        assert_eq!(attrs[6].offset, 56);
     }
 }

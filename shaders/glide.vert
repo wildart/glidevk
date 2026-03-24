@@ -6,10 +6,10 @@ layout(location = 2) in vec2 inTexCoord;
 layout(location = 3) in float inOow;
 layout(location = 4) in vec4 inConstantColor;
 layout(location = 5) in uint inCombineFlags;
+layout(location = 6) in uint inTexIndex;
 
 layout(push_constant) uniform PushConstants {
     vec2 screenSize;
-    vec2 textureSize;
     vec3 chromakeyColor;
     float chromakeyEnabled;
     int fogMode;
@@ -23,6 +23,7 @@ layout(location = 1) out vec2 fragTexCoord;
 layout(location = 2) out float fragOow;
 layout(location = 3) out vec4 fragConstantColor;
 layout(location = 4) flat out uint fragCombineFlags;
+layout(location = 5) flat out uint fragTexIndex;
 
 void main() {
     vec2 ndc;
@@ -34,4 +35,5 @@ void main() {
     fragOow = inOow;
     fragConstantColor = inConstantColor;
     fragCombineFlags = inCombineFlags;
+    fragTexIndex = inTexIndex;
 }

@@ -1,16 +1,17 @@
 #version 450
+#extension GL_EXT_nonuniform_qualifier : require
 
 layout(location = 0) in vec4 fragColor;
 layout(location = 1) in vec2 fragTexCoord;
 layout(location = 2) in float fragOow;
 layout(location = 3) in vec4 fragConstantColor;
 layout(location = 4) flat in uint fragCombineFlags;
+layout(location = 5) flat in uint fragTexIndex;
 
-layout(binding = 0) uniform sampler2D texSampler;
+layout(binding = 0) uniform sampler2D textures[2048];
 
 layout(push_constant) uniform PushConstants {
     vec2 screenSize;
-    vec2 textureSize;
     vec3 chromakeyColor;
     float chromakeyEnabled;
     int fogMode;
@@ -91,8 +92,13 @@ float computeAlphaFactor(int factor, float localA, float otherA, vec4 texColor) 
 }
 
 void main() {
-    vec2 uv = fragTexCoord / pc.textureSize;
-    vec4 texColor = texture(texSampler, uv);
+    // Compute UV normalization from actual texture dimensions (replaces push constant texture_size)
+    ivec2 ts = textureSize(textures[nonuniformEXT(fragTexIndex)], 0);
+    float base = float(max(ts.x, ts.y));
+    vec2 baseSize = 256.0 * vec2(ts) / base;
+    vec2 uv = fragTexCoord / baseSize;
+
+    vec4 texColor = texture(textures[nonuniformEXT(fragTexIndex)], uv);
 
     if (pc.chromakeyEnabled > 0.5) {
         if (texColor.r < 0.01 && texColor.g < 0.01 && texColor.b < 0.01) discard;

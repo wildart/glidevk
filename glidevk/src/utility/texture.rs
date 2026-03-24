@@ -756,22 +756,30 @@ impl VulkanTexture {
 }
 
 /// Maximum number of textures in the Vulkan cache before eviction.
-const MAX_CACHED_TEXTURES: usize = 2048;
+/// Also the size of the descriptor array in the shader.
+pub const MAX_CACHED_TEXTURES: usize = 2048;
 
-/// Cache of Vulkan textures keyed by Glide address
+/// Cache of Vulkan textures keyed by Glide address.
+/// Uses descriptor indexing: a single descriptor set with an array of
+/// MAX_CACHED_TEXTURES combined image samplers at binding 0. Each texture
+/// is assigned a slot index; vertices reference textures by slot index.
 pub struct TextureCache {
     textures: HashMap<u32, VulkanTexture>,
     sampler: vk::Sampler,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_sets: HashMap<u32, vk::DescriptorSet>,
+    /// Single shared descriptor set with array of samplers
+    descriptor_set: vk::DescriptorSet,
+    /// Maps Glide texture address to array slot index
+    slot_map: HashMap<u32, u32>,
+    /// Available slot indices for reuse
+    free_slots: Vec<u32>,
     /// Insertion order for LRU eviction (oldest first)
     insertion_order: Vec<u32>,
-    /// Placeholder texture (1x1 white) for when no texture is bound
+    /// Placeholder texture (1x1 white) at slot 0
     placeholder: Option<VulkanTexture>,
-    placeholder_descriptor: vk::DescriptorSet,
-    /// Textures/descriptors pending destruction (deferred until GPU is idle)
-    pending_destroy: Vec<(VulkanTexture, Option<vk::DescriptorSet>)>,
+    /// Textures pending destruction (deferred until GPU is idle)
+    pending_destroy: Vec<VulkanTexture>,
     /// Reusable fence for texture upload submissions (avoids create/destroy per upload)
     upload_fence: vk::Fence,
 }
@@ -802,15 +810,25 @@ impl TextureCache {
                 .expect("Failed to create texture sampler")
         };
 
-        // Create descriptor set layout
+        // Create descriptor set layout with descriptor indexing flags
         let layout_binding = vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
+            .descriptor_count(MAX_CACHED_TEXTURES as u32)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT);
 
+        let binding_flags = [
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+        ];
+        let mut binding_flags_info =
+            vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                .binding_flags(&binding_flags);
+
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
-            .bindings(std::slice::from_ref(&layout_binding));
+            .bindings(std::slice::from_ref(&layout_binding))
+            .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+            .push_next(&mut binding_flags_info);
 
         let descriptor_set_layout = unsafe {
             device
@@ -818,16 +836,15 @@ impl TextureCache {
                 .expect("Failed to create descriptor set layout")
         };
 
-        // Create descriptor pool (allow up to 1024 textures)
-        // Use FREE_DESCRIPTOR_SET_BIT to allow freeing individual descriptor sets
+        // Create descriptor pool with UPDATE_AFTER_BIND flag
         let pool_size = vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(MAX_CACHED_TEXTURES as u32 + 1);
+            .descriptor_count(MAX_CACHED_TEXTURES as u32);
 
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(std::slice::from_ref(&pool_size))
-            .max_sets(MAX_CACHED_TEXTURES as u32 + 1)
-            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
+            .max_sets(1)
+            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND);
 
         let descriptor_pool = unsafe {
             device
@@ -835,15 +852,15 @@ impl TextureCache {
                 .expect("Failed to create descriptor pool")
         };
 
-        // Allocate a placeholder descriptor set (will be updated when placeholder texture is created)
+        // Allocate the single shared descriptor set
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
             .set_layouts(std::slice::from_ref(&descriptor_set_layout));
 
-        let placeholder_descriptor = unsafe {
+        let descriptor_set = unsafe {
             device
                 .allocate_descriptor_sets(&alloc_info)
-                .expect("Failed to allocate placeholder descriptor set")[0]
+                .expect("Failed to allocate descriptor set")[0]
         };
 
         let upload_fence = unsafe {
@@ -855,15 +872,20 @@ impl TextureCache {
                 .expect("Failed to create upload fence")
         };
 
+        // Slot 0 is reserved for the placeholder texture.
+        // Free slots start from 1.
+        let free_slots: Vec<u32> = (1..MAX_CACHED_TEXTURES as u32).rev().collect();
+
         TextureCache {
             textures: HashMap::new(),
             sampler,
             descriptor_set_layout,
             descriptor_pool,
-            descriptor_sets: HashMap::new(),
+            descriptor_set,
+            slot_map: HashMap::new(),
+            free_slots,
             insertion_order: Vec::new(),
             placeholder: None,
-            placeholder_descriptor,
             pending_destroy: Vec::new(),
             upload_fence,
         }
@@ -895,27 +917,27 @@ impl TextureCache {
             None, // init-time upload, no reusable fence
         );
 
-        // Allocate descriptor set
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(std::slice::from_ref(&self.descriptor_set_layout));
-
-        let descriptor_set = unsafe {
-            device
-                .allocate_descriptor_sets(&alloc_info)
-                .expect("Failed to allocate descriptor set")[0]
+        // Remove old texture if it exists (reuse its slot)
+        let slot = if let Some(old_slot) = self.slot_map.remove(&texture_addr) {
+            if let Some(old_texture) = self.textures.remove(&texture_addr) {
+                old_texture.destroy(device);
+                self.insertion_order.retain(|&a| a != texture_addr);
+            }
+            old_slot
+        } else {
+            self.free_slots.pop().expect("No free texture slots available")
         };
 
-        // Update descriptor set
+        // Update descriptor at slot index
         let image_info = vk::DescriptorImageInfo::default()
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image_view(texture.view)
             .sampler(self.sampler);
 
         let descriptor_write = vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
+            .dst_set(self.descriptor_set)
             .dst_binding(0)
-            .dst_array_element(0)
+            .dst_array_element(slot)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(std::slice::from_ref(&image_info));
 
@@ -923,25 +945,12 @@ impl TextureCache {
             device.update_descriptor_sets(&[descriptor_write], &[]);
         }
 
-        // Remove old texture and descriptor set if they exist
-        if let Some(old_texture) = self.textures.remove(&texture_addr) {
-            old_texture.destroy(device);
-            self.insertion_order.retain(|&a| a != texture_addr);
-        }
-        if let Some(old_descriptor_set) = self.descriptor_sets.remove(&texture_addr) {
-            unsafe {
-                device
-                    .free_descriptor_sets(self.descriptor_pool, &[old_descriptor_set])
-                    .unwrap_or(());
-            }
-        }
-
         self.textures.insert(texture_addr, texture);
-        self.descriptor_sets.insert(texture_addr, descriptor_set);
+        self.slot_map.insert(texture_addr, slot);
         self.insertion_order.push(texture_addr);
     }
 
-    /// Create the placeholder texture (1x1 white pixel)
+    /// Create the placeholder texture (1x1 white pixel) at slot 0
     pub fn create_placeholder(
         &mut self,
         device: &ash::Device,
@@ -965,14 +974,14 @@ impl TextureCache {
             None, // init-time upload
         );
 
-        // Update placeholder descriptor set
+        // Update descriptor at slot 0 (reserved for placeholder)
         let image_info = vk::DescriptorImageInfo::default()
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image_view(texture.view)
             .sampler(self.sampler);
 
         let descriptor_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.placeholder_descriptor)
+            .dst_set(self.descriptor_set)
             .dst_binding(0)
             .dst_array_element(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -985,7 +994,7 @@ impl TextureCache {
         self.placeholder = Some(texture);
     }
 
-    /// Upload a texture and create its descriptor set
+    /// Upload a texture and update its descriptor array slot
     pub fn upload_texture(
         &mut self,
         device: &ash::Device,
@@ -1013,27 +1022,28 @@ impl TextureCache {
             Some(self.upload_fence),
         );
 
-        // Allocate descriptor set
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(std::slice::from_ref(&self.descriptor_set_layout));
-
-        let descriptor_set = unsafe {
-            device
-                .allocate_descriptor_sets(&alloc_info)
-                .expect("Failed to allocate descriptor set")[0]
+        // Reuse existing slot or allocate a new one
+        let slot = if let Some(old_slot) = self.slot_map.remove(&address) {
+            // Defer destruction of old texture (may still be in-flight)
+            if let Some(old_texture) = self.textures.remove(&address) {
+                self.pending_destroy.push(old_texture);
+                self.insertion_order.retain(|&a| a != address);
+            }
+            old_slot
+        } else {
+            self.free_slots.pop().expect("No free texture slots available")
         };
 
-        // Update descriptor set
+        // Update descriptor at slot index
         let image_info = vk::DescriptorImageInfo::default()
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image_view(texture.view)
             .sampler(self.sampler);
 
         let descriptor_write = vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
+            .dst_set(self.descriptor_set)
             .dst_binding(0)
-            .dst_array_element(0)
+            .dst_array_element(slot)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(std::slice::from_ref(&image_info));
 
@@ -1041,21 +1051,14 @@ impl TextureCache {
             device.update_descriptor_sets(&[descriptor_write], &[]);
         }
 
-        // Defer destruction of old texture/descriptor (may still be in-flight)
-        let old_descriptor = self.descriptor_sets.remove(&address);
-        if let Some(old_texture) = self.textures.remove(&address) {
-            self.pending_destroy.push((old_texture, old_descriptor));
-            self.insertion_order.retain(|&a| a != address);
-        }
-
         self.textures.insert(address, texture);
-        self.descriptor_sets.insert(address, descriptor_set);
+        self.slot_map.insert(address, slot);
         self.insertion_order.push(address);
 
         log::trace!(
-            "Texture cache: {} textures, {} descriptor sets",
+            "Texture cache: {} textures, {} slots used",
             self.textures.len(),
-            self.descriptor_sets.len()
+            self.slot_map.len()
         );
     }
 
@@ -1086,25 +1089,27 @@ impl TextureCache {
             );
             staging_resources.push((staging_buf, staging_mem));
 
-            // Create and update descriptor set
-            let alloc_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(self.descriptor_pool)
-                .set_layouts(std::slice::from_ref(&self.descriptor_set_layout));
-
-            let descriptor_set = unsafe {
-                device.allocate_descriptor_sets(&alloc_info)
-                    .expect("Failed to allocate descriptor set")[0]
+            // Reuse existing slot or allocate a new one
+            let slot = if let Some(old_slot) = self.slot_map.remove(address) {
+                if let Some(old_texture) = self.textures.remove(address) {
+                    self.pending_destroy.push(old_texture);
+                    self.insertion_order.retain(|&a| a != *address);
+                }
+                old_slot
+            } else {
+                self.free_slots.pop().expect("No free texture slots available")
             };
 
+            // Update descriptor at slot index
             let image_info = vk::DescriptorImageInfo::default()
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .image_view(texture.view)
                 .sampler(self.sampler);
 
             let descriptor_write = vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
+                .dst_set(self.descriptor_set)
                 .dst_binding(0)
-                .dst_array_element(0)
+                .dst_array_element(slot)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(std::slice::from_ref(&image_info));
 
@@ -1112,15 +1117,8 @@ impl TextureCache {
                 device.update_descriptor_sets(&[descriptor_write], &[]);
             }
 
-            // Defer old texture/descriptor destruction
-            let old_descriptor = self.descriptor_sets.remove(address);
-            if let Some(old_texture) = self.textures.remove(address) {
-                self.pending_destroy.push((old_texture, old_descriptor));
-                self.insertion_order.retain(|&a| a != *address);
-            }
-
             self.textures.insert(*address, texture);
-            self.descriptor_sets.insert(*address, descriptor_set);
+            self.slot_map.insert(*address, slot);
             self.insertion_order.push(*address);
         }
 
@@ -1140,14 +1138,14 @@ impl TextureCache {
         log::debug!("Batch uploaded {} textures", textures.len());
     }
 
-    /// Get descriptor set for a texture address
-    pub fn get_descriptor_set(&self, address: u32) -> vk::DescriptorSet {
-        // Skip LRU reordering here — it's O(n) per call and called hundreds of
-        // times per frame. Eviction uses insertion order which is good enough.
-        self.descriptor_sets
-            .get(&address)
-            .copied()
-            .unwrap_or(self.placeholder_descriptor)
+    /// Get the single shared descriptor set (bound once per frame)
+    pub fn get_descriptor_set(&self) -> vk::DescriptorSet {
+        self.descriptor_set
+    }
+
+    /// Get the array slot index for a texture address (0 = placeholder)
+    pub fn get_texture_slot(&self, addr: u32) -> u32 {
+        self.slot_map.get(&addr).copied().unwrap_or(0)
     }
 
     /// Check if a texture exists at the given address
@@ -1198,11 +1196,9 @@ impl TextureCache {
                 new_order.push(addr);
                 continue;
             }
-            // Evict this texture
-            if let Some(descriptor_set) = self.descriptor_sets.remove(&addr) {
-                unsafe {
-                    let _ = device.free_descriptor_sets(self.descriptor_pool, &[descriptor_set]);
-                }
+            // Return slot to free list and destroy texture
+            if let Some(slot) = self.slot_map.remove(&addr) {
+                self.free_slots.push(slot);
             }
             if let Some(texture) = self.textures.remove(&addr) {
                 texture.destroy(device);
@@ -1224,9 +1220,11 @@ impl TextureCache {
     /// Destruction is deferred until flush_pending_destroy() is called after
     /// all in-flight GPU work referencing this texture has completed.
     pub fn invalidate_texture(&mut self, _device: &ash::Device, address: u32) {
-        let descriptor = self.descriptor_sets.remove(&address);
+        if let Some(slot) = self.slot_map.remove(&address) {
+            self.free_slots.push(slot);
+        }
         if let Some(texture) = self.textures.remove(&address) {
-            self.pending_destroy.push((texture, descriptor));
+            self.pending_destroy.push(texture);
             self.insertion_order.retain(|&a| a != address);
             log::trace!("Invalidated texture at {:#x} (deferred destroy)", address);
         }
@@ -1235,12 +1233,7 @@ impl TextureCache {
     /// Destroy textures that were previously invalidated.
     /// Must only be called after all in-flight GPU work has completed.
     pub fn flush_pending_destroy(&mut self, device: &ash::Device) {
-        for (texture, descriptor) in self.pending_destroy.drain(..) {
-            if let Some(ds) = descriptor {
-                unsafe {
-                    let _ = device.free_descriptor_sets(self.descriptor_pool, &[ds]);
-                }
-            }
+        for texture in self.pending_destroy.drain(..) {
             texture.destroy(device);
         }
     }
@@ -1257,6 +1250,9 @@ impl TextureCache {
 
     pub fn destroy(&self, device: &ash::Device) {
         for texture in self.textures.values() {
+            texture.destroy(device);
+        }
+        for texture in &self.pending_destroy {
             texture.destroy(device);
         }
         if let Some(ref placeholder) = self.placeholder {

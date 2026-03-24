@@ -32,7 +32,7 @@ pub fn create_instance(
         .application_version(vk::make_api_version(0, 1, 0, 0))
         .engine_name(engine_name.as_c_str())
         .engine_version(vk::make_api_version(0, 1, 0, 0))
-        .api_version(vk::make_api_version(0, 1, 1, 0));
+        .api_version(vk::make_api_version(0, 1, 2, 0));
 
     // This create info used to debug issues in vk::createInstance and vk::destroyInstance.
     // let mut debug_utils_create_info = debug::populate_debug_messenger_create_info();

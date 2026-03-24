@@ -330,12 +330,21 @@ pub fn create_logical_device(
         ..Default::default() // default just enable no feature.
     };
 
+    // Enable descriptor indexing features for texture array binding
+    let mut descriptor_indexing_features =
+        vk::PhysicalDeviceDescriptorIndexingFeatures::default()
+            .descriptor_binding_partially_bound(true)
+            .descriptor_binding_sampled_image_update_after_bind(true)
+            .shader_sampled_image_array_non_uniform_indexing(true)
+            .runtime_descriptor_array(true);
+
     let extensions_names = DEVICE_EXTENSIONS.get_extensions_raw_names();
 
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
         .enabled_features(&physical_device_features)
-        .enabled_extension_names(&extensions_names);
+        .enabled_extension_names(&extensions_names)
+        .push_next(&mut descriptor_indexing_features);
 
     let device: ash::Device = unsafe {
         instance

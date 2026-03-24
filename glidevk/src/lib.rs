@@ -54,6 +54,7 @@ fn push_quad(
         oow: 1.0,
         constant_color: color,
         combine_flags: fps_flags,
+        texture_index: 0,
     };
     vertices.push(v(x1, y1));
     vertices.push(v(x2, y1));
@@ -395,6 +396,8 @@ pub struct Gr {
     lfb_lock_state: LfbLockState,
     /// FPS counter state
     fps_counter: FpsCounter,
+    /// Texture addresses referenced this frame (for upload + eviction protection)
+    frame_textures: std::collections::HashSet<u32>,
 }
 
 struct FpsCounter {
@@ -444,6 +447,7 @@ impl Gr {
                 frame_count: 0,
                 display_fps: 0,
             },
+            frame_textures: std::collections::HashSet::new(),
         }
     }
 
@@ -1006,6 +1010,7 @@ impl Gr {
 
         // Clear vertex buffer
         self.vertex_batch.clear();
+        self.frame_textures.clear();
 
         // Clear LFB state
         self.lfb_lock_state = LfbLockState::default();
@@ -1048,6 +1053,7 @@ impl Gr {
         if self.lfb_lock_state.lfb_written {
             self.lfb_lock_state.lfb_written = false;
             self.vertex_batch.clear();
+            self.frame_textures.clear();
             return Some(());
         }
 
@@ -1056,9 +1062,8 @@ impl Gr {
         // Finalize vertex batch and get draw calls (copy to avoid borrow issues)
         let draw_calls: Vec<utility::vertex::DrawCall> = self.vertex_batch.finalize().to_vec();
 
-        // Collect textures needed this frame (for eviction protection and upload)
-        let needed_textures: std::collections::HashSet<u32> =
-            draw_calls.iter().map(|dc| dc.texture_addr).collect();
+        // Collect textures needed this frame (accumulated during draw calls)
+        let needed_textures: std::collections::HashSet<u32> = self.frame_textures.clone();
 
         // Batch-upload all missing textures in a single GPU submission
         {
@@ -1272,12 +1277,22 @@ impl Gr {
                             &[0],
                         );
 
+                        // Bind the single shared descriptor set ONCE (texture selection is per-vertex)
+                        let descriptor_set = app.texture_cache.get_descriptor_set();
+                        app.device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            app.pipeline_layout,
+                            0,
+                            &[descriptor_set],
+                            &[],
+                        );
+
                         // Track previous state to skip redundant GPU commands
-                        let mut prev_texture_addr: u32 = u32::MAX;
                         let mut prev_push_bytes: [u8; 96] = [0; 96];
                         let mut first_draw = true;
 
-                        // Issue draw calls, skipping redundant state changes
+                        // Issue draw calls (only break on blend_mode/chromakey changes)
                         for draw_call in &draw_calls {
                             // Switch pipeline if blend mode changed
                             if draw_call.blend_mode != current_blend_mode {
@@ -1291,18 +1306,9 @@ impl Gr {
                                 }
                             }
 
-                            // Build push constants
-                            let (tex_width, tex_height) =
-                                app.texture_cache.get_texture_size(draw_call.texture_addr);
-                            let (base_width, base_height) = if tex_width >= tex_height {
-                                (256.0, 256.0 * tex_height as f32 / tex_width as f32)
-                            } else {
-                                (256.0 * tex_width as f32 / tex_height as f32, 256.0)
-                            };
-
+                            // Build push constants (no texture_size -- computed in shader)
                             let push_constants = utility::vertex::PushConstants {
                                 screen_size: [screen_width as f32, screen_height as f32],
-                                texture_size: [base_width, base_height],
                                 chromakey_color: [ck_r, ck_g, ck_b],
                                 chromakey_enabled: if draw_call.chromakey_enabled {
                                     1.0
@@ -1331,21 +1337,6 @@ impl Gr {
                                 prev_push_bytes[..push_data.len()].copy_from_slice(push_data);
                             }
 
-                            // Only bind descriptor set if texture changed
-                            if draw_call.texture_addr != prev_texture_addr {
-                                let descriptor_set =
-                                    app.texture_cache.get_descriptor_set(draw_call.texture_addr);
-                                app.device.cmd_bind_descriptor_sets(
-                                    cmd,
-                                    vk::PipelineBindPoint::GRAPHICS,
-                                    app.pipeline_layout,
-                                    0,
-                                    &[descriptor_set],
-                                    &[],
-                                );
-                                prev_texture_addr = draw_call.texture_addr;
-                            }
-
                             first_draw = false;
 
                             // Draw this batch
@@ -1357,11 +1348,8 @@ impl Gr {
                                 0,
                             );
                             log::trace!(
-                                "buffer_swap: drew {} vertices with texture {:#x} ({}x{})",
+                                "buffer_swap: drew {} vertices",
                                 draw_call.vertex_count,
-                                draw_call.texture_addr,
-                                tex_width,
-                                tex_height
                             );
                         }
                         log::trace!("buffer_swap: completed {} draw calls", draw_calls.len());
@@ -1455,7 +1443,6 @@ impl Gr {
                             // Draw with CF_LOCAL (vertex color only), alpha blend, placeholder texture
                             let fps_push = utility::vertex::PushConstants {
                                 screen_size: [sw, sh],
-                                texture_size: [1.0, 1.0],
                                 chromakey_color: [0.0, 0.0, 0.0],
                                 chromakey_enabled: 0.0,
                                 fog_mode: 0,
@@ -1484,16 +1471,7 @@ impl Gr {
                                 blend_pipeline,
                             );
 
-                            // Bind placeholder texture (1x1 white)
-                            let placeholder_ds = app.texture_cache.get_descriptor_set(0);
-                            app.device.cmd_bind_descriptor_sets(
-                                cmd,
-                                vk::PipelineBindPoint::GRAPHICS,
-                                app.pipeline_layout,
-                                0,
-                                &[placeholder_ds],
-                                &[],
-                            );
+                            // Descriptor set already bound (shared set, texture_index=0 is placeholder)
 
                             app.device.cmd_draw(cmd, fps_count, 1, fps_start, 0);
                         }
@@ -1631,8 +1609,9 @@ impl Gr {
         self.state.clear_a = a;
         self.state.clear_depth = normalized_depth;
 
-        // Clear the vertex batch for the new frame
+        // Clear the vertex batch and frame texture set for the new frame
         self.vertex_batch.clear();
+        self.frame_textures.clear();
 
         log::trace!(
             "Buffer clear values set: color=[{}, {}, {}, {}], depth={}",
@@ -2057,8 +2036,6 @@ impl Gr {
         let tmu_idx = tmu as usize;
         if tmu_idx < GLIDE_NUM_TMU {
             self.state.tex_source[tmu_idx] = start_address;
-            // Record texture change for batched rendering
-            self.vertex_batch.set_texture(start_address);
             log::trace!(
                 "Texture source set for TMU{}: addr={:#x}, even_odd={}, format={:?}",
                 tmu_idx,
@@ -2602,15 +2579,20 @@ impl Gr {
             }
         }
 
-        // Stamp per-vertex state (constant color + packed combine flags)
+        // Stamp per-vertex state (constant color + packed combine flags + texture index)
         let cc = self.current_constant_color();
         let cf = self.current_combine_flags();
+        let tex_addr = self.state.tex_source[0];
+        self.frame_textures.insert(tex_addr);
+        let tex_idx = self.vulkan_app.as_ref()
+            .map(|app| app.texture_cache.get_texture_slot(tex_addr))
+            .unwrap_or(0);
         let mut v0 = utility::vertex::GpuVertex::from_glide_vertex(&a);
         let mut v1 = utility::vertex::GpuVertex::from_glide_vertex(&b);
         let mut v2 = utility::vertex::GpuVertex::from_glide_vertex(&c);
-        v0.constant_color = cc; v0.combine_flags = cf;
-        v1.constant_color = cc; v1.combine_flags = cf;
-        v2.constant_color = cc; v2.combine_flags = cf;
+        v0.constant_color = cc; v0.combine_flags = cf; v0.texture_index = tex_idx;
+        v1.constant_color = cc; v1.combine_flags = cf; v1.texture_index = tex_idx;
+        v2.constant_color = cc; v2.combine_flags = cf; v2.texture_index = tex_idx;
 
         if !self.vertex_batch.push_triangle(v0, v1, v2) {
             log::warn!("Vertex batch full, triangle dropped");
@@ -2635,6 +2617,11 @@ impl Gr {
         let mut gpu_v = utility::vertex::GpuVertex::from_glide_vertex(&pt);
         gpu_v.constant_color = self.current_constant_color();
         gpu_v.combine_flags = self.current_combine_flags();
+        let tex_addr = self.state.tex_source[0];
+        self.frame_textures.insert(tex_addr);
+        gpu_v.texture_index = self.vulkan_app.as_ref()
+            .map(|app| app.texture_cache.get_texture_slot(tex_addr))
+            .unwrap_or(0);
         let x = gpu_v.position[0];
         let y = gpu_v.position[1];
 
@@ -2685,10 +2672,15 @@ impl Gr {
 
         let cc = self.current_constant_color();
         let cf = self.current_combine_flags();
+        let tex_addr = self.state.tex_source[0];
+        self.frame_textures.insert(tex_addr);
+        let tex_idx = self.vulkan_app.as_ref()
+            .map(|app| app.texture_cache.get_texture_slot(tex_addr))
+            .unwrap_or(0);
         let mut gpu_v1 = utility::vertex::GpuVertex::from_glide_vertex(&v1);
         let mut gpu_v2 = utility::vertex::GpuVertex::from_glide_vertex(&v2);
-        gpu_v1.constant_color = cc; gpu_v1.combine_flags = cf;
-        gpu_v2.constant_color = cc; gpu_v2.combine_flags = cf;
+        gpu_v1.constant_color = cc; gpu_v1.combine_flags = cf; gpu_v1.texture_index = tex_idx;
+        gpu_v2.constant_color = cc; gpu_v2.combine_flags = cf; gpu_v2.texture_index = tex_idx;
 
         let x1 = gpu_v1.position[0];
         let y1 = gpu_v1.position[1];
@@ -2756,6 +2748,11 @@ impl Gr {
         let vertex_size = layout.vertex_size();
         let cc = self.current_constant_color();
         let cf = self.current_combine_flags();
+        let tex_addr = self.state.tex_source[0];
+        self.frame_textures.insert(tex_addr);
+        let tex_idx = self.vulkan_app.as_ref()
+            .map(|app| app.texture_cache.get_texture_slot(tex_addr))
+            .unwrap_or(0);
 
         // Extract vertices using the configured layout
         let gpu_vertices: Vec<utility::vertex::GpuVertex> = (0..count as usize)
@@ -2778,6 +2775,7 @@ impl Gr {
                 );
                 v.constant_color = cc;
                 v.combine_flags = cf;
+                v.texture_index = tex_idx;
                 Some(v)
             })
             .collect();
@@ -2802,9 +2800,13 @@ impl Gr {
         let origin = self.state.origin;
         let screen_height = self.state.screen_height as f32;
         let cull_mode = self.state.cull_mode;
-        let current_texture = self.vertex_batch.current_texture();
+        let current_texture = self.state.tex_source[0];
+        self.frame_textures.insert(current_texture);
         let cc = self.current_constant_color();
         let cf = self.current_combine_flags();
+        let tex_idx = self.vulkan_app.as_ref()
+            .map(|app| app.texture_cache.get_texture_slot(current_texture))
+            .unwrap_or(0);
 
         // Log small texture draws (likely glyphs) for debugging
         static LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2859,6 +2861,7 @@ impl Gr {
                 let mut v = utility::vertex::GpuVertex::from_layout_data(x, y, r, g, b, a, s, t, oow);
                 v.constant_color = cc;
                 v.combine_flags = cf;
+                v.texture_index = tex_idx;
                 v
             })
             .collect();
