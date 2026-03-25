@@ -12,8 +12,10 @@ layout(binding = 0) uniform sampler2D textures[2048];
 
 layout(push_constant) uniform PushConstants {
     vec2 screenSize;
-    vec3 chromakeyColor;
     float chromakeyEnabled;
+    float chromakeyR;
+    float chromakeyG;
+    float chromakeyB;
     int fogMode;
     float fogColorR;
     float fogColorG;

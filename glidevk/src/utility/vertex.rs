@@ -190,9 +190,10 @@ impl GpuVertex {
 #[derive(Clone, Copy, Debug)]
 pub struct PushConstants {
     pub screen_size: [f32; 2],
-    pub chromakey_color: [f32; 3],
     pub chromakey_enabled: f32,
-    // Fog state (separate floats, not vec3, to avoid std430 padding)
+    pub chromakey_r: f32,
+    pub chromakey_g: f32,
+    pub chromakey_b: f32,
     pub fog_mode: i32,
     pub fog_color_r: f32,
     pub fog_color_g: f32,
@@ -466,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_push_constants_size() {
-        // screen_size(8) + chromakey_color(12) + chromakey_enabled(4) + fog(16) = 40
+        // screen_size(8) + chromakey_enabled(4) + chromakey_rgb(12) + fog(16) = 40
         assert_eq!(std::mem::size_of::<PushConstants>(), 40);
     }
 

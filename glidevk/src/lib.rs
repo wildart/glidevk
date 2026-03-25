@@ -1064,6 +1064,12 @@ impl Gr {
 
         // Collect textures needed this frame (accumulated during draw calls)
         let needed_textures: std::collections::HashSet<u32> = self.frame_textures.clone();
+        if !needed_textures.is_empty() {
+            log::trace!("Frame needs {} unique textures: {:?}",
+                needed_textures.len(),
+                needed_textures.iter().take(5).map(|a| format!("{:#x}", a)).collect::<Vec<_>>()
+            );
+        }
 
         // Batch-upload all missing textures in a single GPU submission
         {
@@ -1113,8 +1119,32 @@ impl Gr {
 
         // Resolve texture addresses → descriptor slot indices now that all textures are uploaded
         if let Some(app) = &self.vulkan_app {
+            let mut unresolved = 0u32;
             for v in &mut self.vertex_batch.vertices {
-                v.texture_index = app.texture_cache.get_texture_slot(v.texture_index);
+                let addr = v.texture_index;
+                let slot = app.texture_cache.get_texture_slot(addr);
+                if slot == 0 && addr != 0 {
+                    unresolved += 1;
+                }
+                v.texture_index = slot;
+            }
+            if unresolved > 0 {
+                log::warn!(
+                    "buffer_swap: {} vertices with unresolved textures (slot 0 / placeholder)",
+                    unresolved
+                );
+            }
+            // Log texture stats for first 60 frames
+            static FRAME_NUM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let frame = FRAME_NUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if frame < 60 {
+                let unique_slots: std::collections::HashSet<u32> = self.vertex_batch.vertices.iter()
+                    .map(|v| v.texture_index).collect();
+                log::warn!(
+                    "Frame {}: {} unique textures in {} vertices, {} draw calls, cache has {} textures",
+                    frame, unique_slots.len(), self.vertex_batch.vertex_count(),
+                    draw_calls.len(), app.texture_cache.texture_count()
+                );
             }
         }
 
@@ -1316,7 +1346,9 @@ impl Gr {
                             // Build push constants (no texture_size -- computed in shader)
                             let push_constants = utility::vertex::PushConstants {
                                 screen_size: [screen_width as f32, screen_height as f32],
-                                chromakey_color: [ck_r, ck_g, ck_b],
+                                chromakey_r: ck_r,
+                                chromakey_g: ck_g,
+                                chromakey_b: ck_b,
                                 chromakey_enabled: if draw_call.chromakey_enabled {
                                     1.0
                                 } else {
@@ -1450,7 +1482,9 @@ impl Gr {
                             // Draw with CF_LOCAL (vertex color only), alpha blend, placeholder texture
                             let fps_push = utility::vertex::PushConstants {
                                 screen_size: [sw, sh],
-                                chromakey_color: [0.0, 0.0, 0.0],
+                                chromakey_r: 0.0,
+                                chromakey_g: 0.0,
+                                chromakey_b: 0.0,
                                 chromakey_enabled: 0.0,
                                 fog_mode: 0,
                                 fog_color_r: 0.0,
