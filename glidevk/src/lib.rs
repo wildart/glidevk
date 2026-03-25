@@ -1111,6 +1111,13 @@ impl Gr {
             }
         }
 
+        // Resolve texture addresses → descriptor slot indices now that all textures are uploaded
+        if let Some(app) = &self.vulkan_app {
+            for v in &mut self.vertex_batch.vertices {
+                v.texture_index = app.texture_cache.get_texture_slot(v.texture_index);
+            }
+        }
+
         log::trace!(
             "buffer_swap: {} draw calls, {} vertices",
             draw_calls.len(),
@@ -2584,9 +2591,8 @@ impl Gr {
         let cf = self.current_combine_flags();
         let tex_addr = self.state.tex_source[0];
         self.frame_textures.insert(tex_addr);
-        let tex_idx = self.vulkan_app.as_ref()
-            .map(|app| app.texture_cache.get_texture_slot(tex_addr))
-            .unwrap_or(0);
+        // Store raw texture address; resolved to descriptor slot in buffer_swap after upload
+        let tex_idx = tex_addr;
         let mut v0 = utility::vertex::GpuVertex::from_glide_vertex(&a);
         let mut v1 = utility::vertex::GpuVertex::from_glide_vertex(&b);
         let mut v2 = utility::vertex::GpuVertex::from_glide_vertex(&c);
@@ -2619,9 +2625,7 @@ impl Gr {
         gpu_v.combine_flags = self.current_combine_flags();
         let tex_addr = self.state.tex_source[0];
         self.frame_textures.insert(tex_addr);
-        gpu_v.texture_index = self.vulkan_app.as_ref()
-            .map(|app| app.texture_cache.get_texture_slot(tex_addr))
-            .unwrap_or(0);
+        gpu_v.texture_index = tex_addr;
         let x = gpu_v.position[0];
         let y = gpu_v.position[1];
 
@@ -2674,9 +2678,8 @@ impl Gr {
         let cf = self.current_combine_flags();
         let tex_addr = self.state.tex_source[0];
         self.frame_textures.insert(tex_addr);
-        let tex_idx = self.vulkan_app.as_ref()
-            .map(|app| app.texture_cache.get_texture_slot(tex_addr))
-            .unwrap_or(0);
+        // Store raw texture address; resolved to descriptor slot in buffer_swap after upload
+        let tex_idx = tex_addr;
         let mut gpu_v1 = utility::vertex::GpuVertex::from_glide_vertex(&v1);
         let mut gpu_v2 = utility::vertex::GpuVertex::from_glide_vertex(&v2);
         gpu_v1.constant_color = cc; gpu_v1.combine_flags = cf; gpu_v1.texture_index = tex_idx;
@@ -2750,9 +2753,8 @@ impl Gr {
         let cf = self.current_combine_flags();
         let tex_addr = self.state.tex_source[0];
         self.frame_textures.insert(tex_addr);
-        let tex_idx = self.vulkan_app.as_ref()
-            .map(|app| app.texture_cache.get_texture_slot(tex_addr))
-            .unwrap_or(0);
+        // Store raw texture address; resolved to descriptor slot in buffer_swap after upload
+        let tex_idx = tex_addr;
 
         // Extract vertices using the configured layout
         let gpu_vertices: Vec<utility::vertex::GpuVertex> = (0..count as usize)
@@ -2804,9 +2806,7 @@ impl Gr {
         self.frame_textures.insert(current_texture);
         let cc = self.current_constant_color();
         let cf = self.current_combine_flags();
-        let tex_idx = self.vulkan_app.as_ref()
-            .map(|app| app.texture_cache.get_texture_slot(current_texture))
-            .unwrap_or(0);
+        let tex_idx = current_texture;
 
         // Log small texture draws (likely glyphs) for debugging
         static LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
