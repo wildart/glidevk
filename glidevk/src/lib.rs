@@ -1118,6 +1118,7 @@ impl Gr {
         }
 
         // Resolve texture addresses → descriptor slot indices now that all textures are uploaded
+        let t_resolve = std::time::Instant::now();
         if let Some(app) = &self.vulkan_app {
             let mut unresolved = 0u32;
             for v in &mut self.vertex_batch.vertices {
@@ -1148,6 +1149,8 @@ impl Gr {
             }
         }
 
+        let t_resolve_done = std::time::Instant::now();
+
         log::trace!(
             "buffer_swap: {} draw calls, {} vertices",
             draw_calls.len(),
@@ -1156,6 +1159,7 @@ impl Gr {
 
         let vertex_count = self.vertex_batch.vertex_count();
         let vertex_data = self.vertex_batch.as_bytes().to_vec();
+        let t_copy_done = std::time::Instant::now();
         let clear_r = self.state.clear_r;
         let clear_g = self.state.clear_g;
         let clear_b = self.state.clear_b;
@@ -1180,6 +1184,7 @@ impl Gr {
         if let Some(app) = &mut self.vulkan_app {
             unsafe {
                 // Wait for this frame-in-flight slot to be available
+                let t_fence = std::time::Instant::now();
                 let frame = app.current_frame;
                 app.device
                     .wait_for_fences(&[app.in_flight_fences[frame]], true, u64::MAX)
@@ -1187,6 +1192,7 @@ impl Gr {
                 app.device
                     .reset_fences(&[app.in_flight_fences[frame]])
                     .expect("Failed to reset fence");
+                let t_fence_done = std::time::Instant::now();
 
                 // Flush deferred texture/descriptor destruction now that this
                 // frame slot's GPU work is complete
@@ -1225,6 +1231,7 @@ impl Gr {
                 };
 
                 // Upload vertex data to this frame's vertex buffer
+                let t_upload = std::time::Instant::now();
                 if vertex_count > 0 {
                     utility::vertex::upload_to_buffer(
                         &app.device,
@@ -1232,9 +1239,11 @@ impl Gr {
                         &vertex_data,
                     );
                 }
+                let t_upload_done = std::time::Instant::now();
 
                 // Record command buffer for this frame
                 let cmd = app.command_buffers[image_index as usize];
+                let t_record = std::time::Instant::now();
 
                 // Reset and begin command buffer
                 app.device
@@ -1518,6 +1527,7 @@ impl Gr {
                 app.device
                     .end_command_buffer(cmd)
                     .expect("Failed to end command buffer");
+                let t_record_done = std::time::Instant::now();
 
                 // Submit command buffer
                 let wait_semaphores = [app.image_available_semaphores[frame]];
@@ -1531,9 +1541,11 @@ impl Gr {
                     .command_buffers(&command_buffers)
                     .signal_semaphores(&signal_semaphores);
 
+                let t_submit = std::time::Instant::now();
                 app.device
                     .queue_submit(app.graphics_queue, &[submit_info], app.in_flight_fences[frame])
                     .expect("Failed to submit draw command buffer");
+                let t_submit_done = std::time::Instant::now();
 
                 // Present the image
                 let swapchains = [app.swapchain];
@@ -1543,21 +1555,28 @@ impl Gr {
                     .swapchains(&swapchains)
                     .image_indices(&image_indices);
 
+                let t_present = std::time::Instant::now();
                 app.swapchain_loader
                     .queue_present(app.present_queue, &present_info)
                     .expect("Failed to present");
+                let t_present_done = std::time::Instant::now();
 
                 app.last_presented_image_index = image_index;
 
                 // Advance to next frame-in-flight slot
                 app.current_frame = (app.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
-                let frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
-                if frame_ms > 18.0 {
-                    log::warn!(
-                        "Slow frame: {:.1}ms, {} draw calls, {} vertices",
-                        frame_ms, draw_calls.len(), vertex_count
-                    );
+                let resolve_ms = t_resolve_done.duration_since(t_resolve).as_secs_f64() * 1000.0;
+                let copy_ms = t_copy_done.duration_since(t_resolve_done).as_secs_f64() * 1000.0;
+                let fence_ms = t_fence_done.duration_since(t_fence).as_secs_f64() * 1000.0;
+                let upload_ms = t_upload_done.duration_since(t_upload).as_secs_f64() * 1000.0;
+                let record_ms = t_record_done.duration_since(t_record).as_secs_f64() * 1000.0;
+                let submit_ms = t_submit_done.duration_since(t_submit).as_secs_f64() * 1000.0;
+                let present_ms = t_present_done.duration_since(t_present).as_secs_f64() * 1000.0;
+                let total_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+                if total_ms > 18.0 {
+                    log::warn!("Frame timing: resolve={:.1}ms copy={:.1}ms fence={:.1}ms upload={:.1}ms record={:.1}ms submit={:.1}ms present={:.1}ms total={:.1}ms",
+                        resolve_ms, copy_ms, fence_ms, upload_ms, record_ms, submit_ms, present_ms, total_ms);
                 }
             }
             Some(())
