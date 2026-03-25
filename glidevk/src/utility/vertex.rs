@@ -190,7 +190,6 @@ impl GpuVertex {
 #[derive(Clone, Copy, Debug)]
 pub struct PushConstants {
     pub screen_size: [f32; 2],
-    pub chromakey_enabled: f32,
     pub chromakey_r: f32,
     pub chromakey_g: f32,
     pub chromakey_b: f32,
@@ -220,7 +219,6 @@ pub enum BlendMode {
 pub struct DrawCall {
     pub start_vertex: u32,
     pub vertex_count: u32,
-    pub chromakey_enabled: bool,
     pub blend_mode: BlendMode,
 }
 
@@ -232,7 +230,6 @@ pub struct VertexBatch {
     pub draw_calls: Vec<DrawCall>,
     max_vertices: usize,
     current_start: u32,
-    current_chromakey: bool,
     current_blend_mode: BlendMode,
 }
 
@@ -243,28 +240,11 @@ impl VertexBatch {
             draw_calls: Vec::with_capacity(256),
             max_vertices,
             current_start: 0,
-            current_chromakey: false,
             current_blend_mode: BlendMode::Opaque,
         }
     }
 
-    /// Set the chromakey mode for subsequent vertices
-    pub fn set_chromakey(&mut self, enabled: bool) {
-        if enabled != self.current_chromakey && !self.vertices.is_empty() {
-            // Chromakey changed - finalize current draw call if we have vertices
-            let current_count = self.vertices.len() as u32 - self.current_start;
-            if current_count > 0 {
-                self.draw_calls.push(DrawCall {
-                    start_vertex: self.current_start,
-                    vertex_count: current_count,
-                    chromakey_enabled: self.current_chromakey,
-                    blend_mode: self.current_blend_mode,
-                });
-                self.current_start = self.vertices.len() as u32;
-            }
-        }
-        self.current_chromakey = enabled;
-    }
+
 
     /// Set the blend mode for subsequent vertices
     pub fn set_blend_mode(&mut self, mode: BlendMode) {
@@ -274,7 +254,6 @@ impl VertexBatch {
                 self.draw_calls.push(DrawCall {
                     start_vertex: self.current_start,
                     vertex_count: current_count,
-                    chromakey_enabled: self.current_chromakey,
                     blend_mode: self.current_blend_mode,
                 });
                 self.current_start = self.vertices.len() as u32;
@@ -300,7 +279,6 @@ impl VertexBatch {
             self.draw_calls.push(DrawCall {
                 start_vertex: self.current_start,
                 vertex_count: current_count,
-                chromakey_enabled: self.current_chromakey,
                 blend_mode: self.current_blend_mode,
             });
             self.current_start = self.vertices.len() as u32;
@@ -312,7 +290,6 @@ impl VertexBatch {
         self.vertices.clear();
         self.draw_calls.clear();
         self.current_start = 0;
-        // Don't reset chromakey - it persists across frames
     }
 
     pub fn is_empty(&self) -> bool {
@@ -467,8 +444,8 @@ mod tests {
 
     #[test]
     fn test_push_constants_size() {
-        // screen_size(8) + chromakey_enabled(4) + chromakey_rgb(12) + fog(16) = 40
-        assert_eq!(std::mem::size_of::<PushConstants>(), 40);
+        // screen_size(8) + chromakey_rgb(12) + fog(16) = 36
+        assert_eq!(std::mem::size_of::<PushConstants>(), 36);
     }
 
     #[test]

@@ -1349,11 +1349,6 @@ impl Gr {
                                 chromakey_r: ck_r,
                                 chromakey_g: ck_g,
                                 chromakey_b: ck_b,
-                                chromakey_enabled: if draw_call.chromakey_enabled {
-                                    1.0
-                                } else {
-                                    0.0
-                                },
                                 fog_mode,
                                 fog_color_r: fog_r,
                                 fog_color_g: fog_g,
@@ -1485,7 +1480,6 @@ impl Gr {
                                 chromakey_r: 0.0,
                                 chromakey_g: 0.0,
                                 chromakey_b: 0.0,
-                                chromakey_enabled: 0.0,
                                 fog_mode: 0,
                                 fog_color_r: 0.0,
                                 fog_color_g: 0.0,
@@ -1830,7 +1824,8 @@ impl Gr {
         let acl = (self.state.alpha_combine_local as u32 & 0x3) << 20;
         let ccl = (self.state.color_combine_local as u32 & 0x3) << 22;
         let aco = (self.state.alpha_combine_other as u32 & 0x3) << 24;
-        ccf | acf | ccfr | acfr | cco | acl | ccl | aco
+        let ck = if matches!(self.state.chromakey_mode, ChromakeyMode::Enable) { 1u32 << 26 } else { 0 };
+        ccf | acf | ccfr | acfr | cco | acl | ccl | aco | ck
     }
 
     /// Get the current constant color as normalized RGBA floats
@@ -1869,9 +1864,6 @@ impl Gr {
     /// grChromakeyMode - enable/disable chroma-keying
     pub fn chromakey_mode(&mut self, mode: ChromakeyMode) {
         self.state.chromakey_mode = mode;
-        // Track chromakey changes for batched rendering
-        let enabled = matches!(mode, ChromakeyMode::Enable);
-        self.vertex_batch.set_chromakey(enabled);
         log::trace!("Chromakey mode set to: {:?}", mode);
     }
 

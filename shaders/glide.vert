@@ -10,7 +10,6 @@ layout(location = 6) in uint inTexIndex;
 
 layout(push_constant) uniform PushConstants {
     vec2 screenSize;
-    float chromakeyEnabled;
     float chromakeyR;
     float chromakeyG;
     float chromakeyB;

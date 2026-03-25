@@ -12,7 +12,6 @@ layout(binding = 0) uniform sampler2D textures[2048];
 
 layout(push_constant) uniform PushConstants {
     vec2 screenSize;
-    float chromakeyEnabled;
     float chromakeyR;
     float chromakeyG;
     float chromakeyB;
@@ -33,6 +32,7 @@ int getColorOther()    { return int((fragCombineFlags >> 18) & 0x3u); }
 int getAlphaLocal()    { return int((fragCombineFlags >> 20) & 0x3u); }
 int getColorLocal()    { return int((fragCombineFlags >> 22) & 0x3u); }
 int getAlphaOther()    { return int((fragCombineFlags >> 24) & 0x3u); }
+bool getChromakeyEnabled() { return (fragCombineFlags & (1u << 26)) != 0u; }
 
 const int CF_ZERO = 0;
 const int CF_LOCAL = 1;
@@ -102,7 +102,7 @@ void main() {
 
     vec4 texColor = texture(textures[nonuniformEXT(fragTexIndex)], uv);
 
-    if (pc.chromakeyEnabled > 0.5) {
+    if (getChromakeyEnabled()) {
         if (texColor.r < 0.01 && texColor.g < 0.01 && texColor.b < 0.01) discard;
     }
 
