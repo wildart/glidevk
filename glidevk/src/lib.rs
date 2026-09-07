@@ -242,6 +242,7 @@ pub struct State {
 
     // Texture table state
     tex_table_type: TextureTableType,
+    palette_generation: u64,
 
     // Vertex layout configuration
     vertex_layout: VertexLayout,
@@ -332,6 +333,7 @@ impl Default for State {
             tex_combine_factor: [CombineFactor::Zero; GLIDE_NUM_TMU],
             // Default texture table type
             tex_table_type: TextureTableType::Palette,
+            palette_generation: 0,
             // Default vertex layout: all disabled
             vertex_layout: VertexLayout::default(),
         }
@@ -376,6 +378,45 @@ impl Default for LfbLockState {
             lfb_written: false,
         }
     }
+}
+
+/// Resize a tightly packed BGRA8 image using nearest-neighbor sampling.
+/// Glide exposes logical framebuffer coordinates even when the Vulkan
+/// swapchain is configured at a larger presentation size.
+fn scale_bgra_nearest(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    destination_width: u32,
+    destination_height: u32,
+) -> Vec<u8> {
+    if source_width == 0
+        || source_height == 0
+        || destination_width == 0
+        || destination_height == 0
+        || source.len() < (source_width * source_height * 4) as usize
+    {
+        return Vec::new();
+    }
+
+    if source_width == destination_width && source_height == destination_height {
+        return source.to_vec();
+    }
+
+    let mut destination =
+        vec![0u8; (destination_width * destination_height * 4) as usize];
+    for y in 0..destination_height {
+        let source_y = (y as u64 * source_height as u64 / destination_height as u64) as u32;
+        for x in 0..destination_width {
+            let source_x =
+                (x as u64 * source_width as u64 / destination_width as u64) as u32;
+            let source_offset = ((source_y * source_width + source_x) * 4) as usize;
+            let destination_offset = ((y * destination_width + x) * 4) as usize;
+            destination[destination_offset..destination_offset + 4]
+                .copy_from_slice(&source[source_offset..source_offset + 4]);
+        }
+    }
+    destination
 }
 
 pub struct Gr {
@@ -1074,32 +1115,63 @@ impl Gr {
         // Batch-upload all missing textures in a single GPU submission
         {
             let mut to_upload: Vec<(u32, utility::texture::TextureData, Option<utility::texture::PaletteTable>)> = Vec::new();
+            let mut uploaded_palette_generations: Vec<(u32, Option<u64>)> = Vec::new();
 
+            let pal_gen = self.state.palette_generation;
             for &addr in &needed_textures {
                 if addr == 0 {
                     continue;
                 }
-                let needs_upload = self.vulkan_app.as_ref()
-                    .map(|app| !app.texture_cache.has_texture(addr))
-                    .unwrap_or(false);
+
+                let Some(tmu_idx) = (0..GLIDE_NUM_TMU)
+                    .find(|&index| self.texture_memory[index].get_texture(addr).is_some())
+                else {
+                    continue;
+                };
+                let tex = self.texture_memory[tmu_idx]
+                    .get_texture(addr)
+                    .expect("texture disappeared while preparing upload");
+                let palette_generation =
+                    matches!(tex.format, TextureFormat::P8).then_some(pal_gen);
+
+                // Check if texture is missing or has a stale palette
+                let (has_it, palette_stale) = self.vulkan_app.as_ref()
+                    .map(|app| (
+                        app.texture_cache.has_texture(addr),
+                        app.texture_cache
+                            .is_palette_stale(addr, palette_generation),
+                    ))
+                    .unwrap_or((false, false));
+
+                let needs_upload = !has_it || palette_stale;
+
+                // Log a small sample of palette-driven re-uploads.
+                static STALE_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if palette_stale && has_it {
+                    let n = STALE_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 10 {
+                        log::debug!(
+                            "Palette changed: re-uploading P8 texture {:#x} at generation {}",
+                            addr,
+                            pal_gen
+                        );
+                    }
+                }
 
                 if needs_upload {
-                    // Find which TMU has this texture and get its data
-                    for tmu_idx in 0..GLIDE_NUM_TMU {
-                        if let Some(tex) = self.texture_memory[tmu_idx].get_texture(addr) {
-                            let palette = self.texture_memory[tmu_idx]
-                                .get_palette(0)
-                                .map(|p| utility::texture::PaletteTable { entries: p.entries.clone() });
-                            to_upload.push((
-                                addr,
-                                utility::texture::TextureData::new(
-                                    tex.width, tex.height, tex.format, tex.data.clone(),
-                                ),
-                                palette,
-                            ));
-                            break;
-                        }
-                    }
+                    let palette = palette_generation.and_then(|_| {
+                        self.texture_memory[tmu_idx]
+                            .get_palette(0)
+                            .cloned()
+                    });
+                    to_upload.push((
+                        addr,
+                        utility::texture::TextureData::new(
+                            tex.width, tex.height, tex.format, tex.data.clone(),
+                        ),
+                        palette,
+                    ));
+                    uploaded_palette_generations.push((addr, palette_generation));
                 }
             }
 
@@ -1113,6 +1185,10 @@ impl Gr {
                         app.graphics_queue,
                         to_upload,
                     );
+                    // Record palette generation for freshly uploaded textures
+                    for (addr, generation) in uploaded_palette_generations {
+                        app.texture_cache.set_palette_gen(addr, generation);
+                    }
                 }
             }
         }
@@ -1353,6 +1429,7 @@ impl Gr {
                             }
 
                             // Build push constants (no texture_size -- computed in shader)
+                            let gamma = crate::api::current_gamma_rgb();
                             let push_constants = utility::vertex::PushConstants {
                                 screen_size: [screen_width as f32, screen_height as f32],
                                 chromakey_r: ck_r,
@@ -1362,6 +1439,9 @@ impl Gr {
                                 fog_color_r: fog_r,
                                 fog_color_g: fog_g,
                                 fog_color_b: fog_b,
+                                gamma_r: gamma[0],
+                                gamma_g: gamma[1],
+                                gamma_b: gamma[2],
                             };
 
                             // Only push constants if they changed
@@ -1493,6 +1573,9 @@ impl Gr {
                                 fog_color_r: 0.0,
                                 fog_color_g: 0.0,
                                 fog_color_b: 0.0,
+                                gamma_r: 1.0,
+                                gamma_g: 1.0,
+                                gamma_b: 1.0,
                             };
                             let fps_push_data = std::slice::from_raw_parts(
                                 &fps_push as *const _ as *const u8,
@@ -2575,16 +2658,22 @@ impl Gr {
             return;
         }
 
-        log::debug!("Texture table download: type={:?}", table_type);
-
         match table_type {
             TextureTableType::Palette | TextureTableType::Palette6666Ext => {
-                // Copy palette data (256 entries * 4 bytes each = 1024 bytes)
-                let palette_data =
-                    unsafe { std::slice::from_raw_parts(data as *const u8, 256 * 4) };
-                let palette = utility::texture::PaletteTable::from_data(palette_data);
-                // Always download to TMU0
-                self.texture_memory[0].store_palette(0, palette);
+                let raw = unsafe {
+                    std::slice::from_raw_parts(data as *const u8, 256 * 4)
+                };
+                let palette = if matches!(table_type, TextureTableType::Palette6666Ext) {
+                    utility::texture::PaletteTable::from_argb6666_data(raw)
+                } else {
+                    utility::texture::PaletteTable::from_data(raw)
+                };
+                let old = self.texture_memory[0].get_palette(0);
+                if old.map_or(true, |old| *old != palette) {
+                    self.state.palette_generation =
+                        self.state.palette_generation.wrapping_add(1);
+                    self.texture_memory[0].store_palette(0, palette);
+                }
             }
             TextureTableType::Ncc0 | TextureTableType::Ncc1 => {
                 // NCC (Narrow Channel Compression) tables are used for YIQ texture formats
@@ -3393,10 +3482,35 @@ impl Gr {
         dst_stride: FxU32,
         dst_data: *mut std::ffi::c_void,
     ) -> glidesys::FxBool {
+        if dst_data.is_null() || dst_stride < src_width.saturating_mul(2) {
+            return glidesys::FxBool::False;
+        }
+
         // Read entire framebuffer
-        if let Some((fb_width, fb_height, pixels)) = self.lfb_read_region() {
+        if let Some((swapchain_width, swapchain_height, pixels)) = self.lfb_read_region() {
+            let fb_width = if self.state.screen_width > 0 {
+                self.state.screen_width
+            } else {
+                swapchain_width
+            };
+            let fb_height = if self.state.screen_height > 0 {
+                self.state.screen_height
+            } else {
+                swapchain_height
+            };
+            let pixels = scale_bgra_nearest(
+                &pixels,
+                swapchain_width,
+                swapchain_height,
+                fb_width,
+                fb_height,
+            );
+
             // Validate bounds
-            if src_x + src_width > fb_width || src_y + src_height > fb_height {
+            if src_x.checked_add(src_width).is_none_or(|right| right > fb_width)
+                || src_y.checked_add(src_height).is_none_or(|bottom| bottom > fb_height)
+                || pixels.is_empty()
+            {
                 return glidesys::FxBool::False;
             }
 
@@ -3463,8 +3577,14 @@ impl Gr {
             None => return FxBool::False,
         };
 
-        let width = app.swapchain_extent.width;
-        let height = app.swapchain_extent.height;
+        // Glide applications always address the logical game framebuffer.
+        // Presentation scaling is handled when writing to or reading from the
+        // Vulkan swapchain.
+        let (width, height) = if self.state.screen_width > 0 && self.state.screen_height > 0 {
+            (self.state.screen_width, self.state.screen_height)
+        } else {
+            (app.swapchain_extent.width, app.swapchain_extent.height)
+        };
 
         // Calculate stride based on write mode (bytes per pixel)
         let bytes_per_pixel = match write_mode {
@@ -3487,14 +3607,26 @@ impl Gr {
 
         // For read locks, copy framebuffer data to buffer
         if lock_type == glidesys::LfbLock::ReadOnly {
-            if let Some((_, _, pixels)) = self.lfb_read_region() {
+            if let Some((swapchain_width, swapchain_height, pixels)) = self.lfb_read_region() {
+                let pixels = scale_bgra_nearest(
+                    &pixels,
+                    swapchain_width,
+                    swapchain_height,
+                    width,
+                    height,
+                );
                 // Convert from BGRA to requested format
                 match write_mode {
                     glidesys::LfbWriteMode::Rgb565 | glidesys::LfbWriteMode::Any => {
                         // Convert BGRA to RGB565
                         for y in 0..height {
+                            let source_y = if origin == glidesys::OriginLocation::LowerLeft {
+                                height - 1 - y
+                            } else {
+                                y
+                            };
                             for x in 0..width {
-                                let src_idx = ((y * width + x) * 4) as usize;
+                                let src_idx = ((source_y * width + x) * 4) as usize;
                                 let dst_idx = ((y * stride) + (x * 2)) as usize;
                                 if src_idx + 2 < pixels.len() && dst_idx + 1 < data.len() {
                                     let b = pixels[src_idx] as u16;
@@ -3508,9 +3640,24 @@ impl Gr {
                         }
                     }
                     _ => {
-                        // For other formats, just copy raw BGRA data
-                        let copy_len = std::cmp::min(data.len(), pixels.len());
-                        data[..copy_len].copy_from_slice(&pixels[..copy_len]);
+                        // Preserve existing raw BGRA behavior for 32-bit modes.
+                        // Unsupported packed modes remain zero-filled rather
+                        // than copying rows with an incompatible stride.
+                        if bytes_per_pixel == 4 {
+                            for y in 0..height {
+                                let source_y =
+                                    if origin == glidesys::OriginLocation::LowerLeft {
+                                        height - 1 - y
+                                    } else {
+                                        y
+                                    };
+                                let src_start = (source_y * width * 4) as usize;
+                                let dst_start = (y * stride) as usize;
+                                let row_bytes = (width * 4) as usize;
+                                data[dst_start..dst_start + row_bytes]
+                                    .copy_from_slice(&pixels[src_start..src_start + row_bytes]);
+                            }
+                        }
                     }
                 }
             }
@@ -3580,7 +3727,31 @@ impl Gr {
         src_stride: i32,
         src_data: *const std::ffi::c_void,
     ) -> FxBool {
-        if src_data.is_null() || src_width == 0 || src_height == 0 {
+        if src_data.is_null() || src_width == 0 || src_height == 0 || src_stride <= 0 {
+            return FxBool::False;
+        }
+
+        let logical_width = if self.state.screen_width > 0 {
+            self.state.screen_width
+        } else {
+            self.vulkan_app
+                .as_ref()
+                .map_or(0, |app| app.swapchain_extent.width)
+        };
+        let logical_height = if self.state.screen_height > 0 {
+            self.state.screen_height
+        } else {
+            self.vulkan_app
+                .as_ref()
+                .map_or(0, |app| app.swapchain_extent.height)
+        };
+        if dst_x
+            .checked_add(src_width)
+            .is_none_or(|right| right > logical_width)
+            || dst_y
+                .checked_add(src_height)
+                .is_none_or(|bottom| bottom > logical_height)
+        {
             return FxBool::False;
         }
 
@@ -3614,6 +3785,11 @@ impl Gr {
             glidesys::LfbWriteMode::Argb8888 => 4,
             _ => 2,
         };
+        if src_stride < (src_width * bpp) as i32 {
+            self.lfb_lock_state.is_locked = false;
+            self.lfb_lock_state.data.clear();
+            return FxBool::False;
+        }
 
         // Copy row by row from source to locked buffer
         let dst_stride = info.stride_in_bytes;
@@ -3886,18 +4062,164 @@ impl Gr {
                 &[], &[], &[barrier],
             );
 
-            // Copy buffer to image
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0, base_array_layer: 0, layer_count: 1,
-                })
-                .image_extent(vk::Extent3D { width, height, depth: 1 });
+            let needs_scaling = width != app.swapchain_extent.width
+                || height != app.swapchain_extent.height;
 
-            app.device.cmd_copy_buffer_to_image(
-                cmd, staging_buffer, dst_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region],
-            );
+            // When LFB is at game resolution but swapchain is larger, use a staging
+            // image and vkCmdBlitImage to scale up. Otherwise copy directly.
+            let mut lfb_staging_image = vk::Image::null();
+            let mut lfb_staging_memory = vk::DeviceMemory::null();
+
+            if needs_scaling {
+                // Create staging image at game resolution
+                let staging_image_info = vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .extent(vk::Extent3D { width, height, depth: 1 })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .format(vk::Format::B8G8R8A8_UNORM)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .samples(vk::SampleCountFlags::TYPE_1);
+
+                lfb_staging_image = app
+                    .device
+                    .create_image(&staging_image_info, None)
+                    .expect("Failed to create LFB staging image");
+
+                let img_mem_req = app.device.get_image_memory_requirements(lfb_staging_image);
+
+                let mut img_mem_type = 0;
+                for i in 0..mem_properties.memory_type_count {
+                    if (img_mem_req.memory_type_bits & (1 << i)) != 0
+                        && mem_properties.memory_types[i as usize]
+                            .property_flags
+                            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                    {
+                        img_mem_type = i;
+                        break;
+                    }
+                }
+
+                let img_alloc = vk::MemoryAllocateInfo::default()
+                    .allocation_size(img_mem_req.size)
+                    .memory_type_index(img_mem_type);
+
+                lfb_staging_memory = app
+                    .device
+                    .allocate_memory(&img_alloc, None)
+                    .expect("Failed to allocate LFB staging image memory");
+
+                app.device
+                    .bind_image_memory(lfb_staging_image, lfb_staging_memory, 0)
+                    .expect("Failed to bind LFB staging image memory");
+
+                // Transition staging image UNDEFINED → TRANSFER_DST
+                let staging_to_dst = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(lfb_staging_image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0, level_count: 1,
+                        base_array_layer: 0, layer_count: 1,
+                    })
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+                app.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[], &[], &[staging_to_dst],
+                );
+
+                // Copy buffer → staging image
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0, base_array_layer: 0, layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D { width, height, depth: 1 });
+
+                app.device.cmd_copy_buffer_to_image(
+                    cmd, staging_buffer, lfb_staging_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region],
+                );
+
+                // Transition staging image TRANSFER_DST → TRANSFER_SRC
+                let staging_to_src = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(lfb_staging_image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0, level_count: 1,
+                        base_array_layer: 0, layer_count: 1,
+                    })
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+
+                app.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[], &[], &[staging_to_src],
+                );
+
+                // Blit staging image → swapchain image (scales game res → window res)
+                let blit_region = vk::ImageBlit {
+                    src_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0, base_array_layer: 0, layer_count: 1,
+                    },
+                    src_offsets: [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D { x: width as i32, y: height as i32, z: 1 },
+                    ],
+                    dst_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0, base_array_layer: 0, layer_count: 1,
+                    },
+                    dst_offsets: [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D {
+                            x: app.swapchain_extent.width as i32,
+                            y: app.swapchain_extent.height as i32,
+                            z: 1,
+                        },
+                    ],
+                };
+
+                app.device.cmd_blit_image(
+                    cmd,
+                    lfb_staging_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    dst_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[blit_region],
+                    vk::Filter::NEAREST,
+                );
+            } else {
+                // No scaling needed — direct copy
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0, base_array_layer: 0, layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D { width, height, depth: 1 });
+
+                app.device.cmd_copy_buffer_to_image(
+                    cmd, staging_buffer, dst_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region],
+                );
+            }
 
             // Transition to PRESENT_SRC
             let barrier_present = vk::ImageMemoryBarrier::default()
@@ -3957,6 +4279,10 @@ impl Gr {
             app.device.free_command_buffers(app.command_pool, &cmd_buffers);
             app.device.destroy_buffer(staging_buffer, None);
             app.device.free_memory(staging_memory, None);
+            if lfb_staging_image != vk::Image::null() {
+                app.device.destroy_image(lfb_staging_image, None);
+                app.device.free_memory(lfb_staging_memory, None);
+            }
 
             log::debug!(
                 "LFB write uploaded to framebuffer ({}x{}, image_index={})",
@@ -4220,6 +4546,22 @@ mod tests {
         assert!((g - 1.0).abs() < 0.01);
         assert!((b - 1.0).abs() < 0.01);
         assert!((a - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_scale_bgra_nearest_preserves_pixel_blocks() {
+        let source = vec![
+            1, 0, 0, 255, 2, 0, 0, 255,
+            3, 0, 0, 255, 4, 0, 0, 255,
+        ];
+        let scaled = scale_bgra_nearest(&source, 2, 2, 4, 4);
+
+        let pixel = |x: usize, y: usize| scaled[(y * 4 + x) * 4];
+        assert_eq!(pixel(0, 0), 1);
+        assert_eq!(pixel(1, 1), 1);
+        assert_eq!(pixel(2, 0), 2);
+        assert_eq!(pixel(0, 2), 3);
+        assert_eq!(pixel(3, 3), 4);
     }
 
     // ==================== Alpha Tests ====================
@@ -4494,6 +4836,48 @@ mod tests {
         // Default config is 8MB per TMU
         let expected = gr.config().texture.memory.bytes() - 8;
         assert_eq!(gr.tex_max_address(ChipID::Tmu0), expected);
+    }
+
+    #[test]
+    fn test_palette_generation_only_changes_for_new_palette_data() {
+        let mut gr = create_test_gr();
+        let mut palette = [0u32; 256];
+        palette[1] = 0xFF12_3456;
+
+        gr.tex_download_table(
+            TextureTableType::Palette,
+            palette.as_ptr().cast(),
+        );
+        assert_eq!(gr.state.palette_generation, 1);
+
+        gr.tex_download_table(
+            TextureTableType::Palette,
+            palette.as_ptr().cast(),
+        );
+        assert_eq!(gr.state.palette_generation, 1);
+
+        palette[1] = 0xFF65_4321;
+        gr.tex_download_table(
+            TextureTableType::Palette,
+            palette.as_ptr().cast(),
+        );
+        assert_eq!(gr.state.palette_generation, 2);
+    }
+
+    #[test]
+    fn test_palette_6666_download_quantizes_argb_input() {
+        let mut gr = create_test_gr();
+        let mut palette = [0u32; 256];
+        palette[0] = 0xFF80_4020;
+
+        gr.tex_download_table(
+            TextureTableType::Palette6666Ext,
+            palette.as_ptr().cast(),
+        );
+
+        let stored = gr.texture_memory[0].get_palette(0).unwrap();
+        assert_eq!(stored.entries[0], 0xFF82_4120);
+        assert_eq!(gr.state.palette_generation, 1);
     }
 
     #[test]

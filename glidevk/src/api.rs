@@ -4,6 +4,16 @@
 //! the appropriate calling convention for DLL exports.
 
 use crate::glidesys::*;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Global per-channel gamma values. The standalone Glide gamma functions cannot
+/// access a `Gr` instance, so rendering reads these atomics when building push
+/// constants.
+pub static GAMMA_RGB: [AtomicU32; 3] = [
+    AtomicU32::new(1.0f32.to_bits()),
+    AtomicU32::new(1.0f32.to_bits()),
+    AtomicU32::new(1.0f32.to_bits()),
+];
 
 // Static strings for grGetString
 static VERSION: &[u8] = b"3.0\0";
@@ -463,43 +473,110 @@ pub unsafe fn get_proc_address(proc_name: *const std::ffi::c_char) -> GrProc {
 /// Load gamma correction table
 /// The table has 256 entries, each a 32-bit value with R, G, B components
 pub fn load_gamma_table(
-    _num_entries: FxU32,
-    _red: *const FxU32,
-    _green: *const FxU32,
-    _blue: *const FxU32,
+    num_entries: FxU32,
+    red: *const FxU32,
+    green: *const FxU32,
+    blue: *const FxU32,
 ) {
-    // Stub - gamma correction not yet implemented in Vulkan backend
-    // In a full implementation, this would update the swapchain gamma ramp
+    if num_entries < 2 || (red.is_null() && green.is_null() && blue.is_null()) {
+        return;
+    }
+
+    // The Vulkan backend currently represents a gamma table with a per-channel
+    // exponent. Estimate that exponent from each supplied LUT independently.
+    let mut gamma = current_gamma_rgb();
+    for (channel, table_ptr) in [red, green, blue].into_iter().enumerate() {
+        if !table_ptr.is_null() {
+            let table = unsafe {
+                std::slice::from_raw_parts(table_ptr, num_entries as usize)
+            };
+            if let Some(estimated) = estimate_gamma_from_table(table) {
+                gamma[channel] = estimated;
+            }
+        }
+    }
+
+    set_gamma_rgb(gamma);
+    log::debug!(
+        "Gamma table loaded: estimated R={:.3} G={:.3} B={:.3}",
+        gamma[0],
+        gamma[1],
+        gamma[2]
+    );
 }
 
 /// Glide utility function: compute and load gamma correction tables
 /// Formula: c_gamma = 255 * (c/255)^(1/gamma)
 pub fn gamma_correction_rgb(gamma_red: f32, gamma_green: f32, gamma_blue: f32) {
-    // Build gamma correction tables (256 entries each)
-    let mut red_table: [FxU32; 256] = [0; 256];
-    let mut green_table: [FxU32; 256] = [0; 256];
-    let mut blue_table: [FxU32; 256] = [0; 256];
+    let gamma = [gamma_red, gamma_green, gamma_blue].map(sanitize_gamma);
+    set_gamma_rgb(gamma);
+    log::debug!(
+        "Gamma set: R={:.3} G={:.3} B={:.3}",
+        gamma[0],
+        gamma[1],
+        gamma[2]
+    );
+}
 
-    for x in 0..256 {
-        // Original formula from gamma.c:
-        // gammaTable[x] = FTOL(POW(x/255.0F, 1.0F/gamma) * 255.0F + 0.5F)
-        // The + 0.5 before truncation is equivalent to rounding
-        let c = x as f32 / 255.0;
+pub fn current_gamma_rgb() -> [f32; 3] {
+    GAMMA_RGB.each_ref().map(|value| {
+        f32::from_bits(value.load(Ordering::Relaxed))
+    })
+}
 
-        let r = (c.powf(1.0 / gamma_red) * 255.0 + 0.5) as u32;
-        let g = (c.powf(1.0 / gamma_green) * 255.0 + 0.5) as u32;
-        let b = (c.powf(1.0 / gamma_blue) * 255.0 + 0.5) as u32;
+fn set_gamma_rgb(gamma: [f32; 3]) {
+    for (target, value) in GAMMA_RGB.iter().zip(gamma.map(sanitize_gamma)) {
+        target.store(value.to_bits(), Ordering::Relaxed);
+    }
+}
 
-        red_table[x] = r.min(255);
-        green_table[x] = g.min(255);
-        blue_table[x] = b.min(255);
+fn sanitize_gamma(gamma: f32) -> f32 {
+    if gamma.is_finite() && gamma > 0.0 {
+        gamma.clamp(0.1, 10.0)
+    } else {
+        1.0
+    }
+}
+
+fn estimate_gamma_from_table(table: &[FxU32]) -> Option<f32> {
+    if table.len() < 2 {
+        return None;
     }
 
-    // Download the gamma table to hardware
-    load_gamma_table(
-        256,
-        red_table.as_ptr(),
-        green_table.as_ptr(),
-        blue_table.as_ptr(),
-    );
+    let max_index = table.len() - 1;
+    let sample_index = max_index / 2;
+    let input = sample_index as f64 / max_index as f64;
+    let output = table[sample_index].min(255) as f64 / 255.0;
+
+    if input <= 0.0 || input >= 1.0 || output <= 0.0 || output >= 1.0 {
+        return None;
+    }
+
+    Some(sanitize_gamma((input.ln() / output.ln()) as f32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimates_gamma_from_generated_table() {
+        let expected = 1.8f32;
+        let table: Vec<FxU32> = (0..256)
+            .map(|value| {
+                let normalized = value as f32 / 255.0;
+                (normalized.powf(1.0 / expected) * 255.0 + 0.5) as FxU32
+            })
+            .collect();
+
+        let estimated = estimate_gamma_from_table(&table).unwrap();
+        assert!((estimated - expected).abs() < 0.03);
+    }
+
+    #[test]
+    fn rejects_degenerate_gamma_tables() {
+        assert_eq!(estimate_gamma_from_table(&[]), None);
+        assert_eq!(estimate_gamma_from_table(&[0, 255]), None);
+        assert_eq!(estimate_gamma_from_table(&[255; 256]), None);
+    }
 }

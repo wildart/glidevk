@@ -17,6 +17,9 @@ layout(push_constant) uniform PushConstants {
     float fogColorR;
     float fogColorG;
     float fogColorB;
+    float gammaR;
+    float gammaG;
+    float gammaB;
 } pc;
 
 layout(location = 0) out vec4 fragColor;

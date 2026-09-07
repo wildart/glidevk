@@ -19,6 +19,9 @@ layout(push_constant) uniform PushConstants {
     float fogColorR;
     float fogColorG;
     float fogColorB;
+    float gammaR;
+    float gammaG;
+    float gammaB;
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -129,7 +132,7 @@ void main() {
                   : (alphaOtherSrc == CO_CONSTANT) ? fragConstantColor.a
                   : fragColor.a;
 
-    vec3 c_factor = computeColorFactor(colorFactorType, c_local, a_local, a_local, texColor);
+    vec3 c_factor = computeColorFactor(colorFactorType, c_local, a_local, a_other, texColor);
 
     // Color combine
     vec3 resultRGB;
@@ -170,6 +173,12 @@ void main() {
         float w = (fragOow > 0.0001) ? 1.0 / fragOow : 65536.0;
         float fogFactor = clamp(log2(max(w, 1.0)) * 4.0 / 63.0, 0.0, 1.0);
         resultRGB = mix(resultRGB, vec3(pc.fogColorR, pc.fogColorG, pc.fogColorB), fogFactor);
+    }
+
+    // Apply gamma correction (Glide hardware applies this via LUT on final output)
+    vec3 gamma = max(vec3(pc.gammaR, pc.gammaG, pc.gammaB), vec3(0.001));
+    if (any(greaterThan(abs(gamma - vec3(1.0)), vec3(0.0001)))) {
+        resultRGB = pow(resultRGB, vec3(1.0) / gamma);
     }
 
     outColor = vec4(resultRGB, resultA);

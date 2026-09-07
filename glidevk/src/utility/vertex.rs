@@ -197,6 +197,9 @@ pub struct PushConstants {
     pub fog_color_r: f32,
     pub fog_color_g: f32,
     pub fog_color_b: f32,
+    pub gamma_r: f32,
+    pub gamma_g: f32,
+    pub gamma_b: f32,
 }
 
 /// Blend mode for a draw call — maps Glide's grAlphaBlendFunction to a pipeline variant
@@ -444,8 +447,8 @@ mod tests {
 
     #[test]
     fn test_push_constants_size() {
-        // screen_size(8) + chromakey_rgb(12) + fog(16) = 36
-        assert_eq!(std::mem::size_of::<PushConstants>(), 36);
+        // screen_size(8) + chromakey_rgb(12) + fog(16) + gamma_rgb(12) = 48
+        assert_eq!(std::mem::size_of::<PushConstants>(), 48);
     }
 
     #[test]

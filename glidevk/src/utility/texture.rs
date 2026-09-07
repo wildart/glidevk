@@ -25,7 +25,7 @@ impl TextureData {
 }
 
 /// Palette table for indexed color textures
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PaletteTable {
     pub entries: Vec<u32>, // ARGB colors
 }
@@ -50,6 +50,29 @@ impl PaletteTable {
             entries.push(0);
         }
         PaletteTable { entries }
+    }
+
+    /// Build a palette using the Glide PALETTE_6666 extension semantics.
+    ///
+    /// The application still supplies ordinary ARGB8888 entries. Hardware
+    /// truncates each channel to six bits, so reproduce that quantization and
+    /// expand the result back to ARGB8888 for Vulkan sampling.
+    pub fn from_argb6666_data(data: &[u8]) -> Self {
+        let mut palette = Self::from_data(data);
+        for color in &mut palette.entries {
+            let [b, g, r, a] = color.to_le_bytes();
+            let quantize = |channel: u8| {
+                let six_bits = channel >> 2;
+                (six_bits << 2) | (six_bits >> 4)
+            };
+            *color = u32::from_le_bytes([
+                quantize(b),
+                quantize(g),
+                quantize(r),
+                quantize(a),
+            ]);
+        }
+        palette
     }
 }
 
@@ -782,6 +805,8 @@ pub struct TextureCache {
     pending_destroy: Vec<VulkanTexture>,
     /// Reusable fence for texture upload submissions (avoids create/destroy per upload)
     upload_fence: vk::Fence,
+    /// Palette generation at which each P8 texture was uploaded.
+    uploaded_palette_gen: HashMap<u32, u64>,
 }
 
 impl TextureCache {
@@ -888,6 +913,7 @@ impl TextureCache {
             placeholder: None,
             pending_destroy: Vec::new(),
             upload_fence,
+            uploaded_palette_gen: HashMap::new(),
         }
     }
 
@@ -1153,6 +1179,24 @@ impl TextureCache {
         self.textures.contains_key(&address)
     }
 
+    /// Check if a cached P8 texture is stale due to a palette change.
+    /// Non-palettized textures pass `None` and never become palette-stale.
+    pub fn is_palette_stale(&self, address: u32, current_gen: Option<u64>) -> bool {
+        current_gen.is_some_and(|generation| {
+            self.uploaded_palette_gen.get(&address).copied() != Some(generation)
+        })
+    }
+
+    /// Record the palette generation used by a P8 texture. Passing `None`
+    /// explicitly marks the texture as palette-independent.
+    pub fn set_palette_gen(&mut self, address: u32, generation: Option<u64>) {
+        if let Some(generation) = generation {
+            self.uploaded_palette_gen.insert(address, generation);
+        } else {
+            self.uploaded_palette_gen.remove(&address);
+        }
+    }
+
     /// Get texture dimensions for an address (returns placeholder size if not found)
     pub fn get_texture_size(&self, address: u32) -> (u32, u32) {
         if let Some(tex) = self.textures.get(&address) {
@@ -1203,6 +1247,7 @@ impl TextureCache {
             if let Some(texture) = self.textures.remove(&addr) {
                 texture.destroy(device);
             }
+            self.uploaded_palette_gen.remove(&addr);
             evicted += 1;
         }
         self.insertion_order = new_order;
@@ -1226,6 +1271,7 @@ impl TextureCache {
         if let Some(texture) = self.textures.remove(&address) {
             self.pending_destroy.push(texture);
             self.insertion_order.retain(|&a| a != address);
+            self.uploaded_palette_gen.remove(&address);
             log::trace!("Invalidated texture at {:#x} (deferred destroy)", address);
         }
     }
@@ -1259,6 +1305,7 @@ impl TextureCache {
             placeholder.destroy(device);
         }
         unsafe {
+            device.destroy_fence(self.upload_fence, None);
             device.destroy_sampler(self.sampler, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
@@ -1436,6 +1483,16 @@ mod tests {
         let retrieved = tm.get_palette(0);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().entries.len(), 256);
+    }
+
+    #[test]
+    fn test_palette_6666_quantizes_argb_channels() {
+        let input = 0xFF80_4020u32.to_le_bytes();
+        let palette = PaletteTable::from_argb6666_data(&input);
+
+        // FF,80,40,20 quantized to six bits and expanded becomes FF,82,41,20.
+        assert_eq!(palette.entries[0], 0xFF82_4120);
+        assert_eq!(palette.entries.len(), 256);
     }
 
     #[test]
