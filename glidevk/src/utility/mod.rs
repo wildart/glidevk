@@ -486,8 +486,12 @@ pub fn choose_swapchain_extent_size(
     window_width: u32,
     window_height: u32,
 ) -> vk::Extent2D {
-    // Always use requested size (clamped to valid range)
-    // Don't use capabilities.current_extent as it reflects physical window size on HiDPI
+    // Some window systems dictate the exact surface extent. Only choose and
+    // clamp an extent when the surface reports the Vulkan "undefined" sentinel.
+    if capabilities.current_extent.width != u32::MAX {
+        return capabilities.current_extent;
+    }
+
     use num::clamp;
     vk::Extent2D {
         width: clamp(
@@ -500,6 +504,62 @@ pub fn choose_swapchain_extent_size(
             capabilities.min_image_extent.height,
             capabilities.max_image_extent.height,
         ),
+    }
+}
+
+#[cfg(test)]
+mod swapchain_extent_tests {
+    use super::*;
+
+    #[test]
+    fn uses_surface_defined_extent() {
+        let capabilities = vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            min_image_extent: vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            max_image_extent: vk::Extent2D {
+                width: 4096,
+                height: 4096,
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            choose_swapchain_extent_size(&capabilities, 800, 600),
+            capabilities.current_extent
+        );
+    }
+
+    #[test]
+    fn clamps_requested_extent_when_surface_leaves_it_undefined() {
+        let capabilities = vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: u32::MAX,
+                height: u32::MAX,
+            },
+            min_image_extent: vk::Extent2D {
+                width: 320,
+                height: 200,
+            },
+            max_image_extent: vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            choose_swapchain_extent_size(&capabilities, 2560, 100),
+            vk::Extent2D {
+                width: 1920,
+                height: 200,
+            }
+        );
     }
 }
 

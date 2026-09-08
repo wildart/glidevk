@@ -470,6 +470,181 @@ impl VulkanApp {
                 .destroy_swapchain(self.swapchain, None);
         }
     }
+
+    /// Rebuild every resource whose dimensions or image count depend on the
+    /// native window's swapchain.
+    pub fn recreate_swapchain(
+        &mut self,
+        instance: &ash::Instance,
+        surface_loader: &ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
+        requested_width: u32,
+        requested_height: u32,
+    ) -> Result<(), vk::Result> {
+        if requested_width == 0 || requested_height == 0 {
+            return Ok(());
+        }
+
+        unsafe {
+            self.device.device_wait_idle()?;
+        }
+
+        let support = query_swapchain_support(
+            surface_loader,
+            self.physical_device,
+            &surface,
+        );
+        let surface_format = choose_swapchain_format(&support.formats);
+        let present_mode = choose_swapchain_present_mode(&support.present_modes);
+        let extent = choose_swapchain_extent_size(
+            &support.capabilities,
+            requested_width,
+            requested_height,
+        );
+
+        let queue_families =
+            find_queue_family(instance, self.physical_device, surface_loader, &surface);
+        let (sharing_mode, queue_family_indices) =
+            if queue_families.graphics_family != queue_families.present_family {
+                (
+                    vk::SharingMode::CONCURRENT,
+                    vec![
+                        queue_families.graphics_family.unwrap(),
+                        queue_families.present_family.unwrap(),
+                    ],
+                )
+            } else {
+                (vk::SharingMode::EXCLUSIVE, Vec::new())
+            };
+
+        let mut image_count = support.capabilities.min_image_count + 1;
+        if support.capabilities.max_image_count > 0 {
+            image_count = image_count.min(support.capabilities.max_image_count);
+        }
+
+        let create_info = vk::SwapchainCreateInfoKHR::default()
+            .surface(surface)
+            .min_image_count(image_count)
+            .image_color_space(surface_format.color_space)
+            .image_format(surface_format.format)
+            .image_extent(extent)
+            .image_usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+            .image_sharing_mode(sharing_mode)
+            .queue_family_indices(&queue_family_indices)
+            .pre_transform(support.capabilities.current_transform)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(present_mode)
+            .clipped(true)
+            .old_swapchain(self.swapchain)
+            .image_array_layers(1);
+
+        let new_swapchain = unsafe {
+            self.swapchain_loader
+                .create_swapchain(&create_info, None)?
+        };
+        let new_images = unsafe {
+            self.swapchain_loader
+                .get_swapchain_images(new_swapchain)?
+        };
+        let new_imageviews =
+            create_image_views(&self.device, surface_format.format, &new_images);
+        let (new_depth_image, new_depth_memory, new_depth_view) =
+            create_depth_resources(
+                &self.device,
+                instance,
+                self.physical_device,
+                extent,
+                self.depth_format,
+            );
+        let new_render_pass =
+            create_render_pass(&self.device, surface_format.format, self.depth_format);
+        let (new_pipelines, new_pipeline_layout) =
+            create_glide_graphics_pipelines(
+                &self.device,
+                new_render_pass,
+                extent,
+                self.texture_cache.descriptor_set_layout(),
+            );
+        let new_framebuffers = create_framebuffers(
+            &self.device,
+            new_render_pass,
+            &new_imageviews,
+            new_depth_view,
+            &extent,
+        );
+        let new_command_buffers = create_command_buffers(
+            &self.device,
+            self.command_pool,
+            vk::Pipeline::null(),
+            &new_framebuffers,
+            new_render_pass,
+            extent,
+        );
+
+        let semaphore_info = vk::SemaphoreCreateInfo::default();
+        let new_render_finished: Vec<vk::Semaphore> = new_images
+            .iter()
+            .map(|_| unsafe {
+                self.device
+                    .create_semaphore(&semaphore_info, None)
+                    .expect("Failed to recreate render-finished semaphore")
+            })
+            .collect();
+
+        unsafe {
+            self.device
+                .free_command_buffers(self.command_pool, &self.command_buffers);
+            for semaphore in self.render_finished_semaphores.drain(..) {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+            for framebuffer in self.swapchain_framebuffers.drain(..) {
+                self.device.destroy_framebuffer(framebuffer, None);
+            }
+            for (_, pipeline) in self.graphics_pipelines.drain() {
+                self.device.destroy_pipeline(pipeline, None);
+            }
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device.destroy_render_pass(self.render_pass, None);
+            self.device.destroy_image_view(self.depth_image_view, None);
+            self.device.destroy_image(self.depth_image, None);
+            self.device.free_memory(self.depth_image_memory, None);
+            for image_view in self.swapchain_imageviews.drain(..) {
+                self.device.destroy_image_view(image_view, None);
+            }
+            self.swapchain_loader
+                .destroy_swapchain(self.swapchain, None);
+        }
+
+        self.swapchain = new_swapchain;
+        self.swapchain_format = surface_format.format;
+        self.swapchain_extent = extent;
+        self.swapchain_images = new_images;
+        self.swapchain_imageviews = new_imageviews;
+        self.swapchain_framebuffers = new_framebuffers;
+        self.command_buffers = new_command_buffers;
+        self.render_finished_semaphores = new_render_finished;
+        self.depth_image = new_depth_image;
+        self.depth_image_memory = new_depth_memory;
+        self.depth_image_view = new_depth_view;
+        self.render_pass = new_render_pass;
+        self.pipeline_layout = new_pipeline_layout;
+        self.graphics_pipelines = new_pipelines;
+        self.current_image_index = 0;
+        self.last_presented_image_index = 0;
+
+        log::info!(
+            "Recreated swapchain at {}x{} with {} images",
+            extent.width,
+            extent.height,
+            self.swapchain_images.len()
+        );
+        Ok(())
+    }
 }
 
 // pub fn get_swapchain_info(

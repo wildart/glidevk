@@ -73,3 +73,101 @@ pub unsafe fn create_surface(
     let win32_surface_loader = win32_surface::Instance::new(entry, instance);
     win32_surface_loader.create_win32_surface(&create_info, None)
 }
+
+/// Apply GlideVK's windowed-mode configuration to an existing Win32 window.
+///
+/// Games pass their own HWND to grSstWinOpen, so winit cannot manage its style
+/// or dimensions. This updates the native style directly and returns the
+/// resulting client-area size.
+#[cfg(target_os = "windows")]
+pub unsafe fn configure_native_window(
+    hwnd: u32,
+    client_width: u32,
+    client_height: u32,
+    resizable: bool,
+    centered: bool,
+) -> Option<(u32, u32)> {
+    use std::mem::size_of;
+    use std::ptr::null_mut;
+    use winapi::shared::windef::{HWND, RECT};
+    use winapi::um::winuser::{
+        AdjustWindowRectEx, GetMonitorInfoW, GetWindowLongW, GetWindowRect, MonitorFromWindow,
+        SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, MONITORINFO,
+        MONITOR_DEFAULTTONEAREST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
+        WS_MAXIMIZEBOX, WS_THICKFRAME,
+    };
+
+    let raw_hwnd = hwnd;
+    let hwnd = raw_hwnd as usize as HWND;
+    if hwnd.is_null() {
+        return None;
+    }
+
+    let mut style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    if resizable {
+        style |= WS_THICKFRAME | WS_MAXIMIZEBOX;
+    } else {
+        style &= !(WS_THICKFRAME | WS_MAXIMIZEBOX);
+    }
+    SetWindowLongW(hwnd, GWL_STYLE, style as i32);
+
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    let mut outer_rect = RECT {
+        left: 0,
+        top: 0,
+        right: client_width as i32,
+        bottom: client_height as i32,
+    };
+    if AdjustWindowRectEx(&mut outer_rect, style, 0, ex_style) == 0 {
+        return native_window_client_size(raw_hwnd);
+    }
+
+    let outer_width = outer_rect.right - outer_rect.left;
+    let outer_height = outer_rect.bottom - outer_rect.top;
+
+    let mut current_rect: RECT = std::mem::zeroed();
+    GetWindowRect(hwnd, &mut current_rect);
+    let mut x = current_rect.left;
+    let mut y = current_rect.top;
+
+    if centered {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut monitor_info: MONITORINFO = std::mem::zeroed();
+        monitor_info.cbSize = size_of::<MONITORINFO>() as u32;
+        if !monitor.is_null() && GetMonitorInfoW(monitor, &mut monitor_info) != 0 {
+            x = monitor_info.rcWork.left
+                + (monitor_info.rcWork.right - monitor_info.rcWork.left - outer_width) / 2;
+            y = monitor_info.rcWork.top
+                + (monitor_info.rcWork.bottom - monitor_info.rcWork.top - outer_height) / 2;
+        }
+    }
+
+    SetWindowPos(
+        hwnd,
+        null_mut(),
+        x,
+        y,
+        outer_width,
+        outer_height,
+        SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    );
+
+    native_window_client_size(raw_hwnd)
+}
+
+/// Return the current Win32 client-area dimensions for a game-owned HWND.
+#[cfg(target_os = "windows")]
+pub unsafe fn native_window_client_size(hwnd: u32) -> Option<(u32, u32)> {
+    use winapi::shared::windef::{HWND, RECT};
+    use winapi::um::winuser::GetClientRect;
+
+    let hwnd = hwnd as usize as HWND;
+    let mut rect: RECT = std::mem::zeroed();
+    if hwnd.is_null() || GetClientRect(hwnd, &mut rect) == 0 {
+        return None;
+    }
+
+    let width = (rect.right - rect.left).max(0) as u32;
+    let height = (rect.bottom - rect.top).max(0) as u32;
+    Some((width, height))
+}

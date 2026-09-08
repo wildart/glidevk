@@ -427,6 +427,8 @@ pub struct Gr {
     vulkan_app: Option<VulkanApp>,
     window: Option<Window>,
     surface: vk::SurfaceKHR,
+    /// Game-owned Win32 HWND passed to grSstWinOpen (zero on other platforms).
+    native_window_handle: FxU32,
     state: State,
     is_framebuffer_resized: bool,
     /// Vertex batch for collecting triangles between buffer_clear and buffer_swap
@@ -461,9 +463,12 @@ impl Gr {
         let config = config::Config::load();
         let texture_memory_bytes = config.texture.memory.bytes() as usize;
         log::info!(
-            "GlideVK config: windowed={}, keep_aspect_ratio={}, texture_memory={}MB",
+            "GlideVK config: windowed={}, resizable={}, static_size={:?}, keep_aspect_ratio={}, supersampling={}x, texture_memory={}MB",
             config.window.windowed,
+            config.window.resizable,
+            config.window.static_size,
             config.window.keep_aspect_ratio,
+            config.render.supersampling,
             texture_memory_bytes / (1024 * 1024)
         );
 
@@ -475,6 +480,7 @@ impl Gr {
             vulkan_app: None,
             window,
             surface: vk::SurfaceKHR::null(),
+            native_window_handle: 0,
             state: Default::default(),
             is_framebuffer_resized: false,
             vertex_batch: utility::vertex::VertexBatch::new(MAX_VERTICES),
@@ -564,6 +570,58 @@ impl Gr {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn refresh_native_window_size(&mut self) {
+        if self.native_window_handle == 0 {
+            return;
+        }
+
+        let Some((width, height)) = (unsafe {
+            utility::platforms::native_window_client_size(self.native_window_handle)
+        }) else {
+            return;
+        };
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let needs_recreate = self.is_framebuffer_resized
+            || self.state.window_width != width
+            || self.state.window_height != height;
+        if !needs_recreate {
+            return;
+        }
+
+        self.state.window_width = width;
+        self.state.window_height = height;
+        let (vp_x, vp_y, vp_w, vp_h) = self.calculate_viewport();
+        self.state.viewport_x = vp_x;
+        self.state.viewport_y = vp_y;
+        self.state.viewport_width = vp_w;
+        self.state.viewport_height = vp_h;
+
+        if let Some(app) = &mut self.vulkan_app {
+            match app.recreate_swapchain(
+                &self.vulkan_instance.instance,
+                &self.vulkan_instance.surface_loader,
+                self.surface,
+                width,
+                height,
+            ) {
+                Ok(()) => self.is_framebuffer_resized = false,
+                Err(error) => {
+                    log::warn!(
+                        "Deferring swapchain recreation for {}x{}: {:?}",
+                        width,
+                        height,
+                        error
+                    );
+                    self.is_framebuffer_resized = true;
+                }
+            }
+        }
+    }
+
     // FX_ENTRY void FX_CALL grErrorSetCallback( GrErrorCallbackFnc_t fnc );
     pub fn error_set_callback(
         &mut self,
@@ -641,6 +699,7 @@ impl Gr {
     ) -> GrContext {
         unsafe {
             assert_eq!(refresh, ScreenRefresh::R60Hz);
+            self.native_window_handle = hwnd;
 
             // Get game's requested resolution
             let (game_width, game_height) = res.into();
@@ -725,6 +784,33 @@ impl Gr {
             #[cfg(target_os = "windows")]
             {
                 assert_ne!(hwnd, 0); // must have hwnd for windows app
+
+                if self.config.window.windowed {
+                    if let Some((actual_width, actual_height)) =
+                        utility::platforms::configure_native_window(
+                            hwnd,
+                            window_width,
+                            window_height,
+                            self.config.window.resizable,
+                            self.config.window.centered,
+                        )
+                    {
+                        self.state.window_width = actual_width;
+                        self.state.window_height = actual_height;
+                        let (vp_x, vp_y, vp_w, vp_h) = self.calculate_viewport();
+                        self.state.viewport_x = vp_x;
+                        self.state.viewport_y = vp_y;
+                        self.state.viewport_width = vp_w;
+                        self.state.viewport_height = vp_h;
+                        log::info!(
+                            "Configured Win32 window: client={}x{}, resizable={}",
+                            actual_width,
+                            actual_height,
+                            self.config.window.resizable
+                        );
+                    }
+                }
+
                 self.surface = utility::platforms::create_surface(
                     &self.vulkan_instance.entry,
                     &self.vulkan_instance.instance,
@@ -1043,6 +1129,8 @@ impl Gr {
 
         // Reset state to post-grGlideInit (as per Glide spec)
         self.state = State::default();
+        self.native_window_handle = 0;
+        self.is_framebuffer_resized = false;
 
         // Clear texture memory
         for tmu in &mut self.texture_memory {
@@ -1089,6 +1177,9 @@ impl Gr {
     }
 
     pub fn buffer_swap(&mut self, _interval: i32) -> Option<()> {
+        #[cfg(target_os = "windows")]
+        self.refresh_native_window_size();
+
         // If LFB write was performed, the image was already presented in lfb_unlock.
         // Just clear the flag and skip the normal render path.
         if self.lfb_lock_state.lfb_written {
@@ -1243,6 +1334,10 @@ impl Gr {
         let clear_depth = self.state.clear_depth;
         let screen_width = self.state.screen_width;
         let screen_height = self.state.screen_height;
+        let viewport_x = self.state.viewport_x;
+        let viewport_y = self.state.viewport_y;
+        let viewport_width = self.state.viewport_width;
+        let viewport_height = self.state.viewport_height;
 
         // Capture chromakey color (enabled state is now per-draw-call)
         let (ck_r, ck_g, ck_b, _) = self
@@ -1265,9 +1360,6 @@ impl Gr {
                 app.device
                     .wait_for_fences(&[app.in_flight_fences[frame]], true, u64::MAX)
                     .expect("Failed to wait for fence");
-                app.device
-                    .reset_fences(&[app.in_flight_fences[frame]])
-                    .expect("Failed to reset fence");
                 let t_fence_done = std::time::Instant::now();
 
                 // Flush deferred texture/descriptor destruction now that this
@@ -1293,8 +1385,11 @@ impl Gr {
                         app.image_available_semaphores[frame],
                         vk::Fence::null(),
                     ) {
-                        Ok((idx, _)) => {
+                        Ok((idx, suboptimal)) => {
                             app.current_image_index = idx;
+                            if suboptimal {
+                                self.is_framebuffer_resized = true;
+                            }
                             break idx;
                         }
                         Err(vk::Result::NOT_READY) => {
@@ -1302,9 +1397,16 @@ impl Gr {
                             std::thread::sleep(std::time::Duration::from_millis(1));
                             continue;
                         }
+                        Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                            self.is_framebuffer_resized = true;
+                            return Some(());
+                        }
                         Err(e) => panic!("Failed to acquire next image: {:?}", e),
                     }
                 };
+                app.device
+                    .reset_fences(&[app.in_flight_fences[frame]])
+                    .expect("Failed to reset fence");
 
                 // Upload vertex data to this frame's vertex buffer
                 let t_upload = std::time::Instant::now();
@@ -1373,18 +1475,24 @@ impl Gr {
 
                 // Set viewport and scissor
                 let viewport = vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: app.swapchain_extent.width as f32,
-                    height: app.swapchain_extent.height as f32,
+                    x: viewport_x as f32,
+                    y: viewport_y as f32,
+                    width: viewport_width as f32,
+                    height: viewport_height as f32,
                     min_depth: 0.0,
                     max_depth: 1.0,
                 };
                 app.device.cmd_set_viewport(cmd, 0, &[viewport]);
 
                 let scissor = vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: app.swapchain_extent,
+                    offset: vk::Offset2D {
+                        x: viewport_x as i32,
+                        y: viewport_y as i32,
+                    },
+                    extent: vk::Extent2D {
+                        width: viewport_width,
+                        height: viewport_height,
+                    },
                 };
                 app.device.cmd_set_scissor(cmd, 0, &[scissor]);
 
@@ -1639,9 +1747,20 @@ impl Gr {
                     .image_indices(&image_indices);
 
                 let t_present = std::time::Instant::now();
-                app.swapchain_loader
+                match app
+                    .swapchain_loader
                     .queue_present(app.present_queue, &present_info)
-                    .expect("Failed to present");
+                {
+                    Ok(suboptimal) => {
+                        if suboptimal {
+                            self.is_framebuffer_resized = true;
+                        }
+                    }
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                        self.is_framebuffer_resized = true;
+                    }
+                    Err(error) => panic!("Failed to present: {:?}", error),
+                }
                 let t_present_done = std::time::Instant::now();
 
                 app.last_presented_image_index = image_index;
@@ -1690,9 +1809,20 @@ impl Gr {
                     .swapchains(&swapchains)
                     .image_indices(&image_indices);
 
-                app.swapchain_loader
+                match app
+                    .swapchain_loader
                     .queue_present(app.present_queue, &present_info)
-                    .expect("Failed to present");
+                {
+                    Ok(suboptimal) => {
+                        if suboptimal {
+                            self.is_framebuffer_resized = true;
+                        }
+                    }
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                        self.is_framebuffer_resized = true;
+                    }
+                    Err(error) => panic!("Failed to present LFB image: {:?}", error),
+                }
 
                 app.last_presented_image_index = image_index;
 
@@ -3810,6 +3940,9 @@ impl Gr {
     /// Upload LFB write data directly to the swapchain image and present.
     /// Uses vkCmdCopyBufferToImage to bypass the shader pipeline entirely.
     fn lfb_upload_to_framebuffer(&mut self) {
+        #[cfg(target_os = "windows")]
+        self.refresh_native_window_size();
+
         let app = match self.vulkan_app.as_mut() {
             Some(app) => app,
             None => return,
@@ -3821,6 +3954,10 @@ impl Gr {
         let write_mode = self.lfb_lock_state.write_mode;
         let origin = self.lfb_lock_state.origin;
         let src_data = &self.lfb_lock_state.data;
+        let viewport_x = self.state.viewport_x;
+        let viewport_y = self.state.viewport_y;
+        let viewport_width = self.state.viewport_width;
+        let viewport_height = self.state.viewport_height;
 
         let frame = app.current_frame;
         unsafe {
@@ -3841,8 +3978,11 @@ impl Gr {
                     vk::Semaphore::null(),
                     app.in_flight_fences[frame],
                 ) {
-                    Ok((image_index, _)) => {
+                    Ok((image_index, suboptimal)) => {
                         app.current_image_index = image_index;
+                        if suboptimal {
+                            self.is_framebuffer_resized = true;
+                        }
                         app.device
                             .wait_for_fences(&[app.in_flight_fences[frame]], true, u64::MAX)
                             .expect("Failed to wait for acquire fence");
@@ -3854,6 +3994,18 @@ impl Gr {
                     Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
+                    }
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                        let empty_submit = vk::SubmitInfo::default();
+                        app.device
+                            .queue_submit(
+                                app.graphics_queue,
+                                &[empty_submit],
+                                app.in_flight_fences[frame],
+                            )
+                            .expect("Failed to restore LFB frame fence");
+                        self.is_framebuffer_resized = true;
+                        return;
                     }
                     Err(e) => panic!("Failed to acquire next image: {:?}", e),
                 }
@@ -4065,6 +4217,26 @@ impl Gr {
             let needs_scaling = width != app.swapchain_extent.width
                 || height != app.swapchain_extent.height;
 
+            if needs_scaling {
+                let clear_color = vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                };
+                let color_range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                app.device.cmd_clear_color_image(
+                    cmd,
+                    dst_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &clear_color,
+                    &[color_range],
+                );
+            }
+
             // When LFB is at game resolution but swapchain is larger, use a staging
             // image and vkCmdBlitImage to scale up. Otherwise copy directly.
             let mut lfb_staging_image = vk::Image::null();
@@ -4190,10 +4362,14 @@ impl Gr {
                         mip_level: 0, base_array_layer: 0, layer_count: 1,
                     },
                     dst_offsets: [
-                        vk::Offset3D { x: 0, y: 0, z: 0 },
                         vk::Offset3D {
-                            x: app.swapchain_extent.width as i32,
-                            y: app.swapchain_extent.height as i32,
+                            x: viewport_x as i32,
+                            y: viewport_y as i32,
+                            z: 0,
+                        },
+                        vk::Offset3D {
+                            x: (viewport_x + viewport_width) as i32,
+                            y: (viewport_y + viewport_height) as i32,
                             z: 1,
                         },
                     ],
@@ -4261,7 +4437,20 @@ impl Gr {
                 .swapchains(&swapchains)
                 .image_indices(&image_indices);
 
-            let _ = app.swapchain_loader.queue_present(app.graphics_queue, &present_info);
+            match app
+                .swapchain_loader
+                .queue_present(app.present_queue, &present_info)
+            {
+                Ok(suboptimal) => {
+                    if suboptimal {
+                        self.is_framebuffer_resized = true;
+                    }
+                }
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.is_framebuffer_resized = true;
+                }
+                Err(error) => panic!("Failed to present LFB upload: {:?}", error),
+            }
 
             app.last_presented_image_index = app.current_image_index;
             log::debug!(
