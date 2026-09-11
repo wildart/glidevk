@@ -7,8 +7,15 @@ layout(location = 2) in float fragOow;
 layout(location = 3) in vec4 fragConstantColor;
 layout(location = 4) flat in uint fragCombineFlags;
 layout(location = 5) flat in uint fragTexIndex;
+layout(location = 6) in float fragTexQ;
+layout(location = 7) in float fragFog;
+layout(location = 8) in float fragDepth;
+layout(location = 9) in vec2 fragTexCoord1;
+layout(location = 10) in float fragTexQ1;
+layout(location = 11) flat in uint fragTexIndex1;
 
-layout(binding = 0) uniform sampler2D textures[2048];
+layout(binding = 0) uniform texture2D textures[2048];
+layout(binding = 1) uniform sampler samplers[72];
 
 layout(push_constant) uniform PushConstants {
     vec2 screenSize;
@@ -22,6 +29,9 @@ layout(push_constant) uniform PushConstants {
     float gammaR;
     float gammaG;
     float gammaB;
+    uint fogTable[16];
+    uint texCombine[2];
+    uint alphaTest;
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -96,18 +106,80 @@ float computeAlphaFactor(int factor, float localA, float otherA, vec4 texColor) 
     return localA;
 }
 
-void main() {
-    // Compute UV normalization from actual texture dimensions (replaces push constant texture_size)
-    ivec2 ts = textureSize(textures[nonuniformEXT(fragTexIndex)], 0);
-    float base = float(max(ts.x, ts.y));
-    vec2 baseSize = 256.0 * vec2(ts) / base;
-    vec2 uv = fragTexCoord / baseSize;
+vec4 combine(int fn, vec4 factor, vec4 local, vec4 other) {
+    if (fn == CF_ZERO) return vec4(0.0);
+    if (fn == CF_LOCAL) return local;
+    if (fn == CF_LOCAL_ALPHA) return vec4(local.a);
+    if (fn == CF_SCALE_OTHER) return factor * other;
+    if (fn == CF_SCALE_OTHER_ADD_LOCAL) return factor * other + local;
+    if (fn == CF_SCALE_OTHER_ADD_LOCAL_ALPHA) return factor * other + vec4(local.a);
+    if (fn == CF_SCALE_OTHER_MINUS_LOCAL) return factor * (other - local);
+    if (fn == CF_SCALE_OTHER_MINUS_LOCAL_ADD_LOCAL) return factor * (other - local) + local;
+    if (fn == CF_SCALE_OTHER_MINUS_LOCAL_ADD_LOCAL_ALPHA) return factor * (other - local) + vec4(local.a);
+    if (fn == CF_SCALE_MINUS_LOCAL_ADD_LOCAL) return (vec4(1.0) - factor) * local;
+    if (fn == CF_SCALE_MINUS_LOCAL_ADD_LOCAL_ALPHA) return vec4(local.a) - factor * local;
+    return vec4(0.0);
+}
 
-    vec4 texColor = texture(textures[nonuniformEXT(fragTexIndex)], uv);
+bool alphaPass(float alpha) {
+    int fn = int(pc.alphaTest & 7u);
+    float a = floor(alpha * 255.0 + 0.5);
+    float ref = float((pc.alphaTest >> 8) & 255u);
+    if (fn == 0) return false;
+    if (fn == 1) return a < ref;
+    if (fn == 2) return a == ref;
+    if (fn == 3) return a <= ref;
+    if (fn == 4) return a > ref;
+    if (fn == 5) return a != ref;
+    if (fn == 6) return a >= ref;
+    return true;
+}
+
+float fogEntry(int i) { return float((pc.fogTable[i / 4] >> (8 * (i % 4))) & 255u) / 255.0; }
+float fogW(int i) { return exp2(float(3 + i / 4)) / float(8 - i % 4); }
+float tableFog(float q) {
+    float w = q > 0.0 ? 1.0 / q : 65536.0;
+    for (int i = 0; i < 63; ++i) {
+        if (w < fogW(i + 1)) return mix(fogEntry(i), fogEntry(i + 1), clamp((w - fogW(i)) / (fogW(i + 1) - fogW(i)), 0.0, 1.0));
+    }
+    return fogEntry(63);
+}
+
+vec4 textureCombine(uint flags, vec4 local, vec4 other) {
+    vec4 factor = vec4(computeColorFactor(int((flags >> 10) & 15u), local.rgb, local.a, other.a, local),
+        computeAlphaFactor(int((flags >> 14) & 15u), local.a, other.a, local));
+    vec4 value;
+    value.rgb = clamp(combine(int(flags & 31u), factor, local, other).rgb, 0.0, 1.0);
+    value.a = clamp(combine(int((flags >> 5) & 31u), vec4(factor.a), vec4(local.a), vec4(other.a)).a, 0.0, 1.0);
+    if ((flags & (1u << 18)) != 0u) value.rgb = vec3(1.0) - value.rgb;
+    if ((flags & (1u << 19)) != 0u) value.a = 1.0 - value.a;
+    return value;
+}
+vec4 sampleTmu(uint index, vec2 st, float q, uint flags) {
+    ivec2 size = textureSize(sampler2D(textures[nonuniformEXT(index)], samplers[(flags >> 20) & 127u]), 0);
+    vec2 baseSize = 256.0 * vec2(size) / float(max(size.x, size.y));
+    return texture(sampler2D(textures[nonuniformEXT(index)], samplers[(flags >> 20) & 127u]), st / (abs(q) > 1e-20 ? q : 1.0) / baseSize);
+}
+
+void main() {
+    if ((fragCombineFlags & (1u << 31)) != 0u) {
+        vec4 scene = texture(sampler2D(textures[nonuniformEXT(fragTexIndex)], samplers[4]), fragTexCoord);
+        outColor = vec4(pow(clamp(scene.rgb, 0.0, 1.0), vec3(1.0) / max(vec3(pc.gammaR, pc.gammaG, pc.gammaB), vec3(0.001))), scene.a);
+        // During display, alphaTest marks automatic sRGB target encoding.
+        if (pc.alphaTest != 0u) {
+            vec3 c = outColor.rgb;
+            outColor.rgb = mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
+        }
+        return;
+    }
+    vec4 texColor = sampleTmu(fragTexIndex, fragTexCoord, fragTexQ, pc.texCombine[0]);
 
     if (getChromakeyEnabled()) {
-        if (texColor.r < 0.01 && texColor.g < 0.01 && texColor.b < 0.01) discard;
+        if (all(lessThan(abs(texColor.rgb - vec3(pc.chromakeyR, pc.chromakeyG, pc.chromakeyB)), vec3(0.5 / 255.0)))) discard;
     }
+
+    vec4 other = textureCombine(pc.texCombine[1], sampleTmu(fragTexIndex1, fragTexCoord1, fragTexQ1, pc.texCombine[1]), vec4(0.0));
+    texColor = textureCombine(pc.texCombine[0], texColor, other);
 
     // Unpack per-vertex combine state
     int colorFunc = getCombineFunc();
@@ -126,7 +198,7 @@ void main() {
 
     vec3 c_local = (colorLocalSrc == CL_CONSTANT) ? fragConstantColor.rgb : fragColor.rgb;
 
-    float a_local = (alphaLocalSrc == CL_CONSTANT) ? fragConstantColor.a : fragColor.a;
+    float a_local = (alphaLocalSrc == CL_CONSTANT) ? fragConstantColor.a : (alphaLocalSrc == 2) ? fragDepth : fragColor.a;
 
     float a_other = (alphaOtherSrc == CO_TEXTURE) ? texColor.a
                   : (alphaOtherSrc == CO_CONSTANT) ? fragConstantColor.a
@@ -153,6 +225,7 @@ void main() {
     float a_factor = computeAlphaFactor(alphaFactorType, a_local, a_other, texColor);
 
     float resultA;
+    // Pass iterated vertex alpha through CF_ZERO for legacy Glide UI compatibility.
     if      (alphaFunc == CF_ZERO) resultA = fragColor.a;
     else if (alphaFunc == CF_LOCAL) resultA = a_local;
     else if (alphaFunc == CF_LOCAL_ALPHA) resultA = a_local;
@@ -169,17 +242,19 @@ void main() {
     resultRGB = clamp(resultRGB, 0.0, 1.0);
     resultA = clamp(resultA, 0.0, 1.0);
 
-    if (pc.fogMode > 0) {
-        float w = (fragOow > 0.0001) ? 1.0 / fragOow : 65536.0;
-        float fogFactor = clamp(log2(max(w, 1.0)) * 4.0 / 63.0, 0.0, 1.0);
-        resultRGB = mix(resultRGB, vec3(pc.fogColorR, pc.fogColorG, pc.fogColorB), fogFactor);
-    }
+    if ((fragCombineFlags & (1u << 27)) != 0u) resultRGB = vec3(1.0) - resultRGB;
+    if ((fragCombineFlags & (1u << 28)) != 0u) resultA = 1.0 - resultA;
+    if (!alphaPass(resultA)) discard;
 
-    // Apply gamma correction (Glide hardware applies this via LUT on final output)
-    vec3 gamma = max(vec3(pc.gammaR, pc.gammaG, pc.gammaB), vec3(0.001));
-    if (any(greaterThan(abs(gamma - vec3(1.0)), vec3(0.0001)))) {
-        resultRGB = pow(resultRGB, vec3(1.0) / gamma);
+    int fogMode = pc.fogMode & 255;
+    if (fogMode > 0) {
+        float f = fogMode == 1 ? tableFog(fragFog) : fogMode == 2 ? tableFog(fragOow)
+            : fogMode == 3 ? fragFog : fragColor.a;
+        f = clamp(f, 0.0, 1.0);
+        vec3 fogColor = vec3(pc.fogColorR, pc.fogColorG, pc.fogColorB);
+        // MULT2 omits the fog-color term; ADD2 omits attenuation of incoming RGB.
+        resultRGB = resultRGB * (((pc.fogMode & 0x200) != 0) ? 1.0 : 1.0 - f)
+            + (((pc.fogMode & 0x100) != 0) ? vec3(0.0) : fogColor * f);
     }
-
-    outColor = vec4(resultRGB, resultA);
+    outColor = vec4(clamp(resultRGB, 0.0, 1.0), resultA);
 }

@@ -1,4 +1,5 @@
 pub mod debug;
+pub mod framebuffer;
 pub mod platforms;
 pub mod structures;
 pub mod texture;
@@ -492,15 +493,12 @@ pub fn choose_swapchain_extent_size(
         return capabilities.current_extent;
     }
 
-    use num::clamp;
     vk::Extent2D {
-        width: clamp(
-            window_width,
+        width: window_width.clamp(
             capabilities.min_image_extent.width,
             capabilities.max_image_extent.width,
         ),
-        height: clamp(
-            window_height,
+        height: window_height.clamp(
             capabilities.min_image_extent.height,
             capabilities.max_image_extent.height,
         ),
@@ -662,7 +660,7 @@ pub fn create_depth_resources(
         .format(depth_format)
         .tiling(vk::ImageTiling::OPTIMAL)
         .initial_layout(vk::ImageLayout::UNDEFINED)
-        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
         .samples(vk::SampleCountFlags::TYPE_1)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
@@ -778,13 +776,15 @@ pub fn create_render_pass(
     let dependencies = [vk::SubpassDependency {
         src_subpass: vk::SUBPASS_EXTERNAL,
         dst_subpass: 0,
-        src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-            | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        src_stage_mask: vk::PipelineStageFlags::ALL_COMMANDS,
         dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-            | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-        src_access_mask: vk::AccessFlags::empty(),
+            | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+        src_access_mask: vk::AccessFlags::MEMORY_WRITE,
         dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            | vk::AccessFlags::COLOR_ATTACHMENT_READ
+            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
         ..Default::default()
     }];
 
@@ -800,53 +800,82 @@ pub fn create_render_pass(
             .create_render_pass(&renderpass_create_info, None)
             .expect("Failed to create render pass!")
     }
+}
+pub fn create_scene_render_pass(
+    device: &ash::Device,
+    surface_format: vk::Format,
+    depth_format: vk::Format,
+) -> vk::RenderPass {
+    // Color attachment
+    let color_attachment = vk::AttachmentDescription {
+        format: surface_format,
+        samples: vk::SampleCountFlags::TYPE_1,
+        load_op: vk::AttachmentLoadOp::LOAD,
+        store_op: vk::AttachmentStoreOp::STORE,
+        stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+        stencil_store_op: vk::AttachmentStoreOp::STORE,
+        initial_layout: vk::ImageLayout::GENERAL,
+        final_layout: vk::ImageLayout::GENERAL,
+        ..Default::default()
+    };
 
-    // let color_attachment = vk::AttachmentDescription {
-    //     format: surface_format,
-    //     flags: vk::AttachmentDescriptionFlags::empty(),
-    //     samples: vk::SampleCountFlags::TYPE_1,
-    //     load_op: vk::AttachmentLoadOp::CLEAR,
-    //     store_op: vk::AttachmentStoreOp::STORE,
-    //     stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
-    //     stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
-    //     initial_layout: vk::ImageLayout::UNDEFINED,
-    //     final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
-    // };
+    // Depth attachment
+    let depth_attachment = vk::AttachmentDescription {
+        format: depth_format,
+        samples: vk::SampleCountFlags::TYPE_1,
+        load_op: vk::AttachmentLoadOp::LOAD,
+        store_op: vk::AttachmentStoreOp::STORE,
+        stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+        stencil_store_op: vk::AttachmentStoreOp::STORE,
+        initial_layout: vk::ImageLayout::GENERAL,
+        final_layout: vk::ImageLayout::GENERAL,
+        ..Default::default()
+    };
 
-    // let color_attachment_refs = [vk::AttachmentReference {
-    //     attachment: 0,
-    //     layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-    // }];
+    let color_attachment_ref = vk::AttachmentReference {
+        attachment: 0,
+        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+    };
 
-    // let subpasses = [
-    //     vk::SubpassDescription::default()
-    //         .color_attachments(&color_attachment_refs)
-    //         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-    //         .resolve_attachments(&[])
-    // ];
+    let depth_attachment_ref = vk::AttachmentReference {
+        attachment: 1,
+        layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
 
-    // let renderpass_attachments = [color_attachment];
+    let color_attachment_refs = [color_attachment_ref];
 
-    // let subpass_dependencies = [vk::SubpassDependency {
-    //     src_subpass: vk::SUBPASS_EXTERNAL,
-    //     dst_subpass: 0,
-    //     src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-    //     dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-    //     src_access_mask: vk::AccessFlags::empty(),
-    //     dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-    //     dependency_flags: vk::DependencyFlags::empty(),
-    // }];
+    let subpass = vk::SubpassDescription::default()
+        .color_attachments(&color_attachment_refs)
+        .depth_stencil_attachment(&depth_attachment_ref)
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS);
 
-    // let renderpass_create_info = vk::RenderPassCreateInfo::default()
-    //     .attachments(&renderpass_attachments)
-    //     .subpasses(&subpasses)
-    //     .dependencies(&subpass_dependencies);
+    let dependencies = [vk::SubpassDependency {
+        src_subpass: vk::SUBPASS_EXTERNAL,
+        dst_subpass: 0,
+        src_stage_mask: vk::PipelineStageFlags::ALL_COMMANDS,
+        dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+        src_access_mask: vk::AccessFlags::MEMORY_WRITE,
+        dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+            | vk::AccessFlags::COLOR_ATTACHMENT_READ
+            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+        ..Default::default()
+    }];
 
-    // unsafe {
-    //     device
-    //         .create_render_pass(&renderpass_create_info, None)
-    //         .expect("Failed to create render pass!")
-    // }
+    let attachments = [color_attachment, depth_attachment];
+
+    let renderpass_create_info = vk::RenderPassCreateInfo::default()
+        .attachments(&attachments)
+        .subpasses(std::slice::from_ref(&subpass))
+        .dependencies(&dependencies);
+
+    unsafe {
+        device
+            .create_render_pass(&renderpass_create_info, None)
+            .expect("Failed to create render pass!")
+    }
 }
 
 pub fn create_shader_module(device: &ash::Device, code: &[u32]) -> vk::ShaderModule {
@@ -860,8 +889,8 @@ pub fn create_shader_module(device: &ash::Device, code: &[u32]) -> vk::ShaderMod
 }
 
 // Embedded SPIR-V shaders (compiled at build time)
-const GLIDE_VERT_SPV: &[u8] = include_bytes!("../../../shaders/glide_vert.spv");
-const GLIDE_FRAG_SPV: &[u8] = include_bytes!("../../../shaders/glide_frag.spv");
+const GLIDE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glide.vert.spv"));
+const GLIDE_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glide.frag.spv"));
 
 /// Convert embedded SPIR-V bytes to u32 words
 fn spv_to_words(bytes: &[u8]) -> Vec<u32> {
@@ -879,19 +908,43 @@ pub fn create_glide_graphics_pipelines(
     render_pass: vk::RenderPass,
     swapchain_extent: vk::Extent2D,
     descriptor_set_layout: vk::DescriptorSetLayout,
-) -> (std::collections::HashMap<vertex::BlendMode, vk::Pipeline>, vk::PipelineLayout) {
+) -> (
+    std::collections::HashMap<vertex::BlendMode, vk::Pipeline>,
+    vk::PipelineLayout,
+) {
     use vertex::BlendMode;
 
     let blend_configs: [(BlendMode, vk::BlendFactor, vk::BlendFactor); 4] = [
-        (BlendMode::Opaque, vk::BlendFactor::ONE, vk::BlendFactor::ZERO),
-        (BlendMode::AlphaBlend, vk::BlendFactor::SRC_ALPHA, vk::BlendFactor::ONE_MINUS_SRC_ALPHA),
-        (BlendMode::Additive, vk::BlendFactor::ONE, vk::BlendFactor::ONE),
-        (BlendMode::Multiplicative, vk::BlendFactor::ZERO, vk::BlendFactor::SRC_COLOR),
+        (
+            BlendMode::Opaque,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ZERO,
+        ),
+        (
+            BlendMode::AlphaBlend,
+            vk::BlendFactor::SRC_ALPHA,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        ),
+        (
+            BlendMode::Additive,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE,
+        ),
+        (
+            BlendMode::Multiplicative,
+            vk::BlendFactor::ZERO,
+            vk::BlendFactor::SRC_COLOR,
+        ),
     ];
 
     let (first_pipeline, pipeline_layout) = create_glide_graphics_pipeline_with_blend(
-        device, render_pass, swapchain_extent, descriptor_set_layout,
-        blend_configs[0].1, blend_configs[0].2, None,
+        device,
+        render_pass,
+        swapchain_extent,
+        descriptor_set_layout,
+        blend_configs[0].1,
+        blend_configs[0].2,
+        None,
     );
 
     let mut pipelines = std::collections::HashMap::new();
@@ -899,8 +952,13 @@ pub fn create_glide_graphics_pipelines(
 
     for &(mode, src, dst) in &blend_configs[1..] {
         let (pipeline, _) = create_glide_graphics_pipeline_with_blend(
-            device, render_pass, swapchain_extent, descriptor_set_layout,
-            src, dst, Some(pipeline_layout),
+            device,
+            render_pass,
+            swapchain_extent,
+            descriptor_set_layout,
+            src,
+            dst,
+            Some(pipeline_layout),
         );
         pipelines.insert(mode, pipeline);
     }
@@ -915,6 +973,32 @@ fn create_glide_graphics_pipeline_with_blend(
     descriptor_set_layout: vk::DescriptorSetLayout,
     src_color_blend: vk::BlendFactor,
     dst_color_blend: vk::BlendFactor,
+    existing_layout: Option<vk::PipelineLayout>,
+) -> (vk::Pipeline, vk::PipelineLayout) {
+    create_state_pipeline(
+        device,
+        render_pass,
+        swapchain_extent,
+        descriptor_set_layout,
+        vertex::PipelineState {
+            blend: [
+                src_color_blend.as_raw(),
+                dst_color_blend.as_raw(),
+                vk::BlendFactor::ONE.as_raw(),
+                vk::BlendFactor::ZERO.as_raw(),
+            ],
+            ..Default::default()
+        },
+        existing_layout,
+    )
+}
+
+pub fn create_state_pipeline(
+    device: &ash::Device,
+    render_pass: vk::RenderPass,
+    swapchain_extent: vk::Extent2D,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    state: vertex::PipelineState,
     existing_layout: Option<vk::PipelineLayout>,
 ) -> (vk::Pipeline, vk::PipelineLayout) {
     let vert_shader_code = spv_to_words(GLIDE_VERT_SPV);
@@ -979,20 +1063,20 @@ fn create_glide_graphics_pipeline_with_blend(
         .sample_shading_enable(false);
 
     let depth_state_create_info = vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_test_enable(true)
-        .depth_write_enable(true)
+        .depth_test_enable(state.depth_test)
+        .depth_write_enable(state.depth_write)
         .depth_bounds_test_enable(false)
-        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
+        .depth_compare_op(vk::CompareOp::from_raw(state.depth_compare))
         .stencil_test_enable(false);
 
     let color_blend_attachment_states = [vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(true)
-        .color_write_mask(vk::ColorComponentFlags::RGBA)
-        .src_color_blend_factor(src_color_blend)
-        .dst_color_blend_factor(dst_color_blend)
+        .color_write_mask(vk::ColorComponentFlags::from_raw(state.color_mask))
+        .src_color_blend_factor(vk::BlendFactor::from_raw(state.blend[0]))
+        .dst_color_blend_factor(vk::BlendFactor::from_raw(state.blend[1]))
         .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ONE)
-        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+        .src_alpha_blend_factor(vk::BlendFactor::from_raw(state.blend[2]))
+        .dst_alpha_blend_factor(vk::BlendFactor::from_raw(state.blend[3]))
         .alpha_blend_op(vk::BlendOp::ADD)];
 
     let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()

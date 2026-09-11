@@ -1,6 +1,14 @@
 use ash::vk;
 use std::{ffi::CStr, os::raw::c_void, ptr};
 
+static ERRORS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub fn reset_validation_errors() {
+    ERRORS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn validation_errors() -> usize {
+    ERRORS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct ValidationInfo {
     pub is_enable: bool,
     pub required_validation_layers: [&'static str; 1],
@@ -12,6 +20,9 @@ unsafe extern "system" fn vulkan_debug_callback(
     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
     _p_user_data: *mut c_void,
 ) -> vk::Bool32 {
+    if message_severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let severity = match message_severity {
         vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => "[Verbose]",
         vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => "[Warning]",

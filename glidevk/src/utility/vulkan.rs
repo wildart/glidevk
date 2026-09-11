@@ -331,12 +331,11 @@ pub fn create_logical_device(
     };
 
     // Enable descriptor indexing features for texture array binding
-    let mut descriptor_indexing_features =
-        vk::PhysicalDeviceDescriptorIndexingFeatures::default()
-            .descriptor_binding_partially_bound(true)
-            .descriptor_binding_sampled_image_update_after_bind(true)
-            .shader_sampled_image_array_non_uniform_indexing(true)
-            .runtime_descriptor_array(true);
+    let mut descriptor_indexing_features = vk::PhysicalDeviceDescriptorIndexingFeatures::default()
+        .descriptor_binding_partially_bound(true)
+        .descriptor_binding_sampled_image_update_after_bind(true)
+        .shader_sampled_image_array_non_uniform_indexing(true)
+        .runtime_descriptor_array(true);
 
     let extensions_names = DEVICE_EXTENSIONS.get_extensions_raw_names();
 
@@ -394,6 +393,8 @@ pub fn create_command_buffers(
 
 pub struct VulkanApp {
     pub device: ash::Device, // Logical Device
+    pub framebuffer: Option<super::framebuffer::Framebuffer>,
+    pub state_pipelines: std::collections::HashMap<super::vertex::PipelineState, vk::Pipeline>,
 
     pub graphics_queue: vk::Queue,
     pub present_queue: vk::Queue,
@@ -489,18 +490,11 @@ impl VulkanApp {
             self.device.device_wait_idle()?;
         }
 
-        let support = query_swapchain_support(
-            surface_loader,
-            self.physical_device,
-            &surface,
-        );
+        let support = query_swapchain_support(surface_loader, self.physical_device, &surface);
         let surface_format = choose_swapchain_format(&support.formats);
         let present_mode = choose_swapchain_present_mode(&support.present_modes);
-        let extent = choose_swapchain_extent_size(
-            &support.capabilities,
-            requested_width,
-            requested_height,
-        );
+        let extent =
+            choose_swapchain_extent_size(&support.capabilities, requested_width, requested_height);
 
         let queue_families =
             find_queue_family(instance, self.physical_device, surface_loader, &surface);
@@ -542,33 +536,24 @@ impl VulkanApp {
             .old_swapchain(self.swapchain)
             .image_array_layers(1);
 
-        let new_swapchain = unsafe {
-            self.swapchain_loader
-                .create_swapchain(&create_info, None)?
-        };
-        let new_images = unsafe {
-            self.swapchain_loader
-                .get_swapchain_images(new_swapchain)?
-        };
-        let new_imageviews =
-            create_image_views(&self.device, surface_format.format, &new_images);
-        let (new_depth_image, new_depth_memory, new_depth_view) =
-            create_depth_resources(
-                &self.device,
-                instance,
-                self.physical_device,
-                extent,
-                self.depth_format,
-            );
+        let new_swapchain = unsafe { self.swapchain_loader.create_swapchain(&create_info, None)? };
+        let new_images = unsafe { self.swapchain_loader.get_swapchain_images(new_swapchain)? };
+        let new_imageviews = create_image_views(&self.device, surface_format.format, &new_images);
+        let (new_depth_image, new_depth_memory, new_depth_view) = create_depth_resources(
+            &self.device,
+            instance,
+            self.physical_device,
+            extent,
+            self.depth_format,
+        );
         let new_render_pass =
             create_render_pass(&self.device, surface_format.format, self.depth_format);
-        let (new_pipelines, new_pipeline_layout) =
-            create_glide_graphics_pipelines(
-                &self.device,
-                new_render_pass,
-                extent,
-                self.texture_cache.descriptor_set_layout(),
-            );
+        let (new_pipelines, new_pipeline_layout) = create_glide_graphics_pipelines(
+            &self.device,
+            new_render_pass,
+            extent,
+            self.texture_cache.descriptor_set_layout(),
+        );
         let new_framebuffers = create_framebuffers(
             &self.device,
             new_render_pass,
@@ -603,6 +588,9 @@ impl VulkanApp {
             }
             for framebuffer in self.swapchain_framebuffers.drain(..) {
                 self.device.destroy_framebuffer(framebuffer, None);
+            }
+            for (_, pipeline) in self.state_pipelines.drain() {
+                self.device.destroy_pipeline(pipeline, None);
             }
             for (_, pipeline) in self.graphics_pipelines.drain() {
                 self.device.destroy_pipeline(pipeline, None);
@@ -721,7 +709,13 @@ impl Drop for VulkanApp {
             for vb in &self.vertex_buffers {
                 vb.destroy(&self.device);
             }
-            
+
+            if let Some(framebuffer) = &self.framebuffer {
+                framebuffer.destroy(&self.device);
+            }
+            for pipeline in self.state_pipelines.values() {
+                self.device.destroy_pipeline(*pipeline, None);
+            }
             self.texture_cache.destroy(&self.device);
 
             self.cleanup_swapchain();

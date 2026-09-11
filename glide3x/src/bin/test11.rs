@@ -57,9 +57,7 @@ fn main() {
                 &mut info,
             ) == FxBool::False
             {
-                println!("Error: Failed to take write lock");
-                grBufferSwap(1);
-                return;
+                panic!("Failed to take write lock");
             }
 
             // Calculate start position (centered with some margin)
@@ -100,9 +98,7 @@ fn main() {
                 &mut read_info,
             ) == FxBool::False
             {
-                println!("Error: Failed to take read lock");
-                grBufferSwap(1);
-                return;
+                panic!("Failed to take read lock");
             }
 
             // Read back the pattern
@@ -137,11 +133,8 @@ fn main() {
                 }
             }
 
-            if matches {
-                println!("Passed readback test");
-            } else {
-                println!("Failed readback test");
-            }
+            assert!(matches, "LFB readback differs from the written pattern");
+            println!("Passed readback test");
 
             grBufferSwap(1);
         },

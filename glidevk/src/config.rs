@@ -183,10 +183,7 @@ pub struct TextureConfig {
     /// Too high values may cause texture glitches or driver issues
     pub memory: TextureMemory,
 
-    /// Size of buffer textures used internally
-    /// Smaller = more game textures fit on GPU
-    /// Larger = more game textures fit in single buffer
-    /// 1024x1024 is recommended for most hardware
+    /// Reserved for configuration compatibility; currently ignored.
     pub buffer_size: BufferTextureSize,
 }
 
@@ -220,15 +217,13 @@ pub enum FpsPosition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RenderConfig {
-    /// Enable bilinear filtering
-    /// Renders scene to texture first, then to screen
-    /// Reduces framerate but increases image quality at desktop resolution
+    /// Reserved for configuration compatibility; use grTexFilterMode instead.
     pub bilinear_filtering: bool,
 
-    /// Enable VSync
+    /// Reserved for configuration compatibility; currently ignored.
     pub vsync: bool,
 
-    /// Supersampling factor (1 = disabled, 2 = 2x, 4 = 4x)
+    /// Reserved for configuration compatibility; currently ignored. Supersampling factor (1 = disabled, 2 = 2x, 4 = 4x)
     pub supersampling: u32,
 
     /// Show FPS counter
@@ -323,64 +318,28 @@ impl Config {
 
     /// Generate a default configuration file with comments
     pub fn generate_default_file<P: AsRef<Path>>(path: P) -> Result<(), std::io::Error> {
-        let default_config = r#"# GlideVK Wrapper Configuration
-# Place this file in the game directory as 'glidevk.toml'
-
-[window]
-# Run in windowed mode instead of fullscreen
-# Overrides the "-w" command-line parameter
-windowed = false
-
-# Keep 4:3 aspect ratio when running in windowed mode or at desktop resolution
-# Additional space is filled with black bars
-keep_aspect_ratio = true
-
-# Static size preset for the window/display
-# Options: "none", "vga", "svga", "xga", "sxga", "uxga", "qxga", "desktop"
-# Or use custom: { width = 1920, height = 1080 }
-# In fullscreen mode, surrounding area is filled black
-static_size = "none"
-
-# Allow resizing the window in windowed mode
-# Window content will be scaled to fit
-resizable = false
-
-# Center the window on the desktop (only in windowed mode)
-centered = true
-
-[texture]
-# Amount of texture memory to report to the game
-# Options: "mb2", "mb4", "mb8", "mb16", "mb32", "mb64", "mb128", "mb256"
-# Or use custom: { Custom = 24 } for 24 MB
-# WARNING: Too high values may cause texture glitches or driver issues
-memory = "mb8"
-
-# Size of buffer textures used internally
-# Options: "Size256", "Size512", "Size1024", "Size2048", "Size4096"
-# Smaller = more game textures fit on GPU
-# Larger = more game textures fit in single buffer
-# 1024x1024 is recommended for most hardware
-buffer_size = "Size1024"
-
-[render]
-# Enable bilinear filtering
-# Renders scene to texture first, then to screen
-# Reduces framerate but increases image quality at desktop resolution
-bilinear_filtering = true
-
-# Enable VSync
-vsync = true
-
-# Supersampling factor (1 = disabled, 2 = 2x, 4 = 4x)
-supersampling = 1
-"#;
-        fs::write(path, default_config)
+        fs::write(path, include_str!("../../glidevk.toml.example"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_in_custom_examples_parse() {
+        let example = include_str!("../../glidevk.toml.example");
+        let _: Config = toml::from_str(example).unwrap();
+        let custom = example
+            .replace(
+                "static_size = \"none\"",
+                "static_size = { custom = { width = 1920, height = 1080 } }",
+            )
+            .replace("memory = \"mb8\"", "memory = { custom = 24 }");
+        let config: Config = toml::from_str(&custom).unwrap();
+        assert_eq!(config.window.static_size.dimensions(), Some((1920, 1080)));
+        assert_eq!(config.texture.memory.bytes(), 24 * 1024 * 1024);
+    }
 
     #[test]
     fn test_default_config() {

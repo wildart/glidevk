@@ -4,8 +4,8 @@
 
 use crate::{
     grGetWindow, grGlideInitWithWindow, grGlideShutdown, grLfbReadRegion, grSstScreenHeight,
-    grSstScreenWidth, grSstSelect, grSstWinOpen, Buffer, ColorFormat, FxBool, OriginLocation,
-    ScreenRefresh, ScreenResolution,
+    grSstScreenWidth, grSstSelect, grSstWinOpen, grVertexLayout, Buffer, ColorFormat, FxBool,
+    OriginLocation, ScreenRefresh, ScreenResolution, Vertex,
 };
 use std::env;
 use std::fs::File;
@@ -248,123 +248,10 @@ where
     S: FnOnce(&TestConfig),
     R: FnMut(&TestConfig) + 'static,
 {
-    env_logger::init();
-
-    let config = match parse_args() {
-        Some(c) => c,
-        None => return,
-    };
-
-    println!("{}:", title);
-    println!("Resolution: {}x{}", config.width, config.height);
-    if config.frames > 0 {
-        println!("Rendering {} frames", config.frames);
-    } else {
-        println!("Close window to quit");
-    }
-
-    let event_loop = EventLoop::new().expect("Failed to create event loop");
-
-    let window = WindowBuilder::new()
-        .with_title(title)
-        .with_inner_size(winit::dpi::LogicalSize::new(config.width, config.height))
-        .with_visible(!config.headless)
-        .build(&event_loop)
-        .expect("Failed to create window");
-
-    // Initialize Glide with the window
-    grGlideInitWithWindow(window);
-
-    // Select SST and open window
-    grSstSelect(0);
-    let ctx = grSstWinOpen(
-        0,
-        config.resolution,
-        ScreenRefresh::R60Hz,
-        ColorFormat::Abgr,
-        OriginLocation::UpperLeft,
-        2,
-        1,
-    );
-    assert_eq!(ctx, 1, "Failed to open graphics context");
-
-    // Call user's setup function
-    setup(&config);
-
-    let mut frame_count: u32 = 0;
-    let mut frames_remaining = config.frames;
-    let dump_file = config.dump_file.clone();
-    let mut shutdown = false;
-
-    event_loop
-        .run(move |event, elwt| {
-            elwt.set_control_flow(ControlFlow::Poll);
-
-            // Don't process events after shutdown
-            if shutdown {
-                return;
-            }
-
-            match event {
-                Event::WindowEvent { event, .. } => match event {
-                    WindowEvent::CloseRequested => {
-                        println!("Shutting down after {} frames", frame_count);
-                        shutdown = true;
-                        grGlideShutdown();
-                        elwt.exit();
-                    }
-                    WindowEvent::RedrawRequested => {
-                        if frames_remaining == 0 {
-                            println!("Completed {} frames", frame_count);
-                            shutdown = true;
-                            grGlideShutdown();
-                            elwt.exit();
-                            return;
-                        }
-
-                        // Call user's render function
-                        render(&config);
-
-                        // Screen dump if requested
-                        if let Some(ref filename) = dump_file {
-                            // Get actual framebuffer dimensions (may differ from logical size on HiDPI)
-                            let width = grSstScreenWidth();
-                            let height = grSstScreenHeight();
-                            let stride = width * 2; // RGB565 = 2 bytes per pixel
-                            let mut pixels = vec![0u8; (width * height * 2) as usize];
-
-                            if grLfbReadRegion(
-                                Buffer::Back,
-                                0,
-                                0,
-                                width,
-                                height,
-                                stride,
-                                pixels.as_mut_ptr() as *mut _,
-                            ) == FxBool::True
-                            {
-                                if let Err(e) = screen_dump(filename, width, height, &pixels) {
-                                    eprintln!("Failed to save screen dump: {}", e);
-                                }
-                            } else {
-                                eprintln!("Failed to read framebuffer");
-                            }
-                        }
-
-                        frame_count += 1;
-                        if frames_remaining > 0 {
-                            frames_remaining -= 1;
-                        }
-                    }
-                    _ => {}
-                },
-                Event::AboutToWait => {
-                    grGetWindow(|window| window.request_redraw());
-                }
-                _ => {}
-            }
-        })
-        .unwrap();
+    run_test_interactive(title, setup, move |config, _| {
+        render(config);
+        true
+    });
 }
 
 /// Run a Glide API test with keyboard input support
@@ -429,13 +316,31 @@ where
         .build(&event_loop)
         .expect("Failed to create window");
 
-    // Initialize Glide with the window
+    let hwnd = {
+        #[cfg(target_os = "windows")]
+        {
+            use winit::raw_window_handle::HasWindowHandle;
+            match window
+                .window_handle()
+                .expect("Native window handle")
+                .as_raw()
+            {
+                winit::raw_window_handle::RawWindowHandle::Win32(h) => h.hwnd.get() as u32,
+                _ => unreachable!(),
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            0
+        }
+    };
+    glidevk::utility::debug::reset_validation_errors();
     grGlideInitWithWindow(window);
 
     // Select SST and open window
     grSstSelect(0);
     let ctx = grSstWinOpen(
-        0,
+        hwnd,
         config.resolution,
         ScreenRefresh::R60Hz,
         ColorFormat::Abgr,
@@ -445,7 +350,18 @@ where
     );
     assert_eq!(ctx, 1, "Failed to open graphics context");
 
-    // Call user's setup function
+    // These demos use the full Rust Vertex; DLL clients configure their own layout.
+    for (param, offset) in [
+        (0x01, 0),
+        (0x20, std::mem::offset_of!(Vertex, r)),
+        (0x10, std::mem::offset_of!(Vertex, a)),
+        (0x02, std::mem::offset_of!(Vertex, ooz)),
+        (0x04, std::mem::offset_of!(Vertex, oow)),
+        (0x40, std::mem::offset_of!(Vertex, tmuvtx)),
+        (0x50, std::mem::offset_of!(Vertex, tmuvtx) + 8),
+    ] {
+        grVertexLayout(param, offset as u32, 1);
+    }
     setup(&config);
 
     let mut frame_count: u32 = 0;
@@ -453,6 +369,8 @@ where
     let dump_file = config.dump_file.clone();
     let mut shutdown = false;
     let mut pressed_keys: Vec<char> = Vec::new();
+    let failed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let frame_failed = failed.clone();
 
     event_loop
         .run(move |event, elwt| {
@@ -539,9 +457,11 @@ where
                             {
                                 if let Err(e) = screen_dump(filename, width, height, &pixels) {
                                     eprintln!("Failed to save screen dump: {}", e);
+                                    frame_failed.set(true);
                                 }
                             } else {
                                 eprintln!("Failed to read framebuffer");
+                                frame_failed.set(true);
                             }
                         }
 
@@ -559,4 +479,10 @@ where
             }
         })
         .unwrap();
+    assert!(!failed.get(), "Framebuffer dump failed");
+    assert_eq!(
+        glidevk::utility::debug::validation_errors(),
+        0,
+        "Vulkan validation errors"
+    );
 }

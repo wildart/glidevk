@@ -25,13 +25,13 @@ static EXTENSION: &[u8] = b" \0";
 /// GrProc type - function pointer for extension functions
 pub type GrProc = Option<unsafe extern "C" fn()>;
 
-
-/// Coordinate space function (stub - current implementation uses window coordinates)
-pub fn coordinate_space(_mode: CoordinateSpaceMode) {
-    // Current implementation always uses window coordinates
-    // Clip coordinates would require transformation matrix support
+static COORDINATE_SPACE: AtomicU32 = AtomicU32::new(0);
+pub fn coordinate_space(mode: CoordinateSpaceMode) {
+    COORDINATE_SPACE.store(mode as u32, Ordering::Relaxed);
 }
-
+pub fn current_coordinate_space() -> u32 {
+    COORDINATE_SPACE.load(Ordering::Relaxed)
+}
 
 /// Finish function - waits for all rendering to complete
 pub fn finish() {
@@ -487,9 +487,7 @@ pub fn load_gamma_table(
     let mut gamma = current_gamma_rgb();
     for (channel, table_ptr) in [red, green, blue].into_iter().enumerate() {
         if !table_ptr.is_null() {
-            let table = unsafe {
-                std::slice::from_raw_parts(table_ptr, num_entries as usize)
-            };
+            let table = unsafe { std::slice::from_raw_parts(table_ptr, num_entries as usize) };
             if let Some(estimated) = estimate_gamma_from_table(table) {
                 gamma[channel] = estimated;
             }
@@ -519,9 +517,9 @@ pub fn gamma_correction_rgb(gamma_red: f32, gamma_green: f32, gamma_blue: f32) {
 }
 
 pub fn current_gamma_rgb() -> [f32; 3] {
-    GAMMA_RGB.each_ref().map(|value| {
-        f32::from_bits(value.load(Ordering::Relaxed))
-    })
+    GAMMA_RGB
+        .each_ref()
+        .map(|value| f32::from_bits(value.load(Ordering::Relaxed)))
 }
 
 fn set_gamma_rgb(gamma: [f32; 3]) {

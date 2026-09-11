@@ -3,6 +3,7 @@
 pub mod api;
 pub mod config;
 pub mod glidesys;
+mod render;
 pub mod utility;
 
 use ash::vk;
@@ -42,7 +43,10 @@ fn fps_digits(mut fps: u32) -> Vec<u8> {
 
 fn push_quad(
     vertices: &mut Vec<utility::vertex::GpuVertex>,
-    x1: f32, y1: f32, x2: f32, y2: f32,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
     color: [f32; 4],
 ) {
     // CF_LOCAL(1) for both color and alpha, all other fields 0
@@ -55,6 +59,7 @@ fn push_quad(
         constant_color: color,
         combine_flags: fps_flags,
         texture_index: 0,
+        ..Default::default()
     };
     vertices.push(v(x1, y1));
     vertices.push(v(x2, y1));
@@ -67,7 +72,11 @@ fn push_quad(
 /// Draw a digit (0-9) as a 7-segment display using colored quads
 fn draw_7seg_digit(
     vertices: &mut Vec<utility::vertex::GpuVertex>,
-    x: f32, y: f32, w: f32, h: f32, digit: u8,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    digit: u8,
     color: [f32; 4],
 ) {
     // Segments: top, top-left, top-right, middle, bottom-left, bottom-right, bottom
@@ -106,7 +115,14 @@ fn draw_7seg_digit(
     }
     // Middle horizontal
     if s & (1 << 3) != 0 {
-        push_quad(vertices, x, y + mid - t / 2.0, x + w, y + mid + t / 2.0, color);
+        push_quad(
+            vertices,
+            x,
+            y + mid - t / 2.0,
+            x + w,
+            y + mid + t / 2.0,
+            color,
+        );
     }
     // Bottom-left vertical
     if s & (1 << 4) != 0 {
@@ -124,7 +140,7 @@ fn draw_7seg_digit(
 
 //  error management
 extern "C" fn error_callback(string: *const c_char, fatal: FxBool) {
-    let qualifier = if fatal == FxBool::True {
+    let qualifier = if fatal.is_true() {
         "Fatal"
     } else {
         "Recoverable"
@@ -134,7 +150,7 @@ extern "C" fn error_callback(string: *const c_char, fatal: FxBool) {
     eprintln!("{qualifier} error: {string}");
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct State {
     // Buffer configuration
     num_buffers: i32,
@@ -157,13 +173,6 @@ pub struct State {
     viewport_y: u32,
     viewport_width: u32,
     viewport_height: u32,
-
-    // Clear color (RGBA floats)
-    clear_r: f32,
-    clear_g: f32,
-    clear_b: f32,
-    clear_a: f32,
-    clear_depth: f32,
 
     // Depth buffer state
     depth_buffer_mode: DepthBufferMode,
@@ -237,8 +246,12 @@ pub struct State {
     tex_clamp_mode_t: [TextureClampMode; GLIDE_NUM_TMU],
     tex_mipmap_mode: [MipMapMode; GLIDE_NUM_TMU],
     tex_lod_bias: [f32; GLIDE_NUM_TMU],
-    tex_combine_function: [TextureCombineFnc; GLIDE_NUM_TMU],
+    tex_combine_function: [CombineFunction; GLIDE_NUM_TMU],
     tex_combine_factor: [CombineFactor; GLIDE_NUM_TMU],
+    tex_combine_alpha_function: [CombineFunction; GLIDE_NUM_TMU],
+    tex_combine_alpha_factor: [CombineFactor; GLIDE_NUM_TMU],
+    tex_combine_rgb_invert: [bool; GLIDE_NUM_TMU],
+    tex_combine_alpha_invert: [bool; GLIDE_NUM_TMU],
 
     // Texture table state
     tex_table_type: TextureTableType,
@@ -266,11 +279,6 @@ impl Default for State {
             viewport_y: 0,
             viewport_width: 0,
             viewport_height: 0,
-            clear_r: 0.0,
-            clear_g: 0.0,
-            clear_b: 0.0,
-            clear_a: 1.0,
-            clear_depth: 1.0,
             // Default depth state: disabled, less-or-equal compare, writes enabled
             depth_buffer_mode: DepthBufferMode::Disable,
             depth_buffer_function: CmpFnc::LEqual,
@@ -322,15 +330,19 @@ impl Default for State {
             shameless_plug: false,
             video_smoothing: false,
             // Default texture state
-            tex_source: [0; GLIDE_NUM_TMU],
+            tex_source: [u32::MAX; GLIDE_NUM_TMU],
             tex_filter_mode_min: [TextureFilterMode::PointSampled; GLIDE_NUM_TMU],
             tex_filter_mode_mag: [TextureFilterMode::PointSampled; GLIDE_NUM_TMU],
             tex_clamp_mode_s: [TextureClampMode::Wrap; GLIDE_NUM_TMU],
             tex_clamp_mode_t: [TextureClampMode::Wrap; GLIDE_NUM_TMU],
             tex_mipmap_mode: [MipMapMode::Disable; GLIDE_NUM_TMU],
             tex_lod_bias: [0.0; GLIDE_NUM_TMU],
-            tex_combine_function: [TextureCombineFnc::Zero; GLIDE_NUM_TMU],
+            tex_combine_function: [CombineFunction::Local, CombineFunction::Zero],
             tex_combine_factor: [CombineFactor::Zero; GLIDE_NUM_TMU],
+            tex_combine_alpha_function: [CombineFunction::Local, CombineFunction::Zero],
+            tex_combine_alpha_factor: [CombineFactor::Zero; GLIDE_NUM_TMU],
+            tex_combine_rgb_invert: [false; GLIDE_NUM_TMU],
+            tex_combine_alpha_invert: [false; GLIDE_NUM_TMU],
             // Default texture table type
             tex_table_type: TextureTableType::Palette,
             palette_generation: 0,
@@ -359,8 +371,6 @@ struct LfbLockState {
     height: u32,
     /// Stride in bytes
     stride: u32,
-    /// Whether LFB write was performed this frame (skip render in buffer_swap)
-    lfb_written: bool,
 }
 
 impl Default for LfbLockState {
@@ -375,7 +385,6 @@ impl Default for LfbLockState {
             width: 0,
             height: 0,
             stride: 0,
-            lfb_written: false,
         }
     }
 }
@@ -403,13 +412,11 @@ fn scale_bgra_nearest(
         return source.to_vec();
     }
 
-    let mut destination =
-        vec![0u8; (destination_width * destination_height * 4) as usize];
+    let mut destination = vec![0u8; (destination_width * destination_height * 4) as usize];
     for y in 0..destination_height {
         let source_y = (y as u64 * source_height as u64 / destination_height as u64) as u32;
         for x in 0..destination_width {
-            let source_x =
-                (x as u64 * source_width as u64 / destination_width as u64) as u32;
+            let source_x = (x as u64 * source_width as u64 / destination_width as u64) as u32;
             let source_offset = ((source_y * source_width + source_x) * 4) as usize;
             let destination_offset = ((y * destination_width + x) * 4) as usize;
             destination[destination_offset..destination_offset + 4]
@@ -417,6 +424,130 @@ fn scale_bgra_nearest(
         }
     }
     destination
+}
+
+fn lfb_to_bgra(
+    width: u32,
+    height: u32,
+    stride: u32,
+    write_mode: LfbWriteMode,
+    origin: OriginLocation,
+    src_data: &[u8],
+) -> Vec<u8> {
+    // Determine bytes per pixel based on write mode
+    let bytes_per_pixel: u32 = match write_mode {
+        glidesys::LfbWriteMode::Rgb565
+        | glidesys::LfbWriteMode::Rgb555
+        | glidesys::LfbWriteMode::Argb1555 => 2,
+        glidesys::LfbWriteMode::Rgb888 => 3,
+        glidesys::LfbWriteMode::Argb8888 => 4,
+        _ => 2,
+    };
+
+    // Convert source data to BGRA8888 (matching swapchain format B8G8R8A8_UNORM)
+    let mut bgra_data = vec![0u8; (width * height * 4) as usize];
+    for y in 0..height {
+        let src_y = if origin == glidesys::OriginLocation::LowerLeft {
+            height - 1 - y
+        } else {
+            y
+        };
+
+        for x in 0..width {
+            let src_idx = (src_y * stride + x * bytes_per_pixel) as usize;
+            let dst_idx = ((y * width + x) * 4) as usize;
+
+            if dst_idx + 3 < bgra_data.len() {
+                let (r, g, b, a) = match write_mode {
+                    glidesys::LfbWriteMode::Rgb565 | glidesys::LfbWriteMode::Any => {
+                        if src_idx + 1 < src_data.len() {
+                            let rgb565 =
+                                (src_data[src_idx] as u16) | ((src_data[src_idx + 1] as u16) << 8);
+                            let r5 = ((rgb565 >> 11) & 0x1F) as u8;
+                            let g6 = ((rgb565 >> 5) & 0x3F) as u8;
+                            let b5 = (rgb565 & 0x1F) as u8;
+                            (
+                                (r5 << 3) | (r5 >> 2),
+                                (g6 << 2) | (g6 >> 4),
+                                (b5 << 3) | (b5 >> 2),
+                                255u8,
+                            )
+                        } else {
+                            (0, 0, 0, 255)
+                        }
+                    }
+                    glidesys::LfbWriteMode::Rgb555 => {
+                        if src_idx + 1 < src_data.len() {
+                            let rgb555 =
+                                (src_data[src_idx] as u16) | ((src_data[src_idx + 1] as u16) << 8);
+                            let r5 = ((rgb555 >> 10) & 0x1F) as u8;
+                            let g5 = ((rgb555 >> 5) & 0x1F) as u8;
+                            let b5 = (rgb555 & 0x1F) as u8;
+                            (
+                                (r5 << 3) | (r5 >> 2),
+                                (g5 << 3) | (g5 >> 2),
+                                (b5 << 3) | (b5 >> 2),
+                                255u8,
+                            )
+                        } else {
+                            (0, 0, 0, 255)
+                        }
+                    }
+                    glidesys::LfbWriteMode::Argb1555 => {
+                        if src_idx + 1 < src_data.len() {
+                            let argb1555 =
+                                (src_data[src_idx] as u16) | ((src_data[src_idx + 1] as u16) << 8);
+                            let a1 = ((argb1555 >> 15) & 0x1) as u8;
+                            let r5 = ((argb1555 >> 10) & 0x1F) as u8;
+                            let g5 = ((argb1555 >> 5) & 0x1F) as u8;
+                            let b5 = (argb1555 & 0x1F) as u8;
+                            (
+                                (r5 << 3) | (r5 >> 2),
+                                (g5 << 3) | (g5 >> 2),
+                                (b5 << 3) | (b5 >> 2),
+                                if a1 != 0 { 255 } else { 0 },
+                            )
+                        } else {
+                            (0, 0, 0, 255)
+                        }
+                    }
+                    glidesys::LfbWriteMode::Rgb888 => {
+                        if src_idx + 2 < src_data.len() {
+                            (
+                                src_data[src_idx + 2],
+                                src_data[src_idx + 1],
+                                src_data[src_idx],
+                                255u8,
+                            )
+                        } else {
+                            (0, 0, 0, 255)
+                        }
+                    }
+                    glidesys::LfbWriteMode::Argb8888 => {
+                        if src_idx + 3 < src_data.len() {
+                            (
+                                src_data[src_idx + 2],
+                                src_data[src_idx + 1],
+                                src_data[src_idx],
+                                src_data[src_idx + 3],
+                            )
+                        } else {
+                            (0, 0, 0, 255)
+                        }
+                    }
+                    _ => (0, 0, 0, 255),
+                };
+
+                // Write as BGRA (matching swapchain B8G8R8A8_UNORM)
+                bgra_data[dst_idx] = b;
+                bgra_data[dst_idx + 1] = g;
+                bgra_data[dst_idx + 2] = r;
+                bgra_data[dst_idx + 3] = a;
+            }
+        }
+    }
+
+    bgra_data
 }
 
 pub struct Gr {
@@ -441,6 +572,9 @@ pub struct Gr {
     fps_counter: FpsCounter,
     /// Texture addresses referenced this frame (for upload + eviction protection)
     frame_textures: std::collections::HashSet<u32>,
+    continuation: Vec<utility::vertex::GpuVertex>,
+    continuation_mode: PrimitiveType,
+    continuation_odd: bool,
 }
 
 struct FpsCounter {
@@ -463,12 +597,11 @@ impl Gr {
         let config = config::Config::load();
         let texture_memory_bytes = config.texture.memory.bytes() as usize;
         log::info!(
-            "GlideVK config: windowed={}, resizable={}, static_size={:?}, keep_aspect_ratio={}, supersampling={}x, texture_memory={}MB",
+            "GlideVK config: windowed={}, resizable={}, static_size={:?}, keep_aspect_ratio={}, texture_memory={}MB",
             config.window.windowed,
             config.window.resizable,
             config.window.static_size,
             config.window.keep_aspect_ratio,
-            config.render.supersampling,
             texture_memory_bytes / (1024 * 1024)
         );
 
@@ -495,6 +628,9 @@ impl Gr {
                 display_fps: 0,
             },
             frame_textures: std::collections::HashSet::new(),
+            continuation: Vec::new(),
+            continuation_mode: PrimitiveType::Triangles,
+            continuation_odd: false,
         }
     }
 
@@ -532,6 +668,15 @@ impl Gr {
                     return Some((size.width, size.height));
                 }
             }
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(info) =
+            unsafe { utility::platforms::native_monitor_info(self.native_window_handle) }
+        {
+            return Some((
+                (info.rcMonitor.right - info.rcMonitor.left) as u32,
+                (info.rcMonitor.bottom - info.rcMonitor.top) as u32,
+            ));
         }
         // Default fallback
         None
@@ -576,9 +721,9 @@ impl Gr {
             return;
         }
 
-        let Some((width, height)) = (unsafe {
-            utility::platforms::native_window_client_size(self.native_window_handle)
-        }) else {
+        let Some((width, height)) =
+            (unsafe { utility::platforms::native_window_client_size(self.native_window_handle) })
+        else {
             return;
         };
         if width == 0 || height == 0 {
@@ -699,20 +844,28 @@ impl Gr {
     ) -> GrContext {
         #[cfg(target_os = "windows")]
         let hwnd = match (hwnd, self.window.as_ref()) {
-            (0, Some(window)) => match window.window_handle().expect("Window has no handle").as_raw() {
-                winit::raw_window_handle::RawWindowHandle::Win32(handle) => handle.hwnd.get() as u32,
+            (0, Some(window)) => match window
+                .window_handle()
+                .expect("Window has no handle")
+                .as_raw()
+            {
+                winit::raw_window_handle::RawWindowHandle::Win32(handle) => {
+                    handle.hwnd.get() as u32
+                }
                 _ => panic!("Expected a Win32 window"),
             },
             _ => hwnd,
         };
         unsafe {
-            assert_eq!(refresh, ScreenRefresh::R60Hz);
+            log::debug!("Requested refresh: {:?}", refresh);
+            self.state.origin = origin;
             self.native_window_handle = hwnd;
 
             // Get game's requested resolution
             let (game_width, game_height) = res.into();
             self.state.screen_width = game_width as u32;
             self.state.screen_height = game_height as u32;
+            self.clip_window(0, 0, game_width as u32, game_height as u32);
             self.state.color_format = cformat;
             self.state.num_buffers = num_buffers;
             self.state.num_aux_buffers = num_aux_buffers;
@@ -740,12 +893,6 @@ impl Gr {
                 vp_w,
                 vp_h
             );
-
-            let _flip = match origin {
-                OriginLocation::UpperLeft => false,
-                OriginLocation::LowerLeft => true,
-                OriginLocation::Any => panic!("OriginLocation::Any is currently unsupported."),
-            };
 
             let _entry = &self.vulkan_instance.entry;
             let instance = &self.vulkan_instance.instance;
@@ -989,31 +1136,29 @@ impl Gr {
             // - render_finished: per-swapchain-image (indexed by acquired image_index)
             //   because the swapchain holds the semaphore until the image is re-acquired
             let semaphore_info = vk::SemaphoreCreateInfo::default();
-            let fence_info =
-                vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+            let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
             let mut image_available_semaphores = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
             let mut in_flight_fences = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
             for _ in 0..MAX_FRAMES_IN_FLIGHT {
-                image_available_semaphores.push(unsafe {
+                image_available_semaphores.push(
                     logical_device
                         .create_semaphore(&semaphore_info, None)
-                        .expect("Failed to create image available semaphore")
-                });
-                in_flight_fences.push(unsafe {
+                        .expect("Failed to create image available semaphore"),
+                );
+                in_flight_fences.push(
                     logical_device
                         .create_fence(&fence_info, None)
-                        .expect("Failed to create in-flight fence")
-                });
+                        .expect("Failed to create in-flight fence"),
+                );
             }
             let swapchain_image_count = swapchain_images.len();
-            let mut render_finished_semaphores =
-                Vec::with_capacity(swapchain_image_count);
+            let mut render_finished_semaphores = Vec::with_capacity(swapchain_image_count);
             for _ in 0..swapchain_image_count {
-                render_finished_semaphores.push(unsafe {
+                render_finished_semaphores.push(
                     logical_device
                         .create_semaphore(&semaphore_info, None)
-                        .expect("Failed to create render finished semaphore")
-                });
+                        .expect("Failed to create render finished semaphore"),
+                );
             }
             log::debug!(
                 "Created synchronization objects ({} frames in flight, {} swapchain images)",
@@ -1033,8 +1178,7 @@ impl Gr {
                     physical_device,
                     vertex_buffer_size,
                     vk::BufferUsageFlags::VERTEX_BUFFER,
-                    vk::MemoryPropertyFlags::HOST_VISIBLE
-                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 ));
             }
             log::debug!(
@@ -1055,6 +1199,8 @@ impl Gr {
 
             self.vulkan_app = Some(VulkanApp {
                 device: logical_device,
+                framebuffer: None,
+                state_pipelines: std::collections::HashMap::new(),
                 graphics_queue,
                 present_queue,
                 swapchain_loader,
@@ -1089,11 +1235,18 @@ impl Gr {
 
                 texture_cache,
             });
+            let app = self.vulkan_app.as_mut().unwrap();
+            app.framebuffer = Some(utility::framebuffer::Framebuffer::new(
+                app,
+                instance,
+                self.state.screen_width,
+                self.state.screen_height,
+            ));
             log::debug!("Vulkan app initialized successfully");
         }
 
         log::debug!("sst_win_open completed");
-        return FxBool::True as u32; // context
+        return FxBool::True.0 as u32; // context
     }
 
     /*
@@ -1185,668 +1338,11 @@ impl Gr {
     }
 
     pub fn buffer_swap(&mut self, _interval: i32) -> Option<()> {
-        #[cfg(target_os = "windows")]
-        self.refresh_native_window_size();
-
-        // If LFB write was performed, the image was already presented in lfb_unlock.
-        // Just clear the flag and skip the normal render path.
-        if self.lfb_lock_state.lfb_written {
-            self.lfb_lock_state.lfb_written = false;
-            self.vertex_batch.clear();
-            self.frame_textures.clear();
-            return Some(());
-        }
-
-        let frame_start = std::time::Instant::now();
-
-        // Finalize vertex batch and get draw calls (copy to avoid borrow issues)
-        let draw_calls: Vec<utility::vertex::DrawCall> = self.vertex_batch.finalize().to_vec();
-
-        // Collect textures needed this frame (accumulated during draw calls)
-        let needed_textures: std::collections::HashSet<u32> = self.frame_textures.clone();
-        if !needed_textures.is_empty() {
-            log::trace!("Frame needs {} unique textures: {:?}",
-                needed_textures.len(),
-                needed_textures.iter().take(5).map(|a| format!("{:#x}", a)).collect::<Vec<_>>()
-            );
-        }
-
-        // Batch-upload all missing textures in a single GPU submission
-        {
-            let mut to_upload: Vec<(u32, utility::texture::TextureData, Option<utility::texture::PaletteTable>)> = Vec::new();
-            let mut uploaded_palette_generations: Vec<(u32, Option<u64>)> = Vec::new();
-
-            let pal_gen = self.state.palette_generation;
-            for &addr in &needed_textures {
-                if addr == 0 {
-                    continue;
-                }
-
-                let Some(tmu_idx) = (0..GLIDE_NUM_TMU)
-                    .find(|&index| self.texture_memory[index].get_texture(addr).is_some())
-                else {
-                    continue;
-                };
-                let tex = self.texture_memory[tmu_idx]
-                    .get_texture(addr)
-                    .expect("texture disappeared while preparing upload");
-                let palette_generation =
-                    matches!(tex.format, TextureFormat::P8).then_some(pal_gen);
-
-                // Check if texture is missing or has a stale palette
-                let (has_it, palette_stale) = self.vulkan_app.as_ref()
-                    .map(|app| (
-                        app.texture_cache.has_texture(addr),
-                        app.texture_cache
-                            .is_palette_stale(addr, palette_generation),
-                    ))
-                    .unwrap_or((false, false));
-
-                let needs_upload = !has_it || palette_stale;
-
-                // Log a small sample of palette-driven re-uploads.
-                static STALE_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if palette_stale && has_it {
-                    let n = STALE_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n < 10 {
-                        log::debug!(
-                            "Palette changed: re-uploading P8 texture {:#x} at generation {}",
-                            addr,
-                            pal_gen
-                        );
-                    }
-                }
-
-                if needs_upload {
-                    let palette = palette_generation.and_then(|_| {
-                        self.texture_memory[tmu_idx]
-                            .get_palette(0)
-                            .cloned()
-                    });
-                    to_upload.push((
-                        addr,
-                        utility::texture::TextureData::new(
-                            tex.width, tex.height, tex.format, tex.data.clone(),
-                        ),
-                        palette,
-                    ));
-                    uploaded_palette_generations.push((addr, palette_generation));
-                }
-            }
-
-            if !to_upload.is_empty() {
-                if let Some(app) = &mut self.vulkan_app {
-                    app.texture_cache.batch_upload(
-                        &app.device,
-                        &self.vulkan_instance.instance,
-                        app.physical_device,
-                        app.command_pool,
-                        app.graphics_queue,
-                        to_upload,
-                    );
-                    // Record palette generation for freshly uploaded textures
-                    for (addr, generation) in uploaded_palette_generations {
-                        app.texture_cache.set_palette_gen(addr, generation);
-                    }
-                }
-            }
-        }
-
-        // Resolve texture addresses → descriptor slot indices now that all textures are uploaded
-        let t_resolve = std::time::Instant::now();
-        if let Some(app) = &self.vulkan_app {
-            let mut unresolved = 0u32;
-            for v in &mut self.vertex_batch.vertices {
-                let addr = v.texture_index;
-                let slot = app.texture_cache.get_texture_slot(addr);
-                if slot == 0 && addr != 0 {
-                    unresolved += 1;
-                }
-                v.texture_index = slot;
-            }
-            if unresolved > 0 {
-                log::warn!(
-                    "buffer_swap: {} vertices with unresolved textures (slot 0 / placeholder)",
-                    unresolved
-                );
-            }
-            // Log texture stats for first 60 frames
-            static FRAME_NUM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let frame = FRAME_NUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if frame < 60 {
-                let unique_slots: std::collections::HashSet<u32> = self.vertex_batch.vertices.iter()
-                    .map(|v| v.texture_index).collect();
-                log::warn!(
-                    "Frame {}: {} unique textures in {} vertices, {} draw calls, cache has {} textures",
-                    frame, unique_slots.len(), self.vertex_batch.vertex_count(),
-                    draw_calls.len(), app.texture_cache.texture_count()
-                );
-            }
-        }
-
-        let t_resolve_done = std::time::Instant::now();
-
-        log::trace!(
-            "buffer_swap: {} draw calls, {} vertices",
-            draw_calls.len(),
-            self.vertex_batch.vertex_count()
-        );
-
-        let vertex_count = self.vertex_batch.vertex_count();
-        let vertex_data = self.vertex_batch.as_bytes().to_vec();
-        let t_copy_done = std::time::Instant::now();
-        let clear_r = self.state.clear_r;
-        let clear_g = self.state.clear_g;
-        let clear_b = self.state.clear_b;
-        let clear_a = self.state.clear_a;
-        let clear_depth = self.state.clear_depth;
-        let screen_width = self.state.screen_width;
-        let screen_height = self.state.screen_height;
-        let viewport_x = self.state.viewport_x;
-        let viewport_y = self.state.viewport_y;
-        let viewport_width = self.state.viewport_width;
-        let viewport_height = self.state.viewport_height;
-
-        // Capture chromakey color (enabled state is now per-draw-call)
-        let (ck_r, ck_g, ck_b, _) = self
-            .state
-            .chromakey_value
-            .to_rgba_f(self.state.color_format);
-
-        // Capture fog state
-        let fog_mode = self.state.fog_mode as i32;
-        let (fog_r, fog_g, fog_b, _) = self
-            .state
-            .fog_color
-            .to_rgba_f(self.state.color_format);
-
-        if let Some(app) = &mut self.vulkan_app {
-            unsafe {
-                // Wait for this frame-in-flight slot to be available
-                let t_fence = std::time::Instant::now();
-                let frame = app.current_frame;
-                app.device
-                    .wait_for_fences(&[app.in_flight_fences[frame]], true, u64::MAX)
-                    .expect("Failed to wait for fence");
-                let t_fence_done = std::time::Instant::now();
-
-                // Flush deferred texture/descriptor destruction now that this
-                // frame slot's GPU work is complete
-                app.texture_cache.flush_pending_destroy(&app.device);
-
-                // Evict unused textures — must happen after fence wait so no
-                // in-flight frame in THIS slot is still referencing them.
-                // Wait for ALL slots to ensure the other slot is also done.
-                if app.texture_cache.needs_eviction() {
-                    for fence in &app.in_flight_fences {
-                        let _ = app.device.wait_for_fences(&[*fence], true, u64::MAX);
-                    }
-                    app.texture_cache
-                        .evict_if_needed(&app.device, &needed_textures);
-                }
-
-                // Acquire next swapchain image with retry loop for NOT_READY
-                let image_index: u32 = loop {
-                    match app.swapchain_loader.acquire_next_image(
-                        app.swapchain,
-                        u64::MAX,
-                        app.image_available_semaphores[frame],
-                        vk::Fence::null(),
-                    ) {
-                        Ok((idx, suboptimal)) => {
-                            app.current_image_index = idx;
-                            if suboptimal {
-                                self.is_framebuffer_resized = true;
-                            }
-                            break idx;
-                        }
-                        Err(vk::Result::NOT_READY) => {
-                            // Image not ready yet, wait a bit and retry
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                            continue;
-                        }
-                        Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                            self.is_framebuffer_resized = true;
-                            return Some(());
-                        }
-                        Err(e) => panic!("Failed to acquire next image: {:?}", e),
-                    }
-                };
-                app.device
-                    .reset_fences(&[app.in_flight_fences[frame]])
-                    .expect("Failed to reset fence");
-
-                // Upload vertex data to this frame's vertex buffer
-                let t_upload = std::time::Instant::now();
-                if vertex_count > 0 {
-                    utility::vertex::upload_to_buffer(
-                        &app.device,
-                        &app.vertex_buffers[frame],
-                        &vertex_data,
-                    );
-                }
-                let t_upload_done = std::time::Instant::now();
-
-                // Record command buffer for this frame
-                let cmd = app.command_buffers[image_index as usize];
-                let t_record = std::time::Instant::now();
-
-                // Reset and begin command buffer
-                app.device
-                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
-                    .expect("Failed to reset command buffer");
-
-                let begin_info = vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-                app.device
-                    .begin_command_buffer(cmd, &begin_info)
-                    .expect("Failed to begin command buffer");
-
-                // Begin render pass with clear values
-                let clear_values = [
-                    vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [clear_r, clear_g, clear_b, clear_a],
-                        },
-                    },
-                    vk::ClearValue {
-                        depth_stencil: vk::ClearDepthStencilValue {
-                            depth: clear_depth,
-                            stencil: 0,
-                        },
-                    },
-                ];
-
-                let render_pass_info = vk::RenderPassBeginInfo::default()
-                    .render_pass(app.render_pass)
-                    .framebuffer(app.swapchain_framebuffers[image_index as usize])
-                    .render_area(vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: app.swapchain_extent,
-                    })
-                    .clear_values(&clear_values);
-
-                app.device.cmd_begin_render_pass(
-                    cmd,
-                    &render_pass_info,
-                    vk::SubpassContents::INLINE,
-                );
-
-                // Bind initial pipeline (will switch per draw call if blend mode changes)
-                let default_pipeline = app.graphics_pipelines[&utility::vertex::BlendMode::Opaque];
-                app.device.cmd_bind_pipeline(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    default_pipeline,
-                );
-                let mut current_blend_mode = utility::vertex::BlendMode::Opaque;
-
-                // Set viewport and scissor
-                let viewport = vk::Viewport {
-                    x: viewport_x as f32,
-                    y: viewport_y as f32,
-                    width: viewport_width as f32,
-                    height: viewport_height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                };
-                app.device.cmd_set_viewport(cmd, 0, &[viewport]);
-
-                let scissor = vk::Rect2D {
-                    offset: vk::Offset2D {
-                        x: viewport_x as i32,
-                        y: viewport_y as i32,
-                    },
-                    extent: vk::Extent2D {
-                        width: viewport_width,
-                        height: viewport_height,
-                    },
-                };
-                app.device.cmd_set_scissor(cmd, 0, &[scissor]);
-
-                // Draw triangles if we have any
-                if vertex_count > 0 && !draw_calls.is_empty() {
-                    {
-                        // Bind this frame's vertex buffer
-                        app.device.cmd_bind_vertex_buffers(
-                            cmd,
-                            0,
-                            &[app.vertex_buffers[frame].buffer],
-                            &[0],
-                        );
-
-                        // Bind the single shared descriptor set ONCE (texture selection is per-vertex)
-                        let descriptor_set = app.texture_cache.get_descriptor_set();
-                        app.device.cmd_bind_descriptor_sets(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            app.pipeline_layout,
-                            0,
-                            &[descriptor_set],
-                            &[],
-                        );
-
-                        // Track previous state to skip redundant GPU commands
-                        let mut prev_push_bytes: [u8; 96] = [0; 96];
-                        let mut first_draw = true;
-
-                        // Issue draw calls (only break on blend_mode/chromakey changes)
-                        for draw_call in &draw_calls {
-                            // Switch pipeline if blend mode changed
-                            if draw_call.blend_mode != current_blend_mode {
-                                if let Some(&pipeline) = app.graphics_pipelines.get(&draw_call.blend_mode) {
-                                    app.device.cmd_bind_pipeline(
-                                        cmd,
-                                        vk::PipelineBindPoint::GRAPHICS,
-                                        pipeline,
-                                    );
-                                    current_blend_mode = draw_call.blend_mode;
-                                }
-                            }
-
-                            // Build push constants (no texture_size -- computed in shader)
-                            let gamma = crate::api::current_gamma_rgb();
-                            let push_constants = utility::vertex::PushConstants {
-                                screen_size: [screen_width as f32, screen_height as f32],
-                                chromakey_r: ck_r,
-                                chromakey_g: ck_g,
-                                chromakey_b: ck_b,
-                                fog_mode,
-                                fog_color_r: fog_r,
-                                fog_color_g: fog_g,
-                                fog_color_b: fog_b,
-                                gamma_r: gamma[0],
-                                gamma_g: gamma[1],
-                                gamma_b: gamma[2],
-                            };
-
-                            // Only push constants if they changed
-                            let push_data = std::slice::from_raw_parts(
-                                &push_constants as *const _ as *const u8,
-                                std::mem::size_of::<utility::vertex::PushConstants>(),
-                            );
-                            if first_draw || push_data != &prev_push_bytes[..push_data.len()] {
-                                app.device.cmd_push_constants(
-                                    cmd,
-                                    app.pipeline_layout,
-                                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                                    0,
-                                    push_data,
-                                );
-                                prev_push_bytes[..push_data.len()].copy_from_slice(push_data);
-                            }
-
-                            first_draw = false;
-
-                            // Draw this batch
-                            app.device.cmd_draw(
-                                cmd,
-                                draw_call.vertex_count,
-                                1,
-                                draw_call.start_vertex,
-                                0,
-                            );
-                            log::trace!(
-                                "buffer_swap: drew {} vertices",
-                                draw_call.vertex_count,
-                            );
-                        }
-                        log::trace!("buffer_swap: completed {} draw calls", draw_calls.len());
-                    }
-                }
-
-                // Draw FPS counter overlay if enabled
-                if self.config.render.fps != config::FpsPosition::Off {
-                    self.fps_counter.frame_count += 1;
-                    let now = std::time::Instant::now();
-                    let elapsed = now.duration_since(self.fps_counter.last_time);
-                    if elapsed.as_secs_f32() >= 1.0 {
-                        self.fps_counter.display_fps = (self.fps_counter.frame_count as f32
-                            / elapsed.as_secs_f32())
-                            as u32;
-                        self.fps_counter.frame_count = 0;
-                        self.fps_counter.last_time = now;
-                    }
-
-                    let fps = self.fps_counter.display_fps;
-                    if fps > 0 {
-                        let sw = screen_width as f32;
-                        let sh = screen_height as f32;
-                        let digits = fps_digits(fps);
-                        let digit_w = 6.0;
-                        let digit_h = 10.0;
-                        let padding = 2.0;
-                        let total_w =
-                            digits.len() as f32 * (digit_w + padding) - padding + padding * 2.0;
-
-                        let (start_x, start_y) = match self.config.render.fps {
-                            config::FpsPosition::TopLeft => (padding, padding),
-                            config::FpsPosition::TopRight => (sw - total_w - padding, padding),
-                            config::FpsPosition::BottomLeft => (padding, sh - digit_h - padding * 3.0),
-                            config::FpsPosition::BottomRight => {
-                                (sw - total_w - padding, sh - digit_h - padding * 3.0)
-                            }
-                            config::FpsPosition::Off => unreachable!(),
-                        };
-
-                        // Build FPS overlay vertices
-                        let mut fps_vertices = Vec::new();
-                        // Background quad
-                        let bg_x1 = start_x - padding;
-                        let bg_y1 = start_y - padding;
-                        let bg_x2 = start_x + total_w;
-                        let bg_y2 = start_y + digit_h + padding;
-                        push_quad(
-                            &mut fps_vertices,
-                            bg_x1, bg_y1, bg_x2, bg_y2,
-                            [0.0, 0.0, 0.0, 0.6],
-                        );
-                        // Digit quads (7-segment)
-                        let mut cx = start_x;
-                        for &d in &digits {
-                            draw_7seg_digit(
-                                &mut fps_vertices,
-                                cx, start_y, digit_w, digit_h, d,
-                                [0.0, 1.0, 0.0, 1.0],
-                            );
-                            cx += digit_w + padding;
-                        }
-
-                        // Upload FPS vertices to current frame's buffer (appended after game vertices)
-                        let fps_start = vertex_count as u32;
-                        let fps_count = fps_vertices.len() as u32;
-                        let fps_bytes: &[u8] = unsafe {
-                            std::slice::from_raw_parts(
-                                fps_vertices.as_ptr() as *const u8,
-                                fps_vertices.len()
-                                    * std::mem::size_of::<utility::vertex::GpuVertex>(),
-                            )
-                        };
-                        let offset = vertex_count
-                            * std::mem::size_of::<utility::vertex::GpuVertex>();
-                        let vb = &app.vertex_buffers[frame];
-                        if offset + fps_bytes.len() <= vb.size as usize {
-                            let data_ptr = app.device.map_memory(
-                                vb.memory,
-                                offset as vk::DeviceSize,
-                                fps_bytes.len() as vk::DeviceSize,
-                                vk::MemoryMapFlags::empty(),
-                            ).expect("Failed to map memory for FPS overlay");
-                            std::ptr::copy_nonoverlapping(
-                                fps_bytes.as_ptr(),
-                                data_ptr as *mut u8,
-                                fps_bytes.len(),
-                            );
-                            app.device.unmap_memory(vb.memory);
-
-                            // Draw with CF_LOCAL (vertex color only), alpha blend, placeholder texture
-                            let fps_push = utility::vertex::PushConstants {
-                                screen_size: [sw, sh],
-                                chromakey_r: 0.0,
-                                chromakey_g: 0.0,
-                                chromakey_b: 0.0,
-                                fog_mode: 0,
-                                fog_color_r: 0.0,
-                                fog_color_g: 0.0,
-                                fog_color_b: 0.0,
-                                gamma_r: 1.0,
-                                gamma_g: 1.0,
-                                gamma_b: 1.0,
-                            };
-                            let fps_push_data = std::slice::from_raw_parts(
-                                &fps_push as *const _ as *const u8,
-                                std::mem::size_of::<utility::vertex::PushConstants>(),
-                            );
-                            app.device.cmd_push_constants(
-                                cmd,
-                                app.pipeline_layout,
-                                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                                0,
-                                fps_push_data,
-                            );
-
-                            // Switch to alpha blend pipeline for transparent background
-                            let blend_pipeline =
-                                app.graphics_pipelines[&utility::vertex::BlendMode::AlphaBlend];
-                            app.device.cmd_bind_pipeline(
-                                cmd,
-                                vk::PipelineBindPoint::GRAPHICS,
-                                blend_pipeline,
-                            );
-
-                            // Descriptor set already bound (shared set, texture_index=0 is placeholder)
-
-                            app.device.cmd_draw(cmd, fps_count, 1, fps_start, 0);
-                        }
-                    }
-                }
-
-                // End render pass and command buffer
-                app.device.cmd_end_render_pass(cmd);
-                app.device
-                    .end_command_buffer(cmd)
-                    .expect("Failed to end command buffer");
-                let t_record_done = std::time::Instant::now();
-
-                // Submit command buffer
-                let wait_semaphores = [app.image_available_semaphores[frame]];
-                let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-                let signal_semaphores = [app.render_finished_semaphores[image_index as usize]];
-                let command_buffers = [cmd];
-
-                let submit_info = vk::SubmitInfo::default()
-                    .wait_semaphores(&wait_semaphores)
-                    .wait_dst_stage_mask(&wait_stages)
-                    .command_buffers(&command_buffers)
-                    .signal_semaphores(&signal_semaphores);
-
-                let t_submit = std::time::Instant::now();
-                app.device
-                    .queue_submit(app.graphics_queue, &[submit_info], app.in_flight_fences[frame])
-                    .expect("Failed to submit draw command buffer");
-                let t_submit_done = std::time::Instant::now();
-
-                // Present the image
-                let swapchains = [app.swapchain];
-                let image_indices = [image_index];
-                let present_info = vk::PresentInfoKHR::default()
-                    .wait_semaphores(&signal_semaphores)
-                    .swapchains(&swapchains)
-                    .image_indices(&image_indices);
-
-                let t_present = std::time::Instant::now();
-                match app
-                    .swapchain_loader
-                    .queue_present(app.present_queue, &present_info)
-                {
-                    Ok(suboptimal) => {
-                        if suboptimal {
-                            self.is_framebuffer_resized = true;
-                        }
-                    }
-                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                        self.is_framebuffer_resized = true;
-                    }
-                    Err(error) => panic!("Failed to present: {:?}", error),
-                }
-                let t_present_done = std::time::Instant::now();
-
-                app.last_presented_image_index = image_index;
-
-                // Advance to next frame-in-flight slot
-                app.current_frame = (app.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
-
-                let resolve_ms = t_resolve_done.duration_since(t_resolve).as_secs_f64() * 1000.0;
-                let copy_ms = t_copy_done.duration_since(t_resolve_done).as_secs_f64() * 1000.0;
-                let fence_ms = t_fence_done.duration_since(t_fence).as_secs_f64() * 1000.0;
-                let upload_ms = t_upload_done.duration_since(t_upload).as_secs_f64() * 1000.0;
-                let record_ms = t_record_done.duration_since(t_record).as_secs_f64() * 1000.0;
-                let submit_ms = t_submit_done.duration_since(t_submit).as_secs_f64() * 1000.0;
-                let present_ms = t_present_done.duration_since(t_present).as_secs_f64() * 1000.0;
-                let total_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
-                if total_ms > 18.0 {
-                    log::warn!("Frame timing: resolve={:.1}ms copy={:.1}ms fence={:.1}ms upload={:.1}ms record={:.1}ms submit={:.1}ms present={:.1}ms total={:.1}ms",
-                        resolve_ms, copy_ms, fence_ms, upload_ms, record_ms, submit_ms, present_ms, total_ms);
-                }
-            }
-            Some(())
-        } else {
-            log::error!("Vulkan application is not initialized. Cannot swap buffers.");
-            None
-        }
-    }
-
-    /// Buffer swap for LFB write case - image already acquired and written, just present
-    fn buffer_swap_lfb(&mut self) -> Option<()> {
-        if let Some(app) = &mut self.vulkan_app {
-            unsafe {
-                let image_index = app.current_image_index;
-                log::trace!(
-                    "buffer_swap_lfb: presenting LFB-written image {}",
-                    image_index
-                );
-
-                // Wait for the image_available semaphore (from acquire in lfb_upload)
-                // and present directly
-                let frame = app.current_frame;
-                let wait_semaphores = [app.image_available_semaphores[frame]];
-                let swapchains = [app.swapchain];
-                let image_indices = [image_index];
-                let present_info = vk::PresentInfoKHR::default()
-                    .wait_semaphores(&wait_semaphores)
-                    .swapchains(&swapchains)
-                    .image_indices(&image_indices);
-
-                match app
-                    .swapchain_loader
-                    .queue_present(app.present_queue, &present_info)
-                {
-                    Ok(suboptimal) => {
-                        if suboptimal {
-                            self.is_framebuffer_resized = true;
-                        }
-                    }
-                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                        self.is_framebuffer_resized = true;
-                    }
-                    Err(error) => panic!("Failed to present LFB image: {:?}", error),
-                }
-
-                app.last_presented_image_index = image_index;
-
-                // Wait for present to complete so next frame's fence wait doesn't hang
-                app.device
-                    .queue_wait_idle(app.present_queue)
-                    .expect("Failed to wait for present queue");
-
-                // Advance to next frame-in-flight slot
-                app.current_frame = (app.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
-            }
-            Some(())
-        } else {
-            log::error!("Vulkan application is not initialized. Cannot swap buffers.");
-            None
-        }
+        self.finish();
+        self.draw_fps_overlay();
+        let app = self.vulkan_app.as_ref()?;
+        app.framebuffer.as_ref()?.copy_front(app);
+        self.present_front()
     }
 
     /*
@@ -1867,36 +1363,37 @@ impl Gr {
         should mask off writes to the buffer using grDepthMask and/or grColorMask as appropriate.
     */
     pub fn buffer_clear(&mut self, color: Color, _alpha: Alpha, depth: FxU32) -> Option<()> {
-        // Convert color to RGBA float values based on the current color format
-        let (r, g, b, _a) = color.to_rgba_f(self.state.color_format);
-        let a = 1.0; // Alpha is ignored as per the description
-
-        // Normalize depth value to Vulkan's [0.0, 1.0] range
-        // In Glide, 0xFFFF = "farthest" to allow all fragments to pass initially
-        // Our shader inverts oow so: depth = 1.0 - oow, meaning closer = smaller depth
-        // Clearing to 1.0 (farthest in Vulkan) allows LESS_OR_EQUAL to pass all fragments initially
-        let normalized_depth = (depth as f32) / 65535.0;
-
-        // Store clear values in state for use in buffer_swap
-        self.state.clear_r = r;
-        self.state.clear_g = g;
-        self.state.clear_b = b;
-        self.state.clear_a = a;
-        self.state.clear_depth = normalized_depth;
-
-        // Clear the vertex batch and frame texture set for the new frame
-        self.vertex_batch.clear();
-        self.frame_textures.clear();
-
-        log::trace!(
-            "Buffer clear values set: color=[{}, {}, {}, {}], depth={}",
-            r,
-            g,
-            b,
-            a,
-            normalized_depth
+        self.finish();
+        if self.vulkan_app.is_none() {
+            return None;
+        }
+        let mut pipeline = self.pipeline_state();
+        pipeline.depth_test = false;
+        pipeline.depth_write = false;
+        pipeline.blend = [1, 0, 1, 0];
+        let mut vertices = Vec::new();
+        // vkCmdClearAttachments has no per-channel mask. A solid quad handles masked color clears.
+        if pipeline.color_mask != 0 && pipeline.color_mask != 15 {
+            let (r, g, b, _) = color.to_rgba_f(self.state.color_format);
+            push_quad(
+                &mut vertices,
+                0.0,
+                0.0,
+                self.state.screen_width as f32,
+                self.state.screen_height as f32,
+                [r, g, b, _alpha.to_f32()],
+            );
+        }
+        let mut push = self.push_constants();
+        push.fog_mode = 0;
+        push.alpha_test = CmpFnc::Always as u32;
+        self.render_vertices(
+            &vertices,
+            pipeline,
+            push,
+            self.clip_rect(),
+            Some((color, _alpha, depth)),
         );
-
         Some(())
     }
 
@@ -1916,7 +1413,7 @@ impl Gr {
 
     /// grDepthMask - enable/disable writes to the depth buffer
     pub fn depth_mask(&mut self, mask: FxBool) {
-        self.state.depth_mask = mask == FxBool::True;
+        self.state.depth_mask = mask.is_true();
         log::debug!("Depth mask set to: {}", self.state.depth_mask);
     }
 
@@ -1930,8 +1427,8 @@ impl Gr {
 
     /// grColorMask - enable/disable writing to the color and alpha buffers
     pub fn color_mask(&mut self, rgb: FxBool, alpha: FxBool) {
-        self.state.color_mask_rgb = rgb == FxBool::True;
-        self.state.color_mask_alpha = alpha == FxBool::True;
+        self.state.color_mask_rgb = rgb.is_true();
+        self.state.color_mask_alpha = alpha.is_true();
         log::debug!(
             "Color mask set to RGB: {}, Alpha: {}",
             self.state.color_mask_rgb,
@@ -1953,25 +1450,6 @@ impl Gr {
         self.state.alpha_blend_rgb_dst = rgb_df;
         self.state.alpha_blend_alpha_src = alpha_sf;
         self.state.alpha_blend_alpha_dst = alpha_df;
-
-        // Map Glide blend args to a pipeline blend mode
-        let blend_mode = match (rgb_sf, rgb_df) {
-            (AlphaBlendFnc::One, AlphaBlendFnc::Zero) => utility::vertex::BlendMode::Opaque,
-            (AlphaBlendFnc::One, AlphaBlendFnc::One) => utility::vertex::BlendMode::Additive,
-            (AlphaBlendFnc::Zero, AlphaBlendFnc::SrcColor) => utility::vertex::BlendMode::Multiplicative,
-            (AlphaBlendFnc::SrcAlpha, AlphaBlendFnc::OneMinusSrcAlpha) => utility::vertex::BlendMode::AlphaBlend,
-            _ => utility::vertex::BlendMode::AlphaBlend, // fallback
-        };
-        self.vertex_batch.set_blend_mode(blend_mode);
-
-        log::debug!(
-            "Alpha blend function set to: RGB({:?}, {:?}), Alpha({:?}, {:?}) → {:?}",
-            rgb_sf,
-            rgb_df,
-            alpha_sf,
-            alpha_df,
-            blend_mode
-        );
     }
 
     // ==================== Cull Mode Functions ====================
@@ -1986,6 +1464,7 @@ impl Gr {
 
     /// grRenderBuffer - select the buffer to render to
     pub fn render_buffer(&mut self, buffer: Buffer) {
+        self.finish();
         self.state.render_buffer = buffer;
         log::debug!("Render buffer set to: {:?}", buffer);
     }
@@ -2027,10 +1506,14 @@ impl Gr {
         self.state.color_combine_factor = factor;
         self.state.color_combine_local = local;
         self.state.color_combine_other = other;
-        self.state.color_combine_invert = invert == FxBool::True;
+        self.state.color_combine_invert = invert.is_true();
         log::trace!(
             "Color combine: function={:?}, factor={:?}, local={:?}, other={:?}, invert={:?}",
-            function, factor, local, other, invert
+            function,
+            factor,
+            local,
+            other,
+            invert
         );
     }
 
@@ -2047,25 +1530,42 @@ impl Gr {
         self.state.alpha_combine_factor = factor;
         self.state.alpha_combine_local = local;
         self.state.alpha_combine_other = other;
-        self.state.alpha_combine_invert = invert == FxBool::True;
+        self.state.alpha_combine_invert = invert.is_true();
         log::trace!(
             "Alpha combine: function={:?}, factor={:?}, local={:?}, other={:?}, invert={:?}",
-            function, factor, local, other, invert
+            function,
+            factor,
+            local,
+            other,
+            invert
         );
     }
 
     /// Pack current combine state into a u32 for per-vertex storage
     fn current_combine_flags(&self) -> u32 {
-        let ccf = self.state.color_combine_function as u32 & 0x1F;
-        let acf = (self.state.alpha_combine_function as u32 & 0x1F) << 5;
+        let ccf = self.state.color_combine_function.0 as u32 & 0x1F;
+        let acf = (self.state.alpha_combine_function.0 as u32 & 0x1F) << 5;
         let ccfr = (self.state.color_combine_factor as u32 & 0xF) << 10;
         let acfr = (self.state.alpha_combine_factor as u32 & 0xF) << 14;
         let cco = (self.state.color_combine_other as u32 & 0x3) << 18;
         let acl = (self.state.alpha_combine_local as u32 & 0x3) << 20;
         let ccl = (self.state.color_combine_local as u32 & 0x3) << 22;
         let aco = (self.state.alpha_combine_other as u32 & 0x3) << 24;
-        let ck = if matches!(self.state.chromakey_mode, ChromakeyMode::Enable) { 1u32 << 26 } else { 0 };
-        ccf | acf | ccfr | acfr | cco | acl | ccl | aco | ck
+        let ck = if matches!(self.state.chromakey_mode, ChromakeyMode::Enable) {
+            1u32 << 26
+        } else {
+            0
+        };
+        ccf | acf
+            | ccfr
+            | acfr
+            | cco
+            | acl
+            | ccl
+            | aco
+            | ck
+            | ((self.state.color_combine_invert as u32) << 27)
+            | ((self.state.alpha_combine_invert as u32) << 28)
     }
 
     /// Get the current constant color as normalized RGBA floats
@@ -2155,149 +1655,6 @@ impl Gr {
 
     // ==================== Texture Functions ====================
 
-    /// Ensure the active texture for a TMU is uploaded to Vulkan
-    /// Returns the texture address if texturing is enabled, or 0 if not
-    fn ensure_texture_uploaded(&mut self, tmu_idx: usize) -> u32 {
-        let tex_addr = self.state.tex_source[tmu_idx];
-        if tex_addr == 0 {
-            return 0;
-        }
-
-        // Check if texture is already in Vulkan cache
-        let needs_upload = self
-            .vulkan_app
-            .as_ref()
-            .map(|app| !app.texture_cache.has_texture(tex_addr))
-            .unwrap_or(false);
-
-        if needs_upload {
-            // Get texture data from CPU memory (clone to avoid borrow issues)
-            let texture_info = self.texture_memory[tmu_idx]
-                .get_texture(tex_addr)
-                .map(|t| (t.width, t.height, t.format, t.data.clone()));
-
-            let palette_entries = self.texture_memory[tmu_idx]
-                .get_palette(0)
-                .map(|p| p.entries.clone());
-
-            if texture_info.is_none() {
-                log::warn!(
-                    "Texture {:#x} not found in CPU memory for TMU{} (using placeholder)",
-                    tex_addr,
-                    tmu_idx
-                );
-            }
-
-            if let (Some((width, height, format, data)), Some(app)) =
-                (texture_info, &mut self.vulkan_app)
-            {
-                log::trace!(
-                    "Uploading texture {:#x} to Vulkan ({}x{}, {:?})",
-                    tex_addr,
-                    width,
-                    height,
-                    format
-                );
-
-                // Create temporary TextureData and PaletteTable for upload
-                let texture_data = utility::texture::TextureData::new(width, height, format, data);
-                let palette =
-                    palette_entries.map(|entries| utility::texture::PaletteTable { entries });
-
-                app.texture_cache.upload_texture(
-                    &app.device,
-                    &self.vulkan_instance.instance,
-                    app.physical_device,
-                    app.command_pool,
-                    app.graphics_queue,
-                    tex_addr,
-                    &texture_data,
-                    palette.as_ref(),
-                );
-            }
-        }
-        tex_addr
-    }
-
-    /// Ensure a texture is uploaded to Vulkan by searching all TMUs for it
-    fn ensure_texture_uploaded_by_addr(&mut self, tex_addr: u32) {
-        if tex_addr == 0 {
-            return;
-        }
-
-        // Check if texture is already in Vulkan cache
-        let needs_upload = self
-            .vulkan_app
-            .as_ref()
-            .map(|app| !app.texture_cache.has_texture(tex_addr))
-            .unwrap_or(false);
-
-        if !needs_upload {
-            return;
-        }
-
-        // Search all TMUs for this texture address
-        let mut texture_info = None;
-        let mut palette_entries = None;
-
-        for tmu_idx in 0..GLIDE_NUM_TMU {
-            if let Some(tex) = self.texture_memory[tmu_idx].get_texture(tex_addr) {
-                texture_info = Some((tex.width, tex.height, tex.format, tex.data.clone()));
-                palette_entries = self.texture_memory[tmu_idx]
-                    .get_palette(0)
-                    .map(|p| p.entries.clone());
-                break;
-            }
-        }
-
-        if texture_info.is_none() {
-            log::warn!(
-                "Texture {:#x} not found in CPU memory for any TMU - will use placeholder",
-                tex_addr
-            );
-            return;
-        }
-
-        // Validate texture dimensions before upload
-        if let Some((width, height, _, _)) = &texture_info {
-            if *width == 0 || *height == 0 {
-                log::trace!(
-                    "Texture {:#x} has invalid dimensions ({}x{}), skipping",
-                    tex_addr,
-                    width,
-                    height
-                );
-                return;
-            }
-        }
-
-        if let (Some((width, height, format, data)), Some(app)) =
-            (texture_info, &mut self.vulkan_app)
-        {
-            log::trace!(
-                "Uploading texture {:#x} to Vulkan ({}x{}, {:?})",
-                tex_addr,
-                width,
-                height,
-                format
-            );
-
-            let texture_data = utility::texture::TextureData::new(width, height, format, data);
-            let palette = palette_entries.map(|entries| utility::texture::PaletteTable { entries });
-
-            app.texture_cache.upload_texture(
-                &app.device,
-                &self.vulkan_instance.instance,
-                app.physical_device,
-                app.command_pool,
-                app.graphics_queue,
-                tex_addr,
-                &texture_data,
-                palette.as_ref(),
-            );
-        }
-    }
-
     /// grTexSource - specify the current texture source for rendering
     pub fn tex_source(
         &mut self,
@@ -2306,8 +1663,8 @@ impl Gr {
         even_odd: FxU32,
         info: &TexInfo,
     ) {
-        let tmu_idx = tmu as usize;
-        if tmu_idx < GLIDE_NUM_TMU {
+        let tmu_idx = tmu.0 as usize;
+        if tmu_idx < GLIDE_NUM_TMU && info.is_valid() && even_odd & 3 != 0 {
             self.state.tex_source[tmu_idx] = start_address;
             log::trace!(
                 "Texture source set for TMU{}: addr={:#x}, even_odd={}, format={:?}",
@@ -2326,7 +1683,7 @@ impl Gr {
         min_filter: TextureFilterMode,
         mag_filter: TextureFilterMode,
     ) {
-        let tmu_idx = tmu as usize;
+        let tmu_idx = tmu.0 as usize;
         if tmu_idx < GLIDE_NUM_TMU {
             self.state.tex_filter_mode_min[tmu_idx] = min_filter;
             self.state.tex_filter_mode_mag[tmu_idx] = mag_filter;
@@ -2346,7 +1703,7 @@ impl Gr {
         s_clamp: TextureClampMode,
         t_clamp: TextureClampMode,
     ) {
-        let tmu_idx = tmu as usize;
+        let tmu_idx = tmu.0 as usize;
         if tmu_idx < GLIDE_NUM_TMU {
             self.state.tex_clamp_mode_s[tmu_idx] = s_clamp;
             self.state.tex_clamp_mode_t[tmu_idx] = t_clamp;
@@ -2361,7 +1718,7 @@ impl Gr {
 
     /// grTexMipMapMode - set mipmap mode
     pub fn tex_mipmap_mode(&mut self, tmu: ChipID, mode: MipMapMode, lod_blending: FxBool) {
-        let tmu_idx = tmu as usize;
+        let tmu_idx = tmu.0 as usize;
         if tmu_idx < GLIDE_NUM_TMU {
             self.state.tex_mipmap_mode[tmu_idx] = mode;
             log::debug!(
@@ -2375,7 +1732,7 @@ impl Gr {
 
     /// grTexLodBiasValue - set LOD bias value
     pub fn tex_lod_bias_value(&mut self, tmu: ChipID, bias: f32) {
-        let tmu_idx = tmu as usize;
+        let tmu_idx = tmu.0 as usize;
         if tmu_idx < GLIDE_NUM_TMU {
             self.state.tex_lod_bias[tmu_idx] = bias;
             log::debug!("Texture LOD bias set for TMU{}: {}", tmu_idx, bias);
@@ -2386,17 +1743,21 @@ impl Gr {
     pub fn tex_combine(
         &mut self,
         tmu: ChipID,
-        rgb_function: TextureCombineFnc,
+        rgb_function: CombineFunction,
         rgb_factor: CombineFactor,
-        alpha_function: TextureCombineFnc,
+        alpha_function: CombineFunction,
         alpha_factor: CombineFactor,
         rgb_invert: FxBool,
         alpha_invert: FxBool,
     ) {
-        let tmu_idx = tmu as usize;
+        let tmu_idx = tmu.0 as usize;
         if tmu_idx < GLIDE_NUM_TMU {
             self.state.tex_combine_function[tmu_idx] = rgb_function;
             self.state.tex_combine_factor[tmu_idx] = rgb_factor;
+            self.state.tex_combine_alpha_function[tmu_idx] = alpha_function;
+            self.state.tex_combine_alpha_factor[tmu_idx] = alpha_factor;
+            self.state.tex_combine_rgb_invert[tmu_idx] = rgb_invert.is_true();
+            self.state.tex_combine_alpha_invert[tmu_idx] = alpha_invert.is_true();
             log::debug!(
                 "Texture combine set for TMU{}: rgb_func={:?}, rgb_factor={:?}, alpha_func={:?}, alpha_factor={:?}, rgb_invert={:?}, alpha_invert={:?}",
                 tmu_idx, rgb_function, rgb_factor, alpha_function, alpha_factor, rgb_invert, alpha_invert
@@ -2414,7 +1775,7 @@ impl Gr {
     /// Reference: docs/glide3x/cvg/glide3/src/ditex.c
     /// Returns total_mem - 8 (last 8 bytes are reserved)
     pub fn tex_max_address(&self, tmu: ChipID) -> FxU32 {
-        let tmu_idx = tmu as usize;
+        let tmu_idx = tmu.0 as usize;
         if tmu_idx < GLIDE_NUM_TMU {
             (self.texture_memory[tmu_idx].memory_available() as FxU32).saturating_sub(8)
         } else {
@@ -2424,14 +1785,13 @@ impl Gr {
 
     /// grTexTextureMemRequired - return bytes required for texture
     pub fn tex_texture_mem_required(&self, even_odd: FxU32, info: &TexInfo) -> FxU32 {
-        let _ = even_odd;
-        info.get_size() as FxU32
+        info.get_size_mask(even_odd) as FxU32
     }
 
     /// Get texture memory size for a TMU (in bytes)
     /// GlideVK extension - not part of original Glide API
     pub fn get_texture_memory_size(&self, tmu: ChipID) -> usize {
-        let tmu_idx = tmu as usize;
+        let tmu_idx = tmu.0 as usize;
         if tmu_idx < GLIDE_NUM_TMU {
             self.texture_memory[tmu_idx].memory_available()
         } else {
@@ -2443,7 +1803,7 @@ impl Gr {
     /// GlideVK extension - not part of original Glide API
     /// Common values: 2MB (0x200000), 4MB (0x400000), 8MB (0x800000)
     pub fn set_texture_memory_size(&mut self, tmu: ChipID, size: usize) {
-        let tmu_idx = tmu as usize;
+        let tmu_idx = tmu.0 as usize;
         if tmu_idx < GLIDE_NUM_TMU {
             self.texture_memory[tmu_idx].set_max_memory(size);
             log::info!(
@@ -2611,177 +1971,120 @@ impl Gr {
         }
     }
 
-    /// grTexDownloadMipMap - download texture mipmap to TMU memory
     pub fn tex_download_mipmap(
         &mut self,
         tmu: ChipID,
-        start_address: FxU32,
-        _even_odd: FxU32,
+        address: FxU32,
+        even_odd: FxU32,
         info: &TexInfo,
     ) {
-        let tmu_idx = tmu as usize;
-        if tmu_idx >= GLIDE_NUM_TMU {
+        let data = unsafe { info.get_data() };
+        let levels = info.levels();
+        let Some(&(large_lod, _, _)) = levels.first() else {
             return;
+        };
+        let mut offset = 0;
+        for (lod, width, height) in levels {
+            let size = width * height * info.format().bytes_per_pixel();
+            if offset + size > data.len() {
+                return;
+            }
+            if even_odd & (1 << (lod as u32 & 1)) != 0 {
+                self.tex_download_mipmap_level(
+                    tmu,
+                    address,
+                    lod,
+                    large_lod,
+                    info.aspect_ratio(),
+                    info.format(),
+                    even_odd,
+                    data[offset..].as_ptr().cast(),
+                );
+            }
+            offset += size;
         }
-
-        let (width, height) = info.get_dimensions();
-        let _size = info.get_size();
-        let format = info.format();
-
-        log::trace!(
-            "tex_download_mipmap: addr={:#x}, {}x{}, format={:?}, raw={}",
-            start_address,
-            width,
-            height,
-            format,
-            info.debug_raw_values()
-        );
-
-        // Copy texture data from the TexInfo
-        let data = unsafe { info.get_data() }.to_vec();
-
-        // Invalidate any existing Vulkan texture at this address (content may have changed)
-        if let Some(app) = &mut self.vulkan_app {
-            app.texture_cache
-                .invalidate_texture(&app.device, start_address);
-        }
-
-        // Store texture in texture memory
-        let texture = utility::texture::TextureData::new(width as u32, height as u32, format, data);
-        self.texture_memory[tmu_idx].store_texture(start_address, texture);
-
-        // Update current texture source
-        self.state.tex_source[tmu_idx] = start_address;
     }
 
-    /// grTexDownloadMipMapLevel - download a single mipmap level
     pub fn tex_download_mipmap_level(
         &mut self,
         tmu: ChipID,
-        start_address: FxU32,
+        address: FxU32,
         this_lod: LOD,
-        _large_lod: LOD,
-        aspect_ratio: AspectRatio,
+        large_lod: LOD,
+        aspect: AspectRatio,
         format: TextureFormat,
-        _even_odd: FxU32,
+        even_odd: FxU32,
         data: *const std::ffi::c_void,
     ) {
-        let tmu_idx = tmu as usize;
-        if tmu_idx >= GLIDE_NUM_TMU {
-            return;
-        }
-
-        let (width, height) = this_lod.to_texture_size(aspect_ratio);
-        let bytes_per_pixel = format.bytes_per_pixel();
-        let size = width * height * bytes_per_pixel;
-
-        log::debug!(
-            "Texture mipmap level download for TMU{}: addr={:#x}, {}x{}, lod={:?}, format={:?}",
-            tmu_idx,
-            start_address,
-            width,
-            height,
+        let (_, height) = this_lod.to_texture_size(aspect);
+        self.tex_download_mipmap_level_partial(
+            tmu,
+            address,
             this_lod,
-            format
+            large_lod,
+            aspect,
+            format,
+            even_odd,
+            data,
+            0,
+            height as i32 - 1,
         );
-
-        // Copy texture data from pointer
-        let texture_data = if !data.is_null() {
-            unsafe { std::slice::from_raw_parts(data as *const u8, size).to_vec() }
-        } else {
-            vec![0; size]
-        };
-
-        // Invalidate any existing Vulkan texture at this address
-        if let Some(app) = &mut self.vulkan_app {
-            app.texture_cache
-                .invalidate_texture(&app.device, start_address);
-        }
-
-        // Store texture in texture memory
-        let texture =
-            utility::texture::TextureData::new(width as u32, height as u32, format, texture_data);
-        self.texture_memory[tmu_idx].store_texture(start_address, texture);
     }
 
-    /// grTexDownloadMipMapLevelPartial - download a partial mipmap level (row range)
     pub fn tex_download_mipmap_level_partial(
         &mut self,
         tmu: ChipID,
-        start_address: FxU32,
+        address: FxU32,
         this_lod: LOD,
-        _large_lod: LOD,
-        aspect_ratio: AspectRatio,
+        large_lod: LOD,
+        aspect: AspectRatio,
         format: TextureFormat,
-        _even_odd: FxU32,
+        even_odd: FxU32,
         data: *const std::ffi::c_void,
         start_row: i32,
         end_row: i32,
-    ) {
-        let tmu_idx = tmu as usize;
-        if tmu_idx >= GLIDE_NUM_TMU {
-            return;
+    ) -> FxBool {
+        let tmu = tmu.0 as usize;
+        let (width, height) = this_lod.to_texture_size(aspect);
+        if tmu >= GLIDE_NUM_TMU
+            || data.is_null()
+            || this_lod as i32 > large_lod as i32
+            || even_odd & (1 << (this_lod as u32 & 1)) == 0
+            || start_row < 0
+            || end_row < start_row
+            || end_row as usize >= height
+        {
+            return FxBool::False;
         }
-
-        let (width, height) = this_lod.to_texture_size(aspect_ratio);
-        let bytes_per_pixel = format.bytes_per_pixel();
-        let row_bytes = width * bytes_per_pixel;
-
-        // Clamp row range to valid values
-        let start_row = start_row.max(0) as usize;
-        let end_row = (end_row as usize).min(height);
-        let num_rows = end_row.saturating_sub(start_row);
-
-        if num_rows == 0 {
-            return;
+        self.finish();
+        let (base_width, base_height) = large_lod.to_texture_size(aspect);
+        let mut texture = self.texture_memory[tmu]
+            .get_texture(address)
+            .filter(|tex| {
+                (tex.width, tex.height, tex.format as i32)
+                    == (base_width as u32, base_height as u32, format as i32)
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                utility::texture::TextureData::new(
+                    base_width as u32,
+                    base_height as u32,
+                    format,
+                    vec![0; base_width * base_height * format.bytes_per_pixel()],
+                )
+            });
+        let level = texture.level_mut(width as u32, height as u32);
+        let row_bytes = width * format.bytes_per_pixel();
+        let count = (end_row - start_row + 1) as usize * row_bytes;
+        let offset = start_row as usize * row_bytes;
+        let source = unsafe { std::slice::from_raw_parts(data as *const u8, count) };
+        level.data[offset..offset + count].copy_from_slice(source);
+        self.texture_memory[tmu].store_texture(address, texture);
+        if let Some(app) = &mut self.vulkan_app {
+            app.texture_cache
+                .invalidate_texture(&app.device, address | ((tmu as u32) << 31));
         }
-
-        log::debug!(
-            "Texture mipmap level partial download for TMU{}: addr={:#x}, {}x{}, rows {}..{}, format={:?}",
-            tmu_idx,
-            start_address,
-            width,
-            height,
-            start_row,
-            end_row,
-            format
-        );
-
-        // Get or create texture at this address
-        let texture = self.texture_memory[tmu_idx].get_texture_mut(start_address);
-
-        if let Some(tex) = texture {
-            // Update existing texture with partial data
-            if !data.is_null() {
-                let src_data =
-                    unsafe { std::slice::from_raw_parts(data as *const u8, num_rows * row_bytes) };
-                let dst_offset = start_row * row_bytes;
-                let dst_end = dst_offset + num_rows * row_bytes;
-                if dst_end <= tex.data.len() {
-                    tex.data[dst_offset..dst_end].copy_from_slice(src_data);
-                }
-            }
-        } else {
-            // Create new texture and fill partial data
-            let total_size = width * height * bytes_per_pixel;
-            let mut texture_data = vec![0u8; total_size];
-
-            if !data.is_null() {
-                let src_data =
-                    unsafe { std::slice::from_raw_parts(data as *const u8, num_rows * row_bytes) };
-                let dst_offset = start_row * row_bytes;
-                texture_data[dst_offset..dst_offset + num_rows * row_bytes]
-                    .copy_from_slice(src_data);
-            }
-
-            let texture = utility::texture::TextureData::new(
-                width as u32,
-                height as u32,
-                format,
-                texture_data,
-            );
-            self.texture_memory[tmu_idx].store_texture(start_address, texture);
-        }
+        FxBool::True
     }
 
     /// grTexDownloadTable - download texture color table (palette or NCC)
@@ -2798,9 +2101,7 @@ impl Gr {
 
         match table_type {
             TextureTableType::Palette | TextureTableType::Palette6666Ext => {
-                let raw = unsafe {
-                    std::slice::from_raw_parts(data as *const u8, 256 * 4)
-                };
+                let raw = unsafe { std::slice::from_raw_parts(data as *const u8, 256 * 4) };
                 let palette = if matches!(table_type, TextureTableType::Palette6666Ext) {
                     utility::texture::PaletteTable::from_argb6666_data(raw)
                 } else {
@@ -2808,20 +2109,16 @@ impl Gr {
                 };
                 let old = self.texture_memory[0].get_palette(0);
                 if old.map_or(true, |old| *old != palette) {
-                    self.state.palette_generation =
-                        self.state.palette_generation.wrapping_add(1);
+                    self.finish();
+                    self.state.palette_generation = self.state.palette_generation.wrapping_add(1);
                     self.texture_memory[0].store_palette(0, palette);
                 }
             }
             TextureTableType::Ncc0 | TextureTableType::Ncc1 => {
-                // NCC (Narrow Channel Compression) tables are used for YIQ texture formats
-                // Structure: 16 bytes yRGB + 24 bytes iRGB + 24 bytes qRGB + 48 bytes packed = 112 bytes
-                // For now, store as raw data - NCC decompression would be done during texture sampling
-                log::debug!(
-                    "NCC table download (type {:?}) - not fully implemented",
-                    table_type
-                );
-                // TODO: Implement NCC table storage and decompression
+                self.finish();
+                let raw = unsafe { std::slice::from_raw_parts(data as *const u8, 64) };
+                self.texture_memory[0].store_ncc(table_type as usize, raw);
+                self.state.palette_generation = self.state.palette_generation.wrapping_add(1);
             }
         }
 
@@ -2831,181 +2128,73 @@ impl Gr {
 
     // ==================== Drawing Functions ====================
 
-    /// grDrawTriangle - draw a triangle
-    pub fn draw_triangle(&mut self, a: &Vertex, b: &Vertex, c: &Vertex) {
-        // Apply Y-flip for lower-left origin
-        let (a, b, c) = if self.state.origin == OriginLocation::LowerLeft {
-            let h = self.state.screen_height as f32;
-            let mut a = *a;
-            let mut b = *b;
-            let mut c = *c;
-            a.y = h - a.y;
-            b.y = h - b.y;
-            c.y = h - c.y;
-            (a, b, c)
-        } else {
-            (*a, *b, *c)
-        };
-
-        // Check culling
-        if self.state.cull_mode != CullMode::Disable {
-            // Calculate signed area (cross product of edges)
-            let area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
-            match self.state.cull_mode {
-                CullMode::Negative if area < 0.0 => return,
-                CullMode::Positive if area > 0.0 => return,
-                _ => {}
+    fn gpu_vertex(&self, v: &Vertex, fog: f32) -> utility::vertex::GpuVertex {
+        let mut gpu = utility::vertex::GpuVertex::from_glide_vertex(v);
+        gpu.depth = match self.state.depth_buffer_mode {
+            DepthBufferMode::ZBuffer | DepthBufferMode::ZBufferCompareToBias => {
+                (v.ooz / 65535.0).clamp(0.0, 1.0)
             }
+            // Normalized W depth preserves near/far clears; emulate the 3Dfx
+            // 16-bit floating encoding if a title needs intermediate W clear values.
+            DepthBufferMode::WBuffer | DepthBufferMode::WBufferCompareToBias => {
+                1.0 - v.oow.clamp(0.0, 1.0)
+            }
+            _ => 0.0,
+        };
+        if api::current_coordinate_space() == CoordinateSpaceMode::Clip as u32 {
+            gpu.position = [
+                (v.x * v.oow + 1.0) * self.state.screen_width as f32 * 0.5,
+                (v.y * v.oow + 1.0) * self.state.screen_height as f32 * 0.5,
+            ];
+            gpu.depth = ((v.ooz * v.oow + 1.0) * 0.5).clamp(0.0, 1.0);
+            gpu.tex_coord[0] *= v.oow;
+            gpu.tex_coord[1] *= v.oow;
+            gpu.tex_q = v.oow;
+            gpu.tex_coord1[0] *= v.oow;
+            gpu.tex_coord1[1] *= v.oow;
+            gpu.tex_q1 = v.oow;
         }
-
-        // Stamp per-vertex state (constant color + packed combine flags + texture index)
-        let cc = self.current_constant_color();
-        let cf = self.current_combine_flags();
-        let tex_addr = self.state.tex_source[0];
-        self.frame_textures.insert(tex_addr);
-        // Store raw texture address; resolved to descriptor slot in buffer_swap after upload
-        let tex_idx = tex_addr;
-        let mut v0 = utility::vertex::GpuVertex::from_glide_vertex(&a);
-        let mut v1 = utility::vertex::GpuVertex::from_glide_vertex(&b);
-        let mut v2 = utility::vertex::GpuVertex::from_glide_vertex(&c);
-        v0.constant_color = cc; v0.combine_flags = cf; v0.texture_index = tex_idx;
-        v1.constant_color = cc; v1.combine_flags = cf; v1.texture_index = tex_idx;
-        v2.constant_color = cc; v2.combine_flags = cf; v2.texture_index = tex_idx;
-
-        if !self.vertex_batch.push_triangle(v0, v1, v2) {
-            log::warn!("Vertex batch full, triangle dropped");
+        if self.state.origin == OriginLocation::LowerLeft {
+            gpu.position[1] = self.state.screen_height as f32 - gpu.position[1];
         }
-    }
-
-    /// grDrawPoint - draw a point as a small quad
-    pub fn draw_point(&mut self, pt: &Vertex) {
-        // Apply Y-flip for lower-left origin
-        let pt = if self.state.origin == OriginLocation::LowerLeft {
-            let h = self.state.screen_height as f32;
-            let mut pt = *pt;
-            pt.y = h - pt.y;
-            pt
+        gpu.constant_color = self.current_constant_color();
+        gpu.combine_flags = self.current_combine_flags();
+        gpu.texture_index = self.state.tex_source[0];
+        gpu.texture_index1 = if self.state.tex_source[1] == u32::MAX {
+            u32::MAX
         } else {
-            *pt
+            self.state.tex_source[1] | (1 << 31)
         };
-
-        // Render point as a 1-pixel quad (2 triangles)
-        const POINT_SIZE: f32 = 0.5;
-
-        let mut gpu_v = utility::vertex::GpuVertex::from_glide_vertex(&pt);
-        gpu_v.constant_color = self.current_constant_color();
-        gpu_v.combine_flags = self.current_combine_flags();
-        let tex_addr = self.state.tex_source[0];
-        self.frame_textures.insert(tex_addr);
-        gpu_v.texture_index = tex_addr;
-        let x = gpu_v.position[0];
-        let y = gpu_v.position[1];
-
-        // Create 4 corners of a small quad
-        let v0 = utility::vertex::GpuVertex {
-            position: [x - POINT_SIZE, y - POINT_SIZE],
-            ..gpu_v
-        };
-        let v1 = utility::vertex::GpuVertex {
-            position: [x + POINT_SIZE, y - POINT_SIZE],
-            ..gpu_v
-        };
-        let v2 = utility::vertex::GpuVertex {
-            position: [x + POINT_SIZE, y + POINT_SIZE],
-            ..gpu_v
-        };
-        let v3 = utility::vertex::GpuVertex {
-            position: [x - POINT_SIZE, y + POINT_SIZE],
-            ..gpu_v
-        };
-
-        // Two triangles to form the quad
-        if !self.vertex_batch.push_triangle(v0, v1, v2) {
-            log::warn!("Vertex batch full, point dropped");
-            return;
-        }
-        if !self.vertex_batch.push_triangle(v0, v2, v3) {
-            log::warn!("Vertex batch full, point dropped");
-        }
-    }
-
-    /// grDrawLine - draw a line as a thin quad
-    pub fn draw_line(&mut self, v1: &Vertex, v2: &Vertex) {
-        // Apply Y-flip for lower-left origin
-        let (v1, v2) = if self.state.origin == OriginLocation::LowerLeft {
-            let h = self.state.screen_height as f32;
-            let mut v1 = *v1;
-            let mut v2 = *v2;
-            v1.y = h - v1.y;
-            v2.y = h - v2.y;
-            (v1, v2)
+        gpu.fog = if self.state.fog_mode.0 & 255 == 3 {
+            v.ooz / 65535.0
         } else {
-            (*v1, *v2)
+            fog
         };
-
-        // Render line as a thin quad (2 triangles)
-        const LINE_WIDTH: f32 = 0.5;
-
-        let cc = self.current_constant_color();
-        let cf = self.current_combine_flags();
-        let tex_addr = self.state.tex_source[0];
-        self.frame_textures.insert(tex_addr);
-        // Store raw texture address; resolved to descriptor slot in buffer_swap after upload
-        let tex_idx = tex_addr;
-        let mut gpu_v1 = utility::vertex::GpuVertex::from_glide_vertex(&v1);
-        let mut gpu_v2 = utility::vertex::GpuVertex::from_glide_vertex(&v2);
-        gpu_v1.constant_color = cc; gpu_v1.combine_flags = cf; gpu_v1.texture_index = tex_idx;
-        gpu_v2.constant_color = cc; gpu_v2.combine_flags = cf; gpu_v2.texture_index = tex_idx;
-
-        let x1 = gpu_v1.position[0];
-        let y1 = gpu_v1.position[1];
-        let x2 = gpu_v2.position[0];
-        let y2 = gpu_v2.position[1];
-
-        // Calculate perpendicular direction for line width
-        let dx = x2 - x1;
-        let dy = y2 - y1;
-        let len = (dx * dx + dy * dy).sqrt();
-
-        if len < 0.001 {
-            // Line too short, draw as a point
-            self.draw_point(&v1);
-            return;
-        }
-
-        // Normalized perpendicular
-        let px = -dy / len * LINE_WIDTH;
-        let py = dx / len * LINE_WIDTH;
-
-        // Create 4 corners of the line quad
-        let c0 = utility::vertex::GpuVertex {
-            position: [x1 - px, y1 - py],
-            ..gpu_v1
-        };
-        let c1 = utility::vertex::GpuVertex {
-            position: [x1 + px, y1 + py],
-            ..gpu_v1
-        };
-        let c2 = utility::vertex::GpuVertex {
-            position: [x2 + px, y2 + py],
-            ..gpu_v2
-        };
-        let c3 = utility::vertex::GpuVertex {
-            position: [x2 - px, y2 - py],
-            ..gpu_v2
-        };
-
-        // Two triangles to form the quad
-        if !self.vertex_batch.push_triangle(c0, c1, c2) {
-            log::warn!("Vertex batch full, line dropped");
-            return;
-        }
-        if !self.vertex_batch.push_triangle(c0, c2, c3) {
-            log::warn!("Vertex batch full, line dropped");
-        }
+        gpu
     }
 
-    /// grDrawVertexArray - draw primitives from an array of vertex pointers
+    pub fn draw_triangle(&mut self, a: &Vertex, b: &Vertex, c: &Vertex) {
+        self.track_textures();
+        let vertices = [
+            self.gpu_vertex(a, a.oow),
+            self.gpu_vertex(b, b.oow),
+            self.gpu_vertex(c, c.oow),
+        ];
+        self.draw_primitives_gpu(PrimitiveType::Triangles, &vertices, self.state.cull_mode);
+    }
+
+    pub fn draw_point(&mut self, point: &Vertex) {
+        self.track_textures();
+        self.draw_point_gpu(self.gpu_vertex(point, point.oow));
+    }
+
+    pub fn draw_line(&mut self, a: &Vertex, b: &Vertex) {
+        self.track_textures();
+        self.draw_line_gpu(self.gpu_vertex(a, a.oow), self.gpu_vertex(b, b.oow));
+    }
+
+    /// # Safety
+    /// Each pointer must contain the fields enabled in the current vertex layout.
     pub unsafe fn draw_vertex_array(
         &mut self,
         mode: PrimitiveType,
@@ -3015,50 +2204,25 @@ impl Gr {
         if pointers.is_null() || count == 0 {
             return;
         }
-
-        let layout = &self.state.vertex_layout;
-        let origin = self.state.origin;
-        let screen_height = self.state.screen_height as f32;
-        let cull_mode = self.state.cull_mode;
-        let vertex_size = layout.vertex_size();
-        let cc = self.current_constant_color();
-        let cf = self.current_combine_flags();
-        let tex_addr = self.state.tex_source[0];
-        self.frame_textures.insert(tex_addr);
-        // Store raw texture address; resolved to descriptor slot in buffer_swap after upload
-        let tex_idx = tex_addr;
-
-        // Extract vertices using the configured layout
-        let gpu_vertices: Vec<utility::vertex::GpuVertex> = (0..count as usize)
-            .filter_map(|i| unsafe {
-                let ptr = *pointers.add(i);
-                if ptr.is_null() {
-                    return None;
-                }
-
-                let vertex_data = std::slice::from_raw_parts(ptr as *const u8, vertex_size);
-                let (x, mut y, r, g, b, a, s, t, oow) = layout.extract_vertex(vertex_data);
-
-                // Apply Y-flip for lower-left origin
-                if origin == OriginLocation::LowerLeft {
-                    y = screen_height - y;
-                }
-
-                let mut v = utility::vertex::GpuVertex::from_layout_data(
-                    x, y, r, g, b, a, s, t, oow,
-                );
-                v.constant_color = cc;
-                v.combine_flags = cf;
-                v.texture_index = tex_idx;
-                Some(v)
+        self.track_textures();
+        let size = self.state.vertex_layout.vertex_size();
+        let pointers = std::slice::from_raw_parts(pointers, count as usize);
+        if pointers.iter().any(|p| p.is_null()) {
+            return;
+        }
+        let vertices: Vec<_> = pointers
+            .iter()
+            .map(|&ptr| {
+                let (vertex, fog) = self
+                    .state
+                    .vertex_layout
+                    .decode(std::slice::from_raw_parts(ptr as *const u8, size));
+                self.gpu_vertex(&vertex, fog)
             })
             .collect();
-
-        // Draw primitives based on mode
-        self.draw_primitives_gpu(mode, &gpu_vertices, cull_mode);
+        self.draw_primitives_gpu(mode, &vertices, self.state.cull_mode);
     }
 
-    /// grDrawVertexArrayContiguous - draw primitives from a contiguous vertex array
     pub fn draw_vertex_array_contiguous(
         &mut self,
         mode: PrimitiveType,
@@ -3066,80 +2230,28 @@ impl Gr {
         pointers: *const Vertex,
         stride: FxU32,
     ) {
-        if pointers.is_null() || count == 0 {
+        let size = self.state.vertex_layout.vertex_size();
+        if pointers.is_null() || count == 0 || (stride as usize) < size {
             return;
         }
-
-        let layout = &self.state.vertex_layout;
-        let origin = self.state.origin;
-        let screen_height = self.state.screen_height as f32;
-        let cull_mode = self.state.cull_mode;
-        let current_texture = self.state.tex_source[0];
-        self.frame_textures.insert(current_texture);
-        let cc = self.current_constant_color();
-        let cf = self.current_combine_flags();
-        let tex_idx = current_texture;
-
-        // Log small texture draws (likely glyphs) for debugging
-        static LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let draw_num = LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // Get texture dimensions to identify glyph draws
-        let tex_size = self.texture_memory[0]
-            .get_texture(current_texture)
-            .map(|t| (t.width, t.height))
-            .unwrap_or((0, 0));
-
-        // Log first 20 small texture draws (32x32 or smaller = likely glyphs)
-        let is_small_texture = tex_size.0 <= 32 && tex_size.1 <= 32 && tex_size.0 > 0;
-        let should_log = is_small_texture && draw_num < 20;
-
-        if is_small_texture && should_log {
-            log::trace!(
-                "grDrawVertexArrayContiguous: texture={:#x} ({}x{}), mode={:?}, count={}",
-                current_texture,
-                tex_size.0,
-                tex_size.1,
-                mode,
-                count
-            );
+        if (count as usize)
+            .checked_mul(stride as usize)
+            .is_none_or(|size| size > isize::MAX as usize)
+        {
+            return;
         }
-
-        // Extract vertices using the configured layout
-        let gpu_vertices: Vec<utility::vertex::GpuVertex> = (0..count as usize)
+        self.track_textures();
+        let vertices: Vec<_> = (0..count as usize)
             .map(|i| unsafe {
-                let byte_ptr = (pointers as *const u8).add(i * stride as usize);
-                let vertex_data = std::slice::from_raw_parts(byte_ptr, stride as usize);
-
-                let (x, mut y, r, g, b, a, s, t, oow) = layout.extract_vertex(vertex_data);
-
-                // Log first 4 vertices of small texture draws at trace level
-                if should_log && i < 4 {
-                    log::trace!(
-                        "  Vertex {}: pos=({:.1}, {:.1}), st=({:.1}, {:.1})",
-                        i,
-                        x,
-                        y,
-                        s,
-                        t
-                    );
-                }
-
-                // Apply Y-flip for lower-left origin
-                if origin == OriginLocation::LowerLeft {
-                    y = screen_height - y;
-                }
-
-                let mut v = utility::vertex::GpuVertex::from_layout_data(x, y, r, g, b, a, s, t, oow);
-                v.constant_color = cc;
-                v.combine_flags = cf;
-                v.texture_index = tex_idx;
-                v
+                let data = std::slice::from_raw_parts(
+                    (pointers as *const u8).add(i * stride as usize),
+                    size,
+                );
+                let (vertex, fog) = self.state.vertex_layout.decode(data);
+                self.gpu_vertex(&vertex, fog)
             })
             .collect();
-
-        // Draw primitives based on mode
-        self.draw_primitives_gpu(mode, &gpu_vertices, cull_mode);
+        self.draw_primitives_gpu(mode, &vertices, self.state.cull_mode);
     }
 
     /// Internal helper to draw primitives from GPU vertices
@@ -3149,6 +2261,47 @@ impl Gr {
         vertices: &[utility::vertex::GpuVertex],
         cull_mode: CullMode,
     ) {
+        let continuing = matches!(
+            mode,
+            PrimitiveType::TriangleStripContinue | PrimitiveType::TriangleFanContinue
+        );
+        let base_mode = match mode {
+            PrimitiveType::TriangleStripContinue => PrimitiveType::TriangleStrip,
+            PrimitiveType::TriangleFanContinue => PrimitiveType::TriangleFan,
+            other => other,
+        };
+        if continuing && self.continuation_mode != base_mode {
+            return;
+        }
+        let previous = if continuing {
+            self.continuation.len()
+        } else {
+            0
+        };
+        let odd = continuing && previous == 2 && self.continuation_odd;
+        let mut joined = if continuing {
+            self.continuation.clone()
+        } else {
+            Vec::new()
+        };
+        joined.extend_from_slice(vertices);
+        if matches!(
+            base_mode,
+            PrimitiveType::TriangleStrip | PrimitiveType::TriangleFan
+        ) {
+            self.continuation_odd =
+                (continuing && self.continuation_odd) ^ (vertices.len() % 2 != 0);
+            self.continuation = if base_mode == PrimitiveType::TriangleFan && joined.len() > 1 {
+                vec![joined[0], *joined.last().unwrap()]
+            } else {
+                joined[joined.len().saturating_sub(2)..].to_vec()
+            };
+            self.continuation_mode = base_mode;
+        } else {
+            self.continuation.clear();
+        }
+        let vertices = joined.as_slice();
+        let mode = base_mode;
         match mode {
             PrimitiveType::Points => {
                 for v in vertices {
@@ -3177,14 +2330,14 @@ impl Gr {
             PrimitiveType::TriangleFan => {
                 if vertices.len() >= 3 {
                     let first = vertices[0];
-                    for i in 1..vertices.len() - 1 {
+                    for i in previous.saturating_sub(1).max(1)..vertices.len() - 1 {
                         self.draw_triangle_gpu(first, vertices[i], vertices[i + 1], cull_mode);
                     }
                 }
             }
             PrimitiveType::TriangleStrip => {
-                for i in 0..vertices.len().saturating_sub(2) {
-                    if i % 2 == 0 {
+                for i in previous.saturating_sub(2)..vertices.len().saturating_sub(2) {
+                    if (i % 2 != 0) == odd {
                         self.draw_triangle_gpu(
                             vertices[i],
                             vertices[i + 1],
@@ -3204,11 +2357,12 @@ impl Gr {
             PrimitiveType::Polygon => {
                 if vertices.len() >= 3 {
                     let first = vertices[0];
-                    for i in 1..vertices.len() - 1 {
+                    for i in previous.saturating_sub(1).max(1)..vertices.len() - 1 {
                         self.draw_triangle_gpu(first, vertices[i], vertices[i + 1], cull_mode);
                     }
                 }
             }
+            _ => log::warn!("Unsupported primitive value {}", mode.0),
         }
     }
 
@@ -3311,67 +2465,6 @@ impl Gr {
         }
     }
 
-    /// Internal helper to draw primitives based on mode
-    fn draw_primitives(&mut self, mode: PrimitiveType, vertices: &[&Vertex]) {
-        match mode {
-            PrimitiveType::Points => {
-                for v in vertices {
-                    self.draw_point(v);
-                }
-            }
-            PrimitiveType::Lines => {
-                // Draw pairs of vertices as lines
-                for chunk in vertices.chunks(2) {
-                    if chunk.len() == 2 {
-                        self.draw_line(chunk[0], chunk[1]);
-                    }
-                }
-            }
-            PrimitiveType::LineStrip => {
-                // Draw connected lines
-                for window in vertices.windows(2) {
-                    self.draw_line(window[0], window[1]);
-                }
-            }
-            PrimitiveType::Triangles => {
-                // Draw groups of 3 vertices as triangles
-                for chunk in vertices.chunks(3) {
-                    if chunk.len() == 3 {
-                        self.draw_triangle(chunk[0], chunk[1], chunk[2]);
-                    }
-                }
-            }
-            PrimitiveType::TriangleStrip => {
-                // Draw triangle strip (v0,v1,v2), (v2,v1,v3), (v2,v3,v4)...
-                for i in 0..vertices.len().saturating_sub(2) {
-                    if i % 2 == 0 {
-                        self.draw_triangle(vertices[i], vertices[i + 1], vertices[i + 2]);
-                    } else {
-                        self.draw_triangle(vertices[i + 1], vertices[i], vertices[i + 2]);
-                    }
-                }
-            }
-            PrimitiveType::TriangleFan => {
-                // Draw triangle fan: all triangles share first vertex
-                if vertices.len() >= 3 {
-                    let first = vertices[0];
-                    for i in 1..vertices.len() - 1 {
-                        self.draw_triangle(first, vertices[i], vertices[i + 1]);
-                    }
-                }
-            }
-            PrimitiveType::Polygon => {
-                // Draw polygon as triangle fan (same as fan for convex polygons)
-                if vertices.len() >= 3 {
-                    let first = vertices[0];
-                    for i in 1..vertices.len() - 1 {
-                        self.draw_triangle(first, vertices[i], vertices[i + 1]);
-                    }
-                }
-            }
-        }
-    }
-
     /// Get a reference to the window
     pub fn window_ref(&self) -> Option<&Window> {
         self.window.as_ref()
@@ -3393,210 +2486,52 @@ impl Gr {
             .unwrap_or(0)
     }
 
-    /// Read the current framebuffer contents
-    /// Returns (width, height, pixel_data) where pixel_data is BGRA bytes (4 bytes per pixel)
-    pub fn lfb_read_region(&self) -> Option<(u32, u32, Vec<u8>)> {
-        let app = self.vulkan_app.as_ref()?;
-
-        unsafe {
-            // Wait for rendering to complete
-            app.device
-                .device_wait_idle()
-                .expect("Failed to wait for device idle");
-
-            let width = app.swapchain_extent.width;
-            let height = app.swapchain_extent.height;
-            let image_size = (width * height * 4) as vk::DeviceSize;
-
-            // Create staging buffer for readback
-            let buffer_info = vk::BufferCreateInfo::default()
-                .size(image_size)
-                .usage(vk::BufferUsageFlags::TRANSFER_DST)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-            let staging_buffer = app
-                .device
-                .create_buffer(&buffer_info, None)
-                .expect("Failed to create staging buffer");
-
-            let mem_requirements = app.device.get_buffer_memory_requirements(staging_buffer);
-
-            // Find host-visible memory type
-            let instance = &self.vulkan_instance.instance;
-            let mem_properties =
-                instance.get_physical_device_memory_properties(app.physical_device);
-
-            let mut memory_type_index = 0;
-            for i in 0..mem_properties.memory_type_count {
-                if (mem_requirements.memory_type_bits & (1 << i)) != 0
-                    && mem_properties.memory_types[i as usize]
-                        .property_flags
-                        .contains(
-                            vk::MemoryPropertyFlags::HOST_VISIBLE
-                                | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        )
-                {
-                    memory_type_index = i;
-                    break;
-                }
-            }
-
-            let alloc_info = vk::MemoryAllocateInfo::default()
-                .allocation_size(mem_requirements.size)
-                .memory_type_index(memory_type_index);
-
-            let staging_memory = app
-                .device
-                .allocate_memory(&alloc_info, None)
-                .expect("Failed to allocate staging memory");
-
-            app.device
-                .bind_buffer_memory(staging_buffer, staging_memory, 0)
-                .expect("Failed to bind staging buffer memory");
-
-            // Create command buffer for copy
-            let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
-                .command_pool(app.command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-
-            let cmd_buffers = app
-                .device
-                .allocate_command_buffers(&cmd_alloc_info)
-                .expect("Failed to allocate command buffer");
-            let cmd = cmd_buffers[0];
-
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-            app.device
-                .begin_command_buffer(cmd, &begin_info)
-                .expect("Failed to begin command buffer");
-
-            // Read from the last presented image (front buffer)
-            log::debug!(
-                "lfb_read_region: reading from image index {} (last_presented={}, current={})",
-                app.last_presented_image_index, app.last_presented_image_index, app.current_image_index
-            );
-            let src_image = app.swapchain_images[app.last_presented_image_index as usize];
-
-            let barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(src_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::MEMORY_READ)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-
-            app.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-
-            // Copy image to buffer
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .image_extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                });
-
-            app.device.cmd_copy_image_to_buffer(
-                cmd,
-                src_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                staging_buffer,
-                &[region],
-            );
-
-            // Transition image back
-            let barrier_back = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(src_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ);
-
-            app.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier_back],
-            );
-
-            app.device
-                .end_command_buffer(cmd)
-                .expect("Failed to end command buffer");
-
-            // Submit and wait
-            let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
-
-            app.device
-                .queue_submit(app.graphics_queue, &[submit_info], vk::Fence::null())
-                .expect("Failed to submit copy command");
-
-            app.device
-                .queue_wait_idle(app.graphics_queue)
-                .expect("Failed to wait for queue");
-
-            // Read back data
-            let data_ptr = app
-                .device
-                .map_memory(staging_memory, 0, image_size, vk::MemoryMapFlags::empty())
-                .expect("Failed to map memory");
-
-            let mut pixels = vec![0u8; image_size as usize];
-            std::ptr::copy_nonoverlapping(
-                data_ptr as *const u8,
-                pixels.as_mut_ptr(),
-                image_size as usize,
-            );
-
-            app.device.unmap_memory(staging_memory);
-
-            // Cleanup
-            app.device
-                .free_command_buffers(app.command_pool, &cmd_buffers);
-            app.device.destroy_buffer(staging_buffer, None);
-            app.device.free_memory(staging_memory, None);
-
-            Some((width, height, pixels))
+    fn track_textures(&mut self) {
+        let addresses = [
+            self.state.tex_source[0],
+            if self.state.tex_source[1] == u32::MAX {
+                u32::MAX
+            } else {
+                self.state.tex_source[1] | (1 << 31)
+            },
+        ];
+        let extra = addresses
+            .iter()
+            .filter(|&&a| a != u32::MAX && !self.frame_textures.contains(&a))
+            .count();
+        if self.frame_textures.len() + extra > utility::texture::DISPLAY_SLOT as usize - 1 {
+            self.finish();
         }
+        self.frame_textures
+            .extend(addresses.into_iter().filter(|&a| a != u32::MAX));
+        self.vertex_batch.set_state(utility::vertex::DrawState {
+            pipeline: self.pipeline_state(),
+            push: self.push_constants(),
+            clip: self.clip_rect(),
+        });
+    }
+
+    fn read_buffer(&mut self, buffer: Buffer) -> Option<(u32, u32, Vec<u8>)> {
+        if !matches!(buffer, Buffer::Front | Buffer::Back) {
+            return None;
+        }
+        self.finish();
+        let app = self.vulkan_app.as_ref()?;
+        let fb = app.framebuffer.as_ref()?;
+        Some((
+            fb.extent.width,
+            fb.extent.height,
+            fb.read(
+                app,
+                &self.vulkan_instance.instance,
+                if buffer == Buffer::Front { 0 } else { 1 },
+            ),
+        ))
+    }
+
+    /// Read the displayed logical framebuffer, before display gamma and scaling.
+    pub fn lfb_read_region(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        self.read_buffer(Buffer::Front)
     }
 
     /// Copy a pixel rectangle from the frame buffer to user memory as RGB565
@@ -3611,8 +2546,8 @@ impl Gr {
     /// # Returns
     /// FxBool::True on success, FxBool::False on failure
     pub fn lfb_read_region_rgb565(
-        &self,
-        _src_buffer: glidesys::Buffer,
+        &mut self,
+        src_buffer: glidesys::Buffer,
         src_x: FxU32,
         src_y: FxU32,
         src_width: FxU32,
@@ -3625,7 +2560,7 @@ impl Gr {
         }
 
         // Read entire framebuffer
-        if let Some((swapchain_width, swapchain_height, pixels)) = self.lfb_read_region() {
+        if let Some((swapchain_width, swapchain_height, pixels)) = self.read_buffer(src_buffer) {
             let fb_width = if self.state.screen_width > 0 {
                 self.state.screen_width
             } else {
@@ -3645,8 +2580,12 @@ impl Gr {
             );
 
             // Validate bounds
-            if src_x.checked_add(src_width).is_none_or(|right| right > fb_width)
-                || src_y.checked_add(src_height).is_none_or(|bottom| bottom > fb_height)
+            if src_x
+                .checked_add(src_width)
+                .is_none_or(|right| right > fb_width)
+                || src_y
+                    .checked_add(src_height)
+                    .is_none_or(|bottom| bottom > fb_height)
                 || pixels.is_empty()
             {
                 return glidesys::FxBool::False;
@@ -3673,7 +2612,7 @@ impl Gr {
 
                     unsafe {
                         let dst_ptr = dst.add(dst_idx) as *mut u16;
-                        *dst_ptr = rgb565;
+                        dst_ptr.write_unaligned(rgb565);
                     }
                 }
             }
@@ -3704,6 +2643,12 @@ impl Gr {
         _pixel_pipeline: FxBool,
         info: &mut glidesys::LfbInfo,
     ) -> FxBool {
+        let lock_type = LfbLock(lock_type.0 & !LfbLock::NoIdle.0);
+        if !matches!(lock_type, LfbLock::ReadOnly | LfbLock::WriteOnly)
+            || !matches!(buffer, Buffer::Front | Buffer::Back)
+        {
+            return FxBool::False;
+        }
         // Check if already locked
         if self.lfb_lock_state.is_locked {
             log::warn!("LFB already locked");
@@ -3724,79 +2669,60 @@ impl Gr {
             (app.swapchain_extent.width, app.swapchain_extent.height)
         };
 
-        // Calculate stride based on write mode (bytes per pixel)
-        let bytes_per_pixel = match write_mode {
-            glidesys::LfbWriteMode::Rgb565
-            | glidesys::LfbWriteMode::Rgb555
-            | glidesys::LfbWriteMode::Argb1555 => 2,
-            glidesys::LfbWriteMode::Rgb888 => 3,
-            glidesys::LfbWriteMode::Argb8888 => 4,
-            glidesys::LfbWriteMode::Rgb565Depth
-            | glidesys::LfbWriteMode::Rgb555Depth
-            | glidesys::LfbWriteMode::Argb1555Depth
-            | glidesys::LfbWriteMode::Za16 => 4,
-            _ => 2, // Default to 16-bit
+        let write_mode = if write_mode == LfbWriteMode::Any {
+            LfbWriteMode::Rgb565
+        } else {
+            write_mode
         };
+        let bytes_per_pixel = match write_mode {
+            LfbWriteMode::Rgb565 | LfbWriteMode::Rgb555 | LfbWriteMode::Argb1555 => 2,
+            LfbWriteMode::Rgb888 => 3,
+            LfbWriteMode::Argb8888 => 4,
+            _ => return FxBool::False,
+        };
+        if !matches!(
+            origin,
+            OriginLocation::UpperLeft | OriginLocation::LowerLeft
+        ) {
+            return FxBool::False;
+        }
         let stride = width * bytes_per_pixel;
-
-        // Allocate buffer
-        let buffer_size = (stride * height) as usize;
-        let mut data = vec![0u8; buffer_size];
-
-        // For read locks, copy framebuffer data to buffer
-        if lock_type == glidesys::LfbLock::ReadOnly {
-            if let Some((swapchain_width, swapchain_height, pixels)) = self.lfb_read_region() {
-                let pixels = scale_bgra_nearest(
-                    &pixels,
-                    swapchain_width,
-                    swapchain_height,
-                    width,
-                    height,
-                );
-                // Convert from BGRA to requested format
-                match write_mode {
-                    glidesys::LfbWriteMode::Rgb565 | glidesys::LfbWriteMode::Any => {
-                        // Convert BGRA to RGB565
-                        for y in 0..height {
-                            let source_y = if origin == glidesys::OriginLocation::LowerLeft {
-                                height - 1 - y
-                            } else {
-                                y
-                            };
-                            for x in 0..width {
-                                let src_idx = ((source_y * width + x) * 4) as usize;
-                                let dst_idx = ((y * stride) + (x * 2)) as usize;
-                                if src_idx + 2 < pixels.len() && dst_idx + 1 < data.len() {
-                                    let b = pixels[src_idx] as u16;
-                                    let g = pixels[src_idx + 1] as u16;
-                                    let r = pixels[src_idx + 2] as u16;
-                                    let rgb565: u16 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
-                                    data[dst_idx] = (rgb565 & 0xFF) as u8;
-                                    data[dst_idx + 1] = ((rgb565 >> 8) & 0xFF) as u8;
+        let Some((_, _, pixels)) = self.read_buffer(buffer) else {
+            return FxBool::False;
+        };
+        // Preload write locks too: applications may update only part of the locked image.
+        // Full readback/convert preserves untouched pixels; track dirty rows if LFB profiling warrants it.
+        let mut data = vec![0; (stride * height) as usize];
+        for y in 0..height {
+            let source_y = if origin == OriginLocation::LowerLeft {
+                height - 1 - y
+            } else {
+                y
+            };
+            for x in 0..width {
+                let source = ((source_y * width + x) * 4) as usize;
+                let dest = (y * stride + x * bytes_per_pixel) as usize;
+                let [b, g, r, a]: [u8; 4] = pixels[source..source + 4].try_into().unwrap();
+                if bytes_per_pixel == 2 {
+                    let value = match write_mode {
+                        LfbWriteMode::Rgb565 => {
+                            ((r as u16 >> 3) << 11) | ((g as u16 >> 2) << 5) | (b as u16 >> 3)
+                        }
+                        _ => {
+                            ((r as u16 >> 3) << 10)
+                                | ((g as u16 >> 3) << 5)
+                                | (b as u16 >> 3)
+                                | if write_mode == LfbWriteMode::Argb1555 && a >= 128 {
+                                    0x8000
+                                } else {
+                                    0
                                 }
-                            }
                         }
-                    }
-                    _ => {
-                        // Preserve existing raw BGRA behavior for 32-bit modes.
-                        // Unsupported packed modes remain zero-filled rather
-                        // than copying rows with an incompatible stride.
-                        if bytes_per_pixel == 4 {
-                            for y in 0..height {
-                                let source_y =
-                                    if origin == glidesys::OriginLocation::LowerLeft {
-                                        height - 1 - y
-                                    } else {
-                                        y
-                                    };
-                                let src_start = (source_y * width * 4) as usize;
-                                let dst_start = (y * stride) as usize;
-                                let row_bytes = (width * 4) as usize;
-                                data[dst_start..dst_start + row_bytes]
-                                    .copy_from_slice(&pixels[src_start..src_start + row_bytes]);
-                            }
-                        }
-                    }
+                    };
+                    data[dest..dest + 2].copy_from_slice(&value.to_le_bytes());
+                } else {
+                    data[dest..dest + bytes_per_pixel as usize]
+                        .copy_from_slice(&[b, g, r, a][..bytes_per_pixel as usize]);
                 }
             }
         }
@@ -3831,6 +2757,7 @@ impl Gr {
     /// # Returns
     /// FxBool::True if unlock succeeded
     pub fn lfb_unlock(&mut self, lock_type: glidesys::LfbLock, buffer: glidesys::Buffer) -> FxBool {
+        let lock_type = LfbLock(lock_type.0 & !LfbLock::NoIdle.0);
         if !self.lfb_lock_state.is_locked {
             return FxBool::False;
         }
@@ -3842,7 +2769,6 @@ impl Gr {
         // For write locks, upload data directly to swapchain image and present
         if lock_type == glidesys::LfbLock::WriteOnly {
             self.lfb_upload_to_framebuffer();
-            self.lfb_lock_state.lfb_written = true;
         }
 
         // Clear lock state
@@ -3852,639 +2778,105 @@ impl Gr {
         FxBool::True
     }
 
-    /// grLfbWriteRegion - write a pixel rectangle to the frame buffer
     pub fn lfb_write_region(
         &mut self,
-        dst_buffer: glidesys::Buffer,
+        dst_buffer: Buffer,
         dst_x: FxU32,
         dst_y: FxU32,
-        src_format: glidesys::LfbWriteMode,
-        src_width: FxU32,
-        src_height: FxU32,
+        src_format: LfbWriteMode,
+        width: FxU32,
+        height: FxU32,
         _pixel_pipeline: FxBool,
-        src_stride: i32,
-        src_data: *const std::ffi::c_void,
+        stride: i32,
+        data: *const std::ffi::c_void,
     ) -> FxBool {
-        if src_data.is_null() || src_width == 0 || src_height == 0 || src_stride <= 0 {
-            return FxBool::False;
-        }
-
-        let logical_width = if self.state.screen_width > 0 {
-            self.state.screen_width
-        } else {
-            self.vulkan_app
-                .as_ref()
-                .map_or(0, |app| app.swapchain_extent.width)
+        let bpp = match src_format {
+            LfbWriteMode::Rgb565 | LfbWriteMode::Rgb555 | LfbWriteMode::Argb1555 => 2,
+            LfbWriteMode::Rgb888 => 3,
+            LfbWriteMode::Argb8888 => 4,
+            _ => return FxBool::False,
         };
-        let logical_height = if self.state.screen_height > 0 {
-            self.state.screen_height
-        } else {
-            self.vulkan_app
-                .as_ref()
-                .map_or(0, |app| app.swapchain_extent.height)
-        };
-        if dst_x
-            .checked_add(src_width)
-            .is_none_or(|right| right > logical_width)
+        if self.lfb_lock_state.is_locked
+            || data.is_null()
+            || width == 0
+            || height == 0
+            || stride <= 0
+            || !matches!(dst_buffer, Buffer::Front | Buffer::Back)
+            || width.checked_mul(bpp).is_none_or(|row| row > stride as u32)
+            || dst_x
+                .checked_add(width)
+                .is_none_or(|right| right > self.state.screen_width)
             || dst_y
-                .checked_add(src_height)
-                .is_none_or(|bottom| bottom > logical_height)
+                .checked_add(height)
+                .is_none_or(|bottom| bottom > self.state.screen_height)
         {
             return FxBool::False;
         }
-
-        // Lock the LFB
-        let mut info = glidesys::LfbInfo {
-            size: std::mem::size_of::<glidesys::LfbInfo>() as i32,
-            lfb_ptr: std::ptr::null_mut(),
-            stride_in_bytes: 0,
-            write_mode: glidesys::LfbWriteMode::Any,
-            origin: glidesys::OriginLocation::UpperLeft,
+        let Some(size) = (height as usize - 1)
+            .checked_mul(stride as usize)
+            .and_then(|n| n.checked_add(width as usize * bpp as usize))
+        else {
+            return FxBool::False;
         };
-
-        if self.lfb_lock(
-            glidesys::LfbLock::WriteOnly,
-            dst_buffer,
+        if size > isize::MAX as usize {
+            return FxBool::False;
+        }
+        self.finish();
+        let pixels = lfb_to_bgra(
+            width,
+            height,
+            stride as u32,
             src_format,
-            glidesys::OriginLocation::UpperLeft,
-            FxBool::False,
-            &mut info,
-        ) != FxBool::True
-        {
+            OriginLocation::UpperLeft,
+            unsafe { std::slice::from_raw_parts(data as *const u8, size) },
+        );
+        let Some(app) = &self.vulkan_app else {
             return FxBool::False;
-        }
-
-        // Calculate bytes per pixel
-        let bpp: u32 = match src_format {
-            glidesys::LfbWriteMode::Rgb565
-            | glidesys::LfbWriteMode::Rgb555
-            | glidesys::LfbWriteMode::Argb1555 => 2,
-            glidesys::LfbWriteMode::Rgb888 => 3,
-            glidesys::LfbWriteMode::Argb8888 => 4,
-            _ => 2,
         };
-        if src_stride < (src_width * bpp) as i32 {
-            self.lfb_lock_state.is_locked = false;
-            self.lfb_lock_state.data.clear();
+        let Some(fb) = &app.framebuffer else {
+            return FxBool::False;
+        };
+        fb.write_rect(
+            app,
+            &self.vulkan_instance.instance,
+            if dst_buffer == Buffer::Front { 0 } else { 1 },
+            &pixels,
+            dst_x,
+            dst_y,
+            width,
+            height,
+        );
+        if dst_buffer == Buffer::Front && self.present_front().is_none() {
             return FxBool::False;
         }
-
-        // Copy row by row from source to locked buffer
-        let dst_stride = info.stride_in_bytes;
-        unsafe {
-            let src_ptr = src_data as *const u8;
-            let dst_ptr = info.lfb_ptr as *mut u8;
-            for y in 0..src_height {
-                let src_row = src_ptr.add((y as i32 * src_stride) as usize);
-                let dst_row = dst_ptr.add(((dst_y + y) * dst_stride + dst_x * bpp) as usize);
-                std::ptr::copy_nonoverlapping(src_row, dst_row, (src_width * bpp) as usize);
-            }
-        }
-
-        // Unlock triggers upload
-        self.lfb_unlock(glidesys::LfbLock::WriteOnly, dst_buffer)
+        FxBool::True
     }
 
-    /// Upload LFB write data directly to the swapchain image and present.
-    /// Uses vkCmdCopyBufferToImage to bypass the shader pipeline entirely.
     fn lfb_upload_to_framebuffer(&mut self) {
-        #[cfg(target_os = "windows")]
-        self.refresh_native_window_size();
-
-        let app = match self.vulkan_app.as_mut() {
-            Some(app) => app,
-            None => return,
-        };
-
+        self.finish();
         let width = self.lfb_lock_state.width;
         let height = self.lfb_lock_state.height;
         let stride = self.lfb_lock_state.stride;
         let write_mode = self.lfb_lock_state.write_mode;
         let origin = self.lfb_lock_state.origin;
         let src_data = &self.lfb_lock_state.data;
-        let viewport_x = self.state.viewport_x;
-        let viewport_y = self.state.viewport_y;
-        let viewport_width = self.state.viewport_width;
-        let viewport_height = self.state.viewport_height;
-
-        let frame = app.current_frame;
-        unsafe {
-            app.device
-                .queue_wait_idle(app.graphics_queue)
-                .expect("Failed to wait for graphics queue");
-            app.device
-                .wait_for_fences(&[app.in_flight_fences[frame]], true, 0)
-                .ok();
-            app.device
-                .reset_fences(&[app.in_flight_fences[frame]])
-                .expect("Failed to reset fence before acquire");
-
-            loop {
-                match app.swapchain_loader.acquire_next_image(
-                    app.swapchain,
-                    1_000_000_000,
-                    vk::Semaphore::null(),
-                    app.in_flight_fences[frame],
-                ) {
-                    Ok((image_index, suboptimal)) => {
-                        app.current_image_index = image_index;
-                        if suboptimal {
-                            self.is_framebuffer_resized = true;
-                        }
-                        app.device
-                            .wait_for_fences(&[app.in_flight_fences[frame]], true, u64::MAX)
-                            .expect("Failed to wait for acquire fence");
-                        app.device
-                            .reset_fences(&[app.in_flight_fences[frame]])
-                            .expect("Failed to reset fence after acquire");
-                        break;
-                    }
-                    Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        continue;
-                    }
-                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                        let empty_submit = vk::SubmitInfo::default();
-                        app.device
-                            .queue_submit(
-                                app.graphics_queue,
-                                &[empty_submit],
-                                app.in_flight_fences[frame],
-                            )
-                            .expect("Failed to restore LFB frame fence");
-                        self.is_framebuffer_resized = true;
-                        return;
-                    }
-                    Err(e) => panic!("Failed to acquire next image: {:?}", e),
-                }
+        let bgra_data = lfb_to_bgra(width, height, stride, write_mode, origin, src_data);
+        if let Some(app) = &self.vulkan_app {
+            if let Some(fb) = &app.framebuffer {
+                fb.write(
+                    app,
+                    &self.vulkan_instance.instance,
+                    if self.lfb_lock_state.buffer == Buffer::Front {
+                        0
+                    } else {
+                        1
+                    },
+                    &bgra_data,
+                );
             }
         }
-
-        // Determine bytes per pixel based on write mode
-        let bytes_per_pixel: u32 = match write_mode {
-            glidesys::LfbWriteMode::Rgb565
-            | glidesys::LfbWriteMode::Rgb555
-            | glidesys::LfbWriteMode::Argb1555 => 2,
-            glidesys::LfbWriteMode::Rgb888 => 3,
-            glidesys::LfbWriteMode::Argb8888 => 4,
-            _ => 2,
-        };
-
-        // Convert source data to BGRA8888 (matching swapchain format B8G8R8A8_UNORM)
-        let mut bgra_data = vec![0u8; (width * height * 4) as usize];
-        for y in 0..height {
-            let src_y = if origin == glidesys::OriginLocation::LowerLeft {
-                height - 1 - y
-            } else {
-                y
-            };
-
-            for x in 0..width {
-                let src_idx = (src_y * stride + x * bytes_per_pixel) as usize;
-                let dst_idx = ((y * width + x) * 4) as usize;
-
-                if dst_idx + 3 < bgra_data.len() {
-                    let (r, g, b, a) = match write_mode {
-                        glidesys::LfbWriteMode::Rgb565 | glidesys::LfbWriteMode::Any => {
-                            if src_idx + 1 < src_data.len() {
-                                let rgb565 = (src_data[src_idx] as u16)
-                                    | ((src_data[src_idx + 1] as u16) << 8);
-                                let r5 = ((rgb565 >> 11) & 0x1F) as u8;
-                                let g6 = ((rgb565 >> 5) & 0x3F) as u8;
-                                let b5 = (rgb565 & 0x1F) as u8;
-                                (
-                                    (r5 << 3) | (r5 >> 2),
-                                    (g6 << 2) | (g6 >> 4),
-                                    (b5 << 3) | (b5 >> 2),
-                                    255u8,
-                                )
-                            } else {
-                                (0, 0, 0, 255)
-                            }
-                        }
-                        glidesys::LfbWriteMode::Rgb555 => {
-                            if src_idx + 1 < src_data.len() {
-                                let rgb555 = (src_data[src_idx] as u16)
-                                    | ((src_data[src_idx + 1] as u16) << 8);
-                                let r5 = ((rgb555 >> 10) & 0x1F) as u8;
-                                let g5 = ((rgb555 >> 5) & 0x1F) as u8;
-                                let b5 = (rgb555 & 0x1F) as u8;
-                                (
-                                    (r5 << 3) | (r5 >> 2),
-                                    (g5 << 3) | (g5 >> 2),
-                                    (b5 << 3) | (b5 >> 2),
-                                    255u8,
-                                )
-                            } else {
-                                (0, 0, 0, 255)
-                            }
-                        }
-                        glidesys::LfbWriteMode::Argb1555 => {
-                            if src_idx + 1 < src_data.len() {
-                                let argb1555 = (src_data[src_idx] as u16)
-                                    | ((src_data[src_idx + 1] as u16) << 8);
-                                let a1 = ((argb1555 >> 15) & 0x1) as u8;
-                                let r5 = ((argb1555 >> 10) & 0x1F) as u8;
-                                let g5 = ((argb1555 >> 5) & 0x1F) as u8;
-                                let b5 = (argb1555 & 0x1F) as u8;
-                                (
-                                    (r5 << 3) | (r5 >> 2),
-                                    (g5 << 3) | (g5 >> 2),
-                                    (b5 << 3) | (b5 >> 2),
-                                    if a1 != 0 { 255 } else { 0 },
-                                )
-                            } else {
-                                (0, 0, 0, 255)
-                            }
-                        }
-                        glidesys::LfbWriteMode::Rgb888 => {
-                            if src_idx + 2 < src_data.len() {
-                                (src_data[src_idx + 2], src_data[src_idx + 1], src_data[src_idx], 255u8)
-                            } else {
-                                (0, 0, 0, 255)
-                            }
-                        }
-                        glidesys::LfbWriteMode::Argb8888 => {
-                            if src_idx + 3 < src_data.len() {
-                                (src_data[src_idx + 2], src_data[src_idx + 1], src_data[src_idx], src_data[src_idx + 3])
-                            } else {
-                                (0, 0, 0, 255)
-                            }
-                        }
-                        _ => (0, 0, 0, 255),
-                    };
-
-                    // Write as BGRA (matching swapchain B8G8R8A8_UNORM)
-                    bgra_data[dst_idx] = b;
-                    bgra_data[dst_idx + 1] = g;
-                    bgra_data[dst_idx + 2] = r;
-                    bgra_data[dst_idx + 3] = a;
-                }
-            }
-        }
-
-        // Copy BGRA data directly to swapchain image via staging buffer
-        unsafe {
-            let image_size = bgra_data.len() as vk::DeviceSize;
-
-            let buffer_info = vk::BufferCreateInfo::default()
-                .size(image_size)
-                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-            let staging_buffer = app
-                .device
-                .create_buffer(&buffer_info, None)
-                .expect("Failed to create staging buffer");
-
-            let mem_requirements = app.device.get_buffer_memory_requirements(staging_buffer);
-
-            let instance = &self.vulkan_instance.instance;
-            let mem_properties =
-                instance.get_physical_device_memory_properties(app.physical_device);
-
-            let mut memory_type_index = 0;
-            for i in 0..mem_properties.memory_type_count {
-                if (mem_requirements.memory_type_bits & (1 << i)) != 0
-                    && mem_properties.memory_types[i as usize]
-                        .property_flags
-                        .contains(
-                            vk::MemoryPropertyFlags::HOST_VISIBLE
-                                | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        )
-                {
-                    memory_type_index = i;
-                    break;
-                }
-            }
-
-            let alloc_info = vk::MemoryAllocateInfo::default()
-                .allocation_size(mem_requirements.size)
-                .memory_type_index(memory_type_index);
-
-            let staging_memory = app
-                .device
-                .allocate_memory(&alloc_info, None)
-                .expect("Failed to allocate staging memory");
-
-            app.device
-                .bind_buffer_memory(staging_buffer, staging_memory, 0)
-                .expect("Failed to bind staging buffer memory");
-
-            let data_ptr = app
-                .device
-                .map_memory(staging_memory, 0, image_size, vk::MemoryMapFlags::empty())
-                .expect("Failed to map memory");
-
-            std::ptr::copy_nonoverlapping(bgra_data.as_ptr(), data_ptr as *mut u8, bgra_data.len());
-
-            app.device.unmap_memory(staging_memory);
-
-            // Record command buffer: transition → copy → transition → present
-            let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
-                .command_pool(app.command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-
-            let cmd_buffers = app
-                .device
-                .allocate_command_buffers(&cmd_alloc_info)
-                .expect("Failed to allocate command buffer");
-            let cmd = cmd_buffers[0];
-
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-            app.device.begin_command_buffer(cmd, &begin_info).expect("Failed to begin command buffer");
-
-            let dst_image = app.swapchain_images[app.current_image_index as usize];
-
-            // Transition to TRANSFER_DST
-            let barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(dst_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0, level_count: 1,
-                    base_array_layer: 0, layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-
-            app.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[], &[], &[barrier],
-            );
-
-            let needs_scaling = width != app.swapchain_extent.width
-                || height != app.swapchain_extent.height;
-
-            if needs_scaling {
-                let clear_color = vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 1.0],
-                };
-                let color_range = vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                };
-                app.device.cmd_clear_color_image(
-                    cmd,
-                    dst_image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &clear_color,
-                    &[color_range],
-                );
-            }
-
-            // When LFB is at game resolution but swapchain is larger, use a staging
-            // image and vkCmdBlitImage to scale up. Otherwise copy directly.
-            let mut lfb_staging_image = vk::Image::null();
-            let mut lfb_staging_memory = vk::DeviceMemory::null();
-
-            if needs_scaling {
-                // Create staging image at game resolution
-                let staging_image_info = vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .extent(vk::Extent3D { width, height, depth: 1 })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .format(vk::Format::B8G8R8A8_UNORM)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .samples(vk::SampleCountFlags::TYPE_1);
-
-                lfb_staging_image = app
-                    .device
-                    .create_image(&staging_image_info, None)
-                    .expect("Failed to create LFB staging image");
-
-                let img_mem_req = app.device.get_image_memory_requirements(lfb_staging_image);
-
-                let mut img_mem_type = 0;
-                for i in 0..mem_properties.memory_type_count {
-                    if (img_mem_req.memory_type_bits & (1 << i)) != 0
-                        && mem_properties.memory_types[i as usize]
-                            .property_flags
-                            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-                    {
-                        img_mem_type = i;
-                        break;
-                    }
-                }
-
-                let img_alloc = vk::MemoryAllocateInfo::default()
-                    .allocation_size(img_mem_req.size)
-                    .memory_type_index(img_mem_type);
-
-                lfb_staging_memory = app
-                    .device
-                    .allocate_memory(&img_alloc, None)
-                    .expect("Failed to allocate LFB staging image memory");
-
-                app.device
-                    .bind_image_memory(lfb_staging_image, lfb_staging_memory, 0)
-                    .expect("Failed to bind LFB staging image memory");
-
-                // Transition staging image UNDEFINED → TRANSFER_DST
-                let staging_to_dst = vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(lfb_staging_image)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0, level_count: 1,
-                        base_array_layer: 0, layer_count: 1,
-                    })
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-
-                app.device.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[], &[], &[staging_to_dst],
-                );
-
-                // Copy buffer → staging image
-                let region = vk::BufferImageCopy::default()
-                    .image_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0, base_array_layer: 0, layer_count: 1,
-                    })
-                    .image_extent(vk::Extent3D { width, height, depth: 1 });
-
-                app.device.cmd_copy_buffer_to_image(
-                    cmd, staging_buffer, lfb_staging_image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region],
-                );
-
-                // Transition staging image TRANSFER_DST → TRANSFER_SRC
-                let staging_to_src = vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(lfb_staging_image)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0, level_count: 1,
-                        base_array_layer: 0, layer_count: 1,
-                    })
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-
-                app.device.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[], &[], &[staging_to_src],
-                );
-
-                // Blit staging image → swapchain image (scales game res → window res)
-                let blit_region = vk::ImageBlit {
-                    src_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0, base_array_layer: 0, layer_count: 1,
-                    },
-                    src_offsets: [
-                        vk::Offset3D { x: 0, y: 0, z: 0 },
-                        vk::Offset3D { x: width as i32, y: height as i32, z: 1 },
-                    ],
-                    dst_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0, base_array_layer: 0, layer_count: 1,
-                    },
-                    dst_offsets: [
-                        vk::Offset3D {
-                            x: viewport_x as i32,
-                            y: viewport_y as i32,
-                            z: 0,
-                        },
-                        vk::Offset3D {
-                            x: (viewport_x + viewport_width) as i32,
-                            y: (viewport_y + viewport_height) as i32,
-                            z: 1,
-                        },
-                    ],
-                };
-
-                app.device.cmd_blit_image(
-                    cmd,
-                    lfb_staging_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    dst_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[blit_region],
-                    vk::Filter::NEAREST,
-                );
-            } else {
-                // No scaling needed — direct copy
-                let region = vk::BufferImageCopy::default()
-                    .image_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0, base_array_layer: 0, layer_count: 1,
-                    })
-                    .image_extent(vk::Extent3D { width, height, depth: 1 });
-
-                app.device.cmd_copy_buffer_to_image(
-                    cmd, staging_buffer, dst_image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region],
-                );
-            }
-
-            // Transition to PRESENT_SRC
-            let barrier_present = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(dst_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0, level_count: 1,
-                    base_array_layer: 0, layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ);
-
-            app.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[], &[], &[barrier_present],
-            );
-
-            app.device.end_command_buffer(cmd).expect("Failed to end command buffer");
-
-            // Submit and wait
-            let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
-            app.device
-                .queue_submit(app.graphics_queue, &[submit_info], vk::Fence::null())
-                .expect("Failed to submit copy command");
-
-            app.device.queue_wait_idle(app.graphics_queue).expect("Failed to wait for queue");
-
-            // Present
-            let swapchains = [app.swapchain];
-            let image_indices = [app.current_image_index];
-            let present_info = vk::PresentInfoKHR::default()
-                .swapchains(&swapchains)
-                .image_indices(&image_indices);
-
-            match app
-                .swapchain_loader
-                .queue_present(app.present_queue, &present_info)
-            {
-                Ok(suboptimal) => {
-                    if suboptimal {
-                        self.is_framebuffer_resized = true;
-                    }
-                }
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    self.is_framebuffer_resized = true;
-                }
-                Err(error) => panic!("Failed to present LFB upload: {:?}", error),
-            }
-
-            app.last_presented_image_index = app.current_image_index;
-            log::debug!(
-                "lfb_upload: set last_presented={} (current={})",
-                app.last_presented_image_index, app.current_image_index
-            );
-
-            // Signal fence so next buffer_swap won't hang
-            let empty_submit = vk::SubmitInfo::default();
-            app.device
-                .queue_submit(app.graphics_queue, &[empty_submit], app.in_flight_fences[frame])
-                .expect("Failed to signal fence");
-
-            // Cleanup
-            app.device.free_command_buffers(app.command_pool, &cmd_buffers);
-            app.device.destroy_buffer(staging_buffer, None);
-            app.device.free_memory(staging_memory, None);
-            if lfb_staging_image != vk::Image::null() {
-                app.device.destroy_image(lfb_staging_image, None);
-                app.device.free_memory(lfb_staging_memory, None);
-            }
-
-            log::debug!(
-                "LFB write uploaded to framebuffer ({}x{}, image_index={})",
-                width, height, app.current_image_index
-            );
+        if self.lfb_lock_state.buffer == Buffer::Front {
+            self.present_front();
         }
     }
 }
@@ -4558,6 +2950,116 @@ mod tests {
         Gr::init(None)
     }
 
+    #[test]
+    fn continuation_batches_and_clip_coordinates() {
+        use utility::vertex::GpuVertex;
+        let mut gr = create_test_gr();
+        let vertices: Vec<_> = (0..6)
+            .map(|i| GpuVertex {
+                position: [i as f32, 0.0],
+                ..Default::default()
+            })
+            .collect();
+        gr.draw_primitives_gpu(
+            PrimitiveType::TriangleStrip,
+            &vertices[..3],
+            CullMode::Disable,
+        );
+        for v in &vertices[3..] {
+            gr.draw_primitives_gpu(
+                PrimitiveType::TriangleStripContinue,
+                &[*v],
+                CullMode::Disable,
+            );
+            assert_eq!(gr.continuation.len(), 2);
+        }
+        let xs: Vec<_> = gr
+            .vertex_batch
+            .vertices
+            .iter()
+            .map(|v| v.position[0] as u32)
+            .collect();
+        assert_eq!(xs, [0, 1, 2, 2, 1, 3, 2, 3, 4, 4, 3, 5]);
+        gr.vertex_batch.clear();
+        gr.draw_primitives_gpu(
+            PrimitiveType::TriangleFan,
+            &vertices[..2],
+            CullMode::Disable,
+        );
+        for v in &vertices[2..] {
+            gr.draw_primitives_gpu(PrimitiveType::TriangleFanContinue, &[*v], CullMode::Disable);
+        }
+        let xs: Vec<_> = gr
+            .vertex_batch
+            .vertices
+            .iter()
+            .map(|v| v.position[0] as u32)
+            .collect();
+        assert_eq!(xs, [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 5]);
+        gr.vertex_batch.clear();
+        for _ in 0..22000 {
+            gr.draw_primitives_gpu(PrimitiveType::Triangles, &vertices[..3], CullMode::Disable);
+        }
+        assert_eq!(
+            gr.vertex_batch.vertices.len(),
+            66000,
+            "batch limit must not drop triangles"
+        );
+        gr.vertex_batch.clear();
+        gr.state.screen_width = 800;
+        gr.state.screen_height = 600;
+        gr.clip_window(0, 0, 800, 600);
+        gr.draw_triangle(
+            &Vertex::new(0.0, 0.0),
+            &Vertex::new(1.0, 0.0),
+            &Vertex::new(0.0, 1.0),
+        );
+        gr.clip_window(10, 20, 30, 40);
+        gr.alpha_blend_function(
+            AlphaBlendFnc::SrcAlpha,
+            AlphaBlendFnc::One,
+            AlphaBlendFnc::One,
+            AlphaBlendFnc::Zero,
+        );
+        gr.draw_triangle(
+            &Vertex::new(0.0, 0.0),
+            &Vertex::new(1.0, 0.0),
+            &Vertex::new(0.0, 1.0),
+        );
+        gr.vertex_batch.finalize();
+        assert_eq!(
+            gr.vertex_batch.draw_calls.len(),
+            2,
+            "state setters retain a single batch"
+        );
+        assert_eq!(
+            gr.vertex_batch.draw_calls[0]
+                .state
+                .unwrap()
+                .clip
+                .extent
+                .width,
+            800
+        );
+        assert_eq!(
+            gr.vertex_batch.draw_calls[1]
+                .state
+                .unwrap()
+                .clip
+                .extent
+                .width,
+            20
+        );
+        api::coordinate_space(CoordinateSpaceMode::Clip);
+        let mut v = Vertex::new(-2.0, 2.0);
+        v.oow = 0.5;
+        v.tmuvtx[0].sow = 128.0;
+        let gpu = gr.gpu_vertex(&v, 0.5);
+        api::coordinate_space(CoordinateSpaceMode::Window);
+        assert_eq!(gpu.position, [0.0, 600.0]);
+        assert_eq!((gpu.tex_coord[0], gpu.tex_q), (64.0, 0.5));
+    }
+
     // ==================== Gr::init Tests ====================
 
     #[test]
@@ -4590,77 +3092,6 @@ mod tests {
     fn test_sst_select_invalid_device() {
         let mut gr = create_test_gr();
         gr.sst_select(999); // Should panic - invalid device index
-    }
-
-    // ==================== grGetString Tests ====================
-
-    #[test]
-    fn test_get_string_renderer() {
-        let mut gr = create_test_gr();
-        let ptr = gr.get_string(EnvironmentInfo::Renderer);
-        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
-        assert_eq!(s, "Glide");
-    }
-
-    #[test]
-    fn test_get_string_vendor() {
-        let mut gr = create_test_gr();
-        let ptr = gr.get_string(EnvironmentInfo::Vendor);
-        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
-        assert_eq!(s, "3Dfx Interactive");
-    }
-
-    #[test]
-    fn test_get_string_version() {
-        let mut gr = create_test_gr();
-        let ptr = gr.get_string(EnvironmentInfo::Version);
-        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
-        assert_eq!(s, "3.0");
-    }
-
-    #[test]
-    fn test_get_string_hardware() {
-        let mut gr = create_test_gr();
-        let ptr = gr.get_string(EnvironmentInfo::Hardware);
-        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
-        assert_eq!(s, "Banshee");
-    }
-
-    #[test]
-    fn test_get_string_extension() {
-        let mut gr = create_test_gr();
-        let ptr = gr.get_string(EnvironmentInfo::Extension);
-        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
-        assert_eq!(s, " "); // Just a space
-    }
-
-    // ==================== grGet Tests ====================
-
-    #[test]
-    fn test_get_num_boards() {
-        let mut gr = create_test_gr();
-        let mut value: i32 = 0;
-        let result = gr.get(EnvironmentParameters::NumBoards, 4, &mut value);
-        assert_eq!(result, 1);
-        assert_eq!(value, 1);
-    }
-
-    #[test]
-    fn test_get_max_texture_size() {
-        let mut gr = create_test_gr();
-        let mut value: i32 = 0;
-        let result = gr.get(EnvironmentParameters::MaxTextureSize, 4, &mut value);
-        assert_eq!(result, 1);
-        assert_eq!(value, 256);
-    }
-
-    #[test]
-    fn test_get_num_fb() {
-        let mut gr = create_test_gr();
-        let mut value: i32 = 0;
-        let result = gr.get(EnvironmentParameters::NumFb, 4, &mut value);
-        assert_eq!(result, 1);
-        assert_eq!(value, 1);
     }
 
     // ==================== grSelectContext Tests ====================
@@ -4747,10 +3178,7 @@ mod tests {
 
     #[test]
     fn test_scale_bgra_nearest_preserves_pixel_blocks() {
-        let source = vec![
-            1, 0, 0, 255, 2, 0, 0, 255,
-            3, 0, 0, 255, 4, 0, 0, 255,
-        ];
+        let source = vec![1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255];
         let scaled = scale_bgra_nearest(&source, 2, 2, 4, 4);
 
         let pixel = |x: usize, y: usize| scaled[(y * 4 + x) * 4];
@@ -5006,16 +3434,16 @@ mod tests {
         let mut gr = create_test_gr();
         gr.tex_combine(
             ChipID::Tmu0,
-            TextureCombineFnc::Decal,
+            CombineFunction::Local,
             CombineFactor::One,
-            TextureCombineFnc::Decal,
+            CombineFunction::Local,
             CombineFactor::One,
             FxBool::False,
             FxBool::False,
         );
         assert!(matches!(
             gr.state.tex_combine_function[0],
-            TextureCombineFnc::Decal
+            CombineFunction::Local
         ));
         assert!(matches!(gr.state.tex_combine_factor[0], CombineFactor::One));
     }
@@ -5041,23 +3469,14 @@ mod tests {
         let mut palette = [0u32; 256];
         palette[1] = 0xFF12_3456;
 
-        gr.tex_download_table(
-            TextureTableType::Palette,
-            palette.as_ptr().cast(),
-        );
+        gr.tex_download_table(TextureTableType::Palette, palette.as_ptr().cast());
         assert_eq!(gr.state.palette_generation, 1);
 
-        gr.tex_download_table(
-            TextureTableType::Palette,
-            palette.as_ptr().cast(),
-        );
+        gr.tex_download_table(TextureTableType::Palette, palette.as_ptr().cast());
         assert_eq!(gr.state.palette_generation, 1);
 
         palette[1] = 0xFF65_4321;
-        gr.tex_download_table(
-            TextureTableType::Palette,
-            palette.as_ptr().cast(),
-        );
+        gr.tex_download_table(TextureTableType::Palette, palette.as_ptr().cast());
         assert_eq!(gr.state.palette_generation, 2);
     }
 
@@ -5067,10 +3486,7 @@ mod tests {
         let mut palette = [0u32; 256];
         palette[0] = 0xFF80_4020;
 
-        gr.tex_download_table(
-            TextureTableType::Palette6666Ext,
-            palette.as_ptr().cast(),
-        );
+        gr.tex_download_table(TextureTableType::Palette6666Ext, palette.as_ptr().cast());
 
         let stored = gr.texture_memory[0].get_palette(0).unwrap();
         assert_eq!(stored.entries[0], 0xFF82_4120);
@@ -5092,8 +3508,14 @@ mod tests {
             CombineFunction::Local
         ));
         assert!(matches!(gr.state.color_combine_factor, CombineFactor::One));
-        assert!(matches!(gr.state.color_combine_local, CombineLocal::Constant));
-        assert!(matches!(gr.state.color_combine_other, CombineOther::Iterated));
+        assert!(matches!(
+            gr.state.color_combine_local,
+            CombineLocal::Constant
+        ));
+        assert!(matches!(
+            gr.state.color_combine_other,
+            CombineOther::Iterated
+        ));
         assert!(gr.state.color_combine_invert);
     }
 
@@ -5111,9 +3533,18 @@ mod tests {
             gr.state.alpha_combine_function,
             CombineFunction::ScaleOther
         ));
-        assert!(matches!(gr.state.alpha_combine_factor, CombineFactor::Local));
-        assert!(matches!(gr.state.alpha_combine_local, CombineLocal::Iterated));
-        assert!(matches!(gr.state.alpha_combine_other, CombineOther::Texture));
+        assert!(matches!(
+            gr.state.alpha_combine_factor,
+            CombineFactor::Local
+        ));
+        assert!(matches!(
+            gr.state.alpha_combine_local,
+            CombineLocal::Iterated
+        ));
+        assert!(matches!(
+            gr.state.alpha_combine_other,
+            CombineOther::Texture
+        ));
         assert!(!gr.state.alpha_combine_invert);
     }
 

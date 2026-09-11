@@ -87,14 +87,12 @@ pub unsafe fn configure_native_window(
     resizable: bool,
     centered: bool,
 ) -> Option<(u32, u32)> {
-    use std::mem::size_of;
     use std::ptr::null_mut;
     use winapi::shared::windef::{HWND, RECT};
     use winapi::um::winuser::{
-        AdjustWindowRectEx, GetMonitorInfoW, GetWindowLongW, GetWindowRect, MonitorFromWindow,
-        SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, MONITORINFO,
-        MONITOR_DEFAULTTONEAREST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
-        WS_MAXIMIZEBOX, WS_THICKFRAME,
+        AdjustWindowRectEx, GetWindowLongW, GetWindowRect, SetWindowLongW, SetWindowPos,
+        GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, WS_MAXIMIZEBOX,
+        WS_THICKFRAME,
     };
 
     let raw_hwnd = hwnd;
@@ -131,10 +129,7 @@ pub unsafe fn configure_native_window(
     let mut y = current_rect.top;
 
     if centered {
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        let mut monitor_info: MONITORINFO = std::mem::zeroed();
-        monitor_info.cbSize = size_of::<MONITORINFO>() as u32;
-        if !monitor.is_null() && GetMonitorInfoW(monitor, &mut monitor_info) != 0 {
+        if let Some(monitor_info) = native_monitor_info(raw_hwnd) {
             x = monitor_info.rcWork.left
                 + (monitor_info.rcWork.right - monitor_info.rcWork.left - outer_width) / 2;
             y = monitor_info.rcWork.top
@@ -170,4 +165,19 @@ pub unsafe fn native_window_client_size(hwnd: u32) -> Option<(u32, u32)> {
     let width = (rect.right - rect.left).max(0) as u32;
     let height = (rect.bottom - rect.top).max(0) as u32;
     Some((width, height))
+}
+
+#[cfg(target_os = "windows")]
+pub unsafe fn native_monitor_info(hwnd: u32) -> Option<winapi::um::winuser::MONITORINFO> {
+    use winapi::um::winuser::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    let monitor = MonitorFromWindow(hwnd as usize as _, MONITOR_DEFAULTTONEAREST);
+    let mut info: MONITORINFO = std::mem::zeroed();
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if monitor.is_null() || GetMonitorInfoW(monitor, &mut info) == 0 {
+        None
+    } else {
+        Some(info)
+    }
 }

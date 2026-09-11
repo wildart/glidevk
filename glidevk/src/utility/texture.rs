@@ -5,12 +5,13 @@ use ash::vk;
 use crate::glidesys::{AspectRatio, TextureFormat, LOD};
 
 /// Texture data stored in CPU memory
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TextureData {
     pub width: u32,
     pub height: u32,
     pub format: TextureFormat,
     pub data: Vec<u8>,
+    pub mipmaps: Vec<TextureData>,
 }
 
 impl TextureData {
@@ -20,7 +21,33 @@ impl TextureData {
             height,
             format,
             data,
+            mipmaps: Vec::new(),
         }
+    }
+}
+
+impl TextureData {
+    pub fn level_mut(&mut self, width: u32, height: u32) -> &mut TextureData {
+        if (width, height) == (self.width, self.height) {
+            return self;
+        }
+        if let Some(index) = self
+            .mipmaps
+            .iter()
+            .position(|level| (level.width, level.height) == (width, height))
+        {
+            return &mut self.mipmaps[index];
+        }
+        self.mipmaps.push(TextureData::new(
+            width,
+            height,
+            self.format,
+            vec![0; width as usize * height as usize * self.format.bytes_per_pixel()],
+        ));
+        self.mipmaps.last_mut().unwrap()
+    }
+    pub fn byte_len(&self) -> usize {
+        self.data.len() + self.mipmaps.iter().map(Self::byte_len).sum::<usize>()
     }
 }
 
@@ -28,12 +55,14 @@ impl TextureData {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaletteTable {
     pub entries: Vec<u32>, // ARGB colors
+    pub extended_alpha: bool,
 }
 
 impl PaletteTable {
     pub fn new() -> Self {
         PaletteTable {
             entries: vec![0; 256],
+            extended_alpha: false,
         }
     }
 
@@ -49,7 +78,10 @@ impl PaletteTable {
         while entries.len() < 256 {
             entries.push(0);
         }
-        PaletteTable { entries }
+        PaletteTable {
+            entries,
+            extended_alpha: false,
+        }
     }
 
     /// Build a palette using the Glide PALETTE_6666 extension semantics.
@@ -59,18 +91,14 @@ impl PaletteTable {
     /// expand the result back to ARGB8888 for Vulkan sampling.
     pub fn from_argb6666_data(data: &[u8]) -> Self {
         let mut palette = Self::from_data(data);
+        palette.extended_alpha = true;
         for color in &mut palette.entries {
             let [b, g, r, a] = color.to_le_bytes();
             let quantize = |channel: u8| {
                 let six_bits = channel >> 2;
                 (six_bits << 2) | (six_bits >> 4)
             };
-            *color = u32::from_le_bytes([
-                quantize(b),
-                quantize(g),
-                quantize(r),
-                quantize(a),
-            ]);
+            *color = u32::from_le_bytes([quantize(b), quantize(g), quantize(r), quantize(a)]);
         }
         palette
     }
@@ -86,6 +114,7 @@ impl Default for PaletteTable {
 /// Stores textures indexed by their Glide memory address
 pub struct TextureMemory {
     textures: HashMap<u32, TextureData>,
+    ncc: [PaletteTable; 2],
     palettes: [PaletteTable; 2], // NCC tables or color palettes per TMU
     total_memory: usize,
     max_memory: usize,
@@ -96,6 +125,7 @@ impl TextureMemory {
         TextureMemory {
             textures: HashMap::new(),
             palettes: [PaletteTable::new(), PaletteTable::new()],
+            ncc: [PaletteTable::new(), PaletteTable::new()],
             total_memory: 0,
             max_memory: max_memory_per_tmu,
         }
@@ -103,11 +133,11 @@ impl TextureMemory {
 
     /// Store a texture at the given Glide address
     pub fn store_texture(&mut self, address: u32, texture: TextureData) {
-        let size = texture.data.len();
+        let size = texture.byte_len();
 
         // Remove old texture at this address if it exists
         if let Some(old) = self.textures.remove(&address) {
-            self.total_memory = self.total_memory.saturating_sub(old.data.len());
+            self.total_memory = self.total_memory.saturating_sub(old.byte_len());
         }
 
         self.total_memory += size;
@@ -141,6 +171,33 @@ impl TextureMemory {
         } else {
             None
         }
+    }
+
+    pub fn store_ncc(&mut self, index: usize, data: &[u8]) {
+        if index >= 2 || data.len() < 64 {
+            return;
+        }
+        let signed = |offset| i16::from_le_bytes([data[offset], data[offset + 1]]) as i32;
+        let entries = (0..256)
+            .map(|value| {
+                let y = data[value >> 4] as i32;
+                let rgb: Vec<u32> = (0..3)
+                    .map(|channel| {
+                        (y + signed(16 + ((value >> 2) & 3) * 6 + channel * 2)
+                            + signed(40 + (value & 3) * 6 + channel * 2))
+                        .clamp(0, 255) as u32
+                    })
+                    .collect();
+                0xff000000 | (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]
+            })
+            .collect();
+        self.ncc[index] = PaletteTable {
+            entries,
+            extended_alpha: false,
+        };
+    }
+    pub fn ncc(&self, index: usize) -> &PaletteTable {
+        &self.ncc[index.min(1)]
     }
 
     /// Calculate texture size from LOD and aspect ratio
@@ -361,7 +418,11 @@ impl VulkanTexture {
             // Single submission for all operations
             if let Some(fence) = upload_fence {
                 Self::end_single_time_commands_with_fence(
-                    device, command_pool, graphics_queue, cmd, fence,
+                    device,
+                    command_pool,
+                    graphics_queue,
+                    cmd,
+                    fence,
                 );
             } else {
                 Self::end_single_time_commands(device, command_pool, graphics_queue, cmd);
@@ -402,8 +463,7 @@ impl VulkanTexture {
         }
     }
 
-    /// Create a texture and record upload commands into an external command buffer.
-    /// Returns the texture and staging resources to be cleaned up after the cmd buffer completes.
+    /// Compatibility entrypoint for a single RGBA level.
     pub fn new_into_cmd(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -413,10 +473,36 @@ impl VulkanTexture {
         height: u32,
         rgba_data: &[u8],
     ) -> (Self, vk::Buffer, vk::DeviceMemory) {
-        let image_size = (width * height * 4) as vk::DeviceSize;
+        Self::new_mips_into_cmd(
+            device,
+            instance,
+            physical_device,
+            cmd,
+            width,
+            height,
+            &[rgba_data.to_vec()],
+        )
+    }
+
+    /// Create a texture and record upload commands into an external command buffer.
+    /// Returns the texture and staging resources to be cleaned up after the cmd buffer completes.
+    pub fn new_mips_into_cmd(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        cmd: vk::CommandBuffer,
+        width: u32,
+        height: u32,
+        levels: &[Vec<u8>],
+    ) -> (Self, vk::Buffer, vk::DeviceMemory) {
+        let rgba_data: Vec<u8> = levels.iter().flatten().copied().collect();
+        let image_size = rgba_data.len() as vk::DeviceSize;
 
         let (staging_buffer, staging_memory) = Self::create_buffer(
-            device, instance, physical_device, image_size,
+            device,
+            instance,
+            physical_device,
+            image_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         );
@@ -431,8 +517,12 @@ impl VulkanTexture {
 
         let image_create_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .extent(vk::Extent3D { width, height, depth: 1 })
-            .mip_levels(1)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(levels.len() as u32)
             .array_layers(1)
             .format(vk::Format::R8G8B8A8_UNORM)
             .tiling(vk::ImageTiling::OPTIMAL)
@@ -442,12 +532,16 @@ impl VulkanTexture {
             .samples(vk::SampleCountFlags::TYPE_1);
 
         let image = unsafe {
-            device.create_image(&image_create_info, None).expect("Failed to create texture image")
+            device
+                .create_image(&image_create_info, None)
+                .expect("Failed to create texture image")
         };
 
         let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
         let memory_type = Self::find_memory_type(
-            instance, physical_device, mem_requirements.memory_type_bits,
+            instance,
+            physical_device,
+            mem_requirements.memory_type_bits,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         );
 
@@ -456,17 +550,24 @@ impl VulkanTexture {
             .memory_type_index(memory_type);
 
         let memory = unsafe {
-            device.allocate_memory(&alloc_info, None).expect("Failed to allocate texture memory")
+            device
+                .allocate_memory(&alloc_info, None)
+                .expect("Failed to allocate texture memory")
         };
 
         unsafe {
-            device.bind_image_memory(image, memory, 0).expect("Failed to bind texture memory");
+            device
+                .bind_image_memory(image, memory, 0)
+                .expect("Failed to bind texture memory");
         }
 
         // Record barriers + copy into the provided command buffer
         let subresource_range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1,
+            base_mip_level: 0,
+            level_count: levels.len() as u32,
+            base_array_layer: 0,
+            layer_count: 1,
         };
 
         let barrier_to_dst = vk::ImageMemoryBarrier::default()
@@ -479,12 +580,28 @@ impl VulkanTexture {
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
 
-        let region = vk::BufferImageCopy::default()
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0, base_array_layer: 0, layer_count: 1,
+        let mut offset = 0;
+        let regions: Vec<_> = levels
+            .iter()
+            .enumerate()
+            .map(|(level, bytes)| {
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(offset)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(level as u32)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: (width >> level).max(1),
+                        height: (height >> level).max(1),
+                        depth: 1,
+                    });
+                offset += bytes.len() as u64;
+                region
             })
-            .image_extent(vk::Extent3D { width, height, depth: 1 });
+            .collect();
 
         let barrier_to_shader = vk::ImageMemoryBarrier::default()
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -497,9 +614,31 @@ impl VulkanTexture {
             .dst_access_mask(vk::AccessFlags::SHADER_READ);
 
         unsafe {
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[barrier_to_dst]);
-            device.cmd_copy_buffer_to_image(cmd, staging_buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &[barrier_to_shader]);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier_to_dst],
+            );
+            device.cmd_copy_buffer_to_image(
+                cmd,
+                staging_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &regions,
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier_to_shader],
+            );
         }
 
         let view_create_info = vk::ImageViewCreateInfo::default()
@@ -509,10 +648,18 @@ impl VulkanTexture {
             .subresource_range(subresource_range);
 
         let view = unsafe {
-            device.create_image_view(&view_create_info, None).expect("Failed to create image view")
+            device
+                .create_image_view(&view_create_info, None)
+                .expect("Failed to create image view")
         };
 
-        let texture = VulkanTexture { image, memory, view, width, height };
+        let texture = VulkanTexture {
+            image,
+            memory,
+            view,
+            width,
+            height,
+        };
         (texture, staging_buffer, staging_memory)
     }
 
@@ -685,7 +832,7 @@ impl VulkanTexture {
         Self::end_single_time_commands(device, command_pool, queue, command_buffer);
     }
 
-    fn begin_single_time_commands(
+    pub(crate) fn begin_single_time_commands(
         device: &ash::Device,
         command_pool: vk::CommandPool,
     ) -> vk::CommandBuffer {
@@ -712,7 +859,7 @@ impl VulkanTexture {
         command_buffer
     }
 
-    fn end_single_time_commands(
+    pub(crate) fn end_single_time_commands(
         device: &ash::Device,
         command_pool: vk::CommandPool,
         queue: vk::Queue,
@@ -786,9 +933,11 @@ pub const MAX_CACHED_TEXTURES: usize = 2048;
 /// Uses descriptor indexing: a single descriptor set with an array of
 /// MAX_CACHED_TEXTURES combined image samplers at binding 0. Each texture
 /// is assigned a slot index; vertices reference textures by slot index.
+pub const DISPLAY_SLOT: u32 = MAX_CACHED_TEXTURES as u32 - 1;
+
 pub struct TextureCache {
+    samplers: Vec<vk::Sampler>,
     textures: HashMap<u32, VulkanTexture>,
-    sampler: vk::Sampler,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     /// Single shared descriptor set with array of samplers
@@ -811,47 +960,31 @@ pub struct TextureCache {
 
 impl TextureCache {
     pub fn new(device: &ash::Device) -> Self {
-        // Create sampler
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::NEAREST)
-            .min_filter(vk::Filter::NEAREST)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .anisotropy_enable(false)
-            .max_anisotropy(1.0)
-            .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
-            .unnormalized_coordinates(false)
-            .compare_enable(false)
-            .compare_op(vk::CompareOp::ALWAYS)
-            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-            .mip_lod_bias(0.0)
-            .min_lod(0.0)
-            .max_lod(0.0);
-
-        let sampler = unsafe {
-            device
-                .create_sampler(&sampler_info, None)
-                .expect("Failed to create texture sampler")
-        };
-
         // Create descriptor set layout with descriptor indexing flags
         let layout_binding = vk::DescriptorSetLayoutBinding::default()
             .binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
             .descriptor_count(MAX_CACHED_TEXTURES as u32)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT);
 
         let binding_flags = [
             vk::DescriptorBindingFlags::PARTIALLY_BOUND
                 | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+            vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+        ];
+        let bindings = [
+            layout_binding,
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(72)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let mut binding_flags_info =
-            vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                .binding_flags(&binding_flags);
+            vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
 
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
-            .bindings(std::slice::from_ref(&layout_binding))
+            .bindings(&bindings)
             .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
             .push_next(&mut binding_flags_info);
 
@@ -863,11 +996,17 @@ impl TextureCache {
 
         // Create descriptor pool with UPDATE_AFTER_BIND flag
         let pool_size = vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .ty(vk::DescriptorType::SAMPLED_IMAGE)
             .descriptor_count(MAX_CACHED_TEXTURES as u32);
 
+        let pool_sizes = [
+            pool_size,
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(72),
+        ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .pool_sizes(std::slice::from_ref(&pool_size))
+            .pool_sizes(&pool_sizes)
             .max_sets(1)
             .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND);
 
@@ -890,8 +1029,7 @@ impl TextureCache {
 
         let upload_fence = unsafe {
             // Start signaled so first reset_fences succeeds
-            let fence_info = vk::FenceCreateInfo::default()
-                .flags(vk::FenceCreateFlags::SIGNALED);
+            let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
             device
                 .create_fence(&fence_info, None)
                 .expect("Failed to create upload fence")
@@ -899,11 +1037,49 @@ impl TextureCache {
 
         // Slot 0 is reserved for the placeholder texture.
         // Free slots start from 1.
-        let free_slots: Vec<u32> = (1..MAX_CACHED_TEXTURES as u32).rev().collect();
+        let free_slots: Vec<u32> = (1..DISPLAY_SLOT).rev().collect();
 
+        // Nearest mip sampling only; add trilinear variants and keyed LOD bias when needed.
+        let samplers: Vec<_> = (0..72)
+            .map(|key| {
+                let wrap = |mode| match mode {
+                    1 => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                    2 => vk::SamplerAddressMode::MIRRORED_REPEAT,
+                    _ => vk::SamplerAddressMode::REPEAT,
+                };
+                unsafe {
+                    device
+                        .create_sampler(
+                            &vk::SamplerCreateInfo::default()
+                                .min_filter(vk::Filter::from_raw(key / 18 % 2))
+                                .mag_filter(vk::Filter::from_raw(key / 9 % 2))
+                                .address_mode_u(wrap(key / 3 % 3))
+                                .address_mode_v(wrap(key % 3))
+                                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                                .max_lod(if key < 36 { 0.0 } else { vk::LOD_CLAMP_NONE }),
+                            None,
+                        )
+                        .expect("Create sampler")
+                }
+            })
+            .collect();
+        let infos: Vec<_> = samplers
+            .iter()
+            .map(|&sampler| vk::DescriptorImageInfo::default().sampler(sampler))
+            .collect();
+        unsafe {
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&infos)],
+                &[],
+            );
+        }
         TextureCache {
+            samplers,
             textures: HashMap::new(),
-            sampler,
             descriptor_set_layout,
             descriptor_pool,
             descriptor_set,
@@ -915,65 +1091,6 @@ impl TextureCache {
             upload_fence,
             uploaded_palette_gen: HashMap::new(),
         }
-    }
-
-    /// Upload a raw RGBA8 texture to the cache
-    pub fn upload_rgba8(
-        &mut self,
-        device: &ash::Device,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        command_pool: vk::CommandPool,
-        queue: vk::Queue,
-        texture_addr: u32,
-        width: u32,
-        height: u32,
-        rgba_data: &[u8],
-    ) {
-        // Create new Vulkan texture from RGBA data
-        let texture = VulkanTexture::new(
-            device,
-            instance,
-            physical_device,
-            command_pool,
-            queue,
-            width,
-            height,
-            rgba_data,
-            None, // init-time upload, no reusable fence
-        );
-
-        // Remove old texture if it exists (reuse its slot)
-        let slot = if let Some(old_slot) = self.slot_map.remove(&texture_addr) {
-            if let Some(old_texture) = self.textures.remove(&texture_addr) {
-                old_texture.destroy(device);
-                self.insertion_order.retain(|&a| a != texture_addr);
-            }
-            old_slot
-        } else {
-            self.free_slots.pop().expect("No free texture slots available")
-        };
-
-        // Update descriptor at slot index
-        let image_info = vk::DescriptorImageInfo::default()
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image_view(texture.view)
-            .sampler(self.sampler);
-
-        let descriptor_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.descriptor_set)
-            .dst_binding(0)
-            .dst_array_element(slot)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(std::slice::from_ref(&image_info));
-
-        unsafe {
-            device.update_descriptor_sets(&[descriptor_write], &[]);
-        }
-
-        self.textures.insert(texture_addr, texture);
-        self.slot_map.insert(texture_addr, slot);
-        self.insertion_order.push(texture_addr);
     }
 
     /// Create the placeholder texture (1x1 white pixel) at slot 0
@@ -1003,14 +1120,13 @@ impl TextureCache {
         // Update descriptor at slot 0 (reserved for placeholder)
         let image_info = vk::DescriptorImageInfo::default()
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image_view(texture.view)
-            .sampler(self.sampler);
+            .image_view(texture.view);
 
         let descriptor_write = vk::WriteDescriptorSet::default()
             .dst_set(self.descriptor_set)
             .dst_binding(0)
             .dst_array_element(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
             .image_info(std::slice::from_ref(&image_info));
 
         unsafe {
@@ -1020,72 +1136,72 @@ impl TextureCache {
         self.placeholder = Some(texture);
     }
 
-    /// Upload a texture and update its descriptor array slot
+    /// Compatibility entrypoints share the synchronized batch uploader.
+    pub fn upload_rgba8(
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        address: u32,
+        width: u32,
+        height: u32,
+        rgba_data: &[u8],
+    ) {
+        self.batch_upload_rgba(
+            device,
+            instance,
+            physical_device,
+            command_pool,
+            queue,
+            vec![(address, width, height, vec![rgba_data.to_vec()])],
+        );
+    }
+
     pub fn upload_texture(
         &mut self,
         device: &ash::Device,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         command_pool: vk::CommandPool,
-        graphics_queue: vk::Queue,
+        queue: vk::Queue,
         address: u32,
-        texture_data: &TextureData,
+        texture: &TextureData,
         palette: Option<&PaletteTable>,
     ) {
-        // Convert texture to RGBA8
-        let rgba_data = convert_to_rgba8(texture_data, palette);
-
-        // Create Vulkan texture (use reusable fence for frame-time uploads)
-        let texture = VulkanTexture::new(
+        self.batch_upload(
             device,
             instance,
             physical_device,
             command_pool,
-            graphics_queue,
-            texture_data.width,
-            texture_data.height,
-            &rgba_data,
-            Some(self.upload_fence),
+            queue,
+            vec![(address, texture.clone(), palette.cloned())],
         );
+    }
 
-        // Reuse existing slot or allocate a new one
-        let slot = if let Some(old_slot) = self.slot_map.remove(&address) {
-            // Defer destruction of old texture (may still be in-flight)
-            if let Some(old_texture) = self.textures.remove(&address) {
-                self.pending_destroy.push(old_texture);
-                self.insertion_order.retain(|&a| a != address);
+    pub fn needs_eviction(&self) -> bool {
+        self.free_slots.is_empty()
+    }
+
+    /// Caller must have completed all readers before reclaiming cached resources.
+    pub fn evict_if_needed(
+        &mut self,
+        device: &ash::Device,
+        protected: &std::collections::HashSet<u32>,
+    ) {
+        if self.needs_eviction() {
+            if let Some(address) = self
+                .insertion_order
+                .iter()
+                .copied()
+                .find(|a| !protected.contains(a))
+            {
+                self.invalidate_texture(device, address);
+                self.flush_pending_destroy(device);
             }
-            old_slot
-        } else {
-            self.free_slots.pop().expect("No free texture slots available")
-        };
-
-        // Update descriptor at slot index
-        let image_info = vk::DescriptorImageInfo::default()
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image_view(texture.view)
-            .sampler(self.sampler);
-
-        let descriptor_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.descriptor_set)
-            .dst_binding(0)
-            .dst_array_element(slot)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(std::slice::from_ref(&image_info));
-
-        unsafe {
-            device.update_descriptor_sets(&[descriptor_write], &[]);
         }
-
-        self.textures.insert(address, texture);
-        self.slot_map.insert(address, slot);
-        self.insertion_order.push(address);
-
-        log::trace!(
-            "Texture cache: {} textures, {} slots used",
-            self.textures.len(),
-            self.slot_map.len()
-        );
+        self.make_room(device, protected);
     }
 
     /// Batch-upload multiple textures in a single command buffer submission.
@@ -1099,22 +1215,70 @@ impl TextureCache {
         graphics_queue: vk::Queue,
         textures: Vec<(u32, TextureData, Option<PaletteTable>)>,
     ) {
+        let textures = textures
+            .into_iter()
+            .map(|(address, texture_data, palette)| {
+                let max_level = texture_data
+                    .mipmaps
+                    .iter()
+                    .map(|m| {
+                        texture_data.width.max(texture_data.height).ilog2()
+                            - m.width.max(m.height).ilog2()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let mut levels = vec![convert_to_rgba8(&texture_data, palette.as_ref())];
+                // Clamp incomplete chains to their last contiguous level.
+                for level in 1..=max_level {
+                    let (w, h) = (
+                        (texture_data.width >> level).max(1),
+                        (texture_data.height >> level).max(1),
+                    );
+                    let Some(mip) = texture_data
+                        .mipmaps
+                        .iter()
+                        .find(|m| (m.width, m.height) == (w, h))
+                    else {
+                        break;
+                    };
+                    levels.push(convert_to_rgba8(mip, palette.as_ref()));
+                }
+                (address, texture_data.width, texture_data.height, levels)
+            })
+            .collect();
+        self.batch_upload_rgba(
+            device,
+            instance,
+            physical_device,
+            command_pool,
+            graphics_queue,
+            textures,
+        );
+    }
+
+    fn batch_upload_rgba(
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        graphics_queue: vk::Queue,
+        textures: Vec<(u32, u32, u32, Vec<Vec<u8>>)>,
+    ) {
         if textures.is_empty() {
             return;
         }
-
+        unsafe {
+            device
+                .device_wait_idle()
+                .expect("Wait before descriptor replacement");
+        }
+        let protected = textures.iter().map(|(address, _, _, _)| *address).collect();
+        self.make_room(device, &protected);
         let cmd = VulkanTexture::begin_single_time_commands(device, command_pool);
         let mut staging_resources: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
 
-        for (address, texture_data, palette) in &textures {
-            let rgba_data = convert_to_rgba8(texture_data, palette.as_ref());
-
-            let (texture, staging_buf, staging_mem) = VulkanTexture::new_into_cmd(
-                device, instance, physical_device, cmd,
-                texture_data.width, texture_data.height, &rgba_data,
-            );
-            staging_resources.push((staging_buf, staging_mem));
-
+        for (address, width, height, levels) in &textures {
             // Reuse existing slot or allocate a new one
             let slot = if let Some(old_slot) = self.slot_map.remove(address) {
                 if let Some(old_texture) = self.textures.remove(address) {
@@ -1123,20 +1287,36 @@ impl TextureCache {
                 }
                 old_slot
             } else {
-                self.free_slots.pop().expect("No free texture slots available")
+                match self.free_slots.pop() {
+                    Some(slot) => slot,
+                    None => {
+                        log::error!("Texture working set exceeds descriptor capacity; using placeholder for {address:#x}");
+                        continue;
+                    }
+                }
             };
+
+            let (texture, staging_buf, staging_mem) = VulkanTexture::new_mips_into_cmd(
+                device,
+                instance,
+                physical_device,
+                cmd,
+                *width,
+                *height,
+                levels,
+            );
+            staging_resources.push((staging_buf, staging_mem));
 
             // Update descriptor at slot index
             let image_info = vk::DescriptorImageInfo::default()
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image_view(texture.view)
-                .sampler(self.sampler);
+                .image_view(texture.view);
 
             let descriptor_write = vk::WriteDescriptorSet::default()
                 .dst_set(self.descriptor_set)
                 .dst_binding(0)
                 .dst_array_element(slot)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                 .image_info(std::slice::from_ref(&image_info));
 
             unsafe {
@@ -1150,7 +1330,11 @@ impl TextureCache {
 
         // Single submission for all texture uploads
         VulkanTexture::end_single_time_commands_with_fence(
-            device, command_pool, graphics_queue, cmd, self.upload_fence,
+            device,
+            command_pool,
+            graphics_queue,
+            cmd,
+            self.upload_fence,
         );
 
         // Cleanup all staging buffers
@@ -1210,53 +1394,37 @@ impl TextureCache {
         }
     }
 
-    /// Check if eviction is needed without actually evicting
-    pub fn needs_eviction(&self) -> bool {
-        self.textures.len() >= MAX_CACHED_TEXTURES
+    /// Reclaim space before allocation; the caller has completed previous readers.
+    pub fn make_room(&mut self, device: &ash::Device, protected: &std::collections::HashSet<u32>) {
+        let required = protected
+            .iter()
+            .filter(|a| !self.slot_map.contains_key(a))
+            .count();
+        let candidates = self.insertion_order.clone();
+        for address in candidates {
+            if self.free_slots.len() >= required {
+                break;
+            }
+            if !protected.contains(&address) {
+                self.invalidate_texture(device, address);
+            }
+        }
+        self.flush_pending_destroy(device);
     }
 
-    /// Evict least-recently-used textures, protecting those needed by the current frame.
-    /// Must be called only after all in-flight GPU work using these textures has completed.
-    pub fn evict_if_needed(
-        &mut self,
-        device: &ash::Device,
-        protected: &std::collections::HashSet<u32>,
-    ) {
-        if self.textures.len() < MAX_CACHED_TEXTURES {
-            return;
-        }
-
-        // Evict oldest entries that aren't in the protected set
-        let target = MAX_CACHED_TEXTURES / 2;
-        let mut evicted = 0;
-        let mut new_order = Vec::with_capacity(self.insertion_order.len());
-
-        for addr in self.insertion_order.drain(..) {
-            if self.textures.len() - evicted <= target {
-                new_order.push(addr);
-                continue;
-            }
-            if protected.contains(&addr) {
-                new_order.push(addr);
-                continue;
-            }
-            // Return slot to free list and destroy texture
-            if let Some(slot) = self.slot_map.remove(&addr) {
-                self.free_slots.push(slot);
-            }
-            if let Some(texture) = self.textures.remove(&addr) {
-                texture.destroy(device);
-            }
-            self.uploaded_palette_gen.remove(&addr);
-            evicted += 1;
-        }
-        self.insertion_order = new_order;
-
-        if evicted > 0 {
-            log::debug!(
-                "Texture cache eviction: removed {}, remaining {}",
-                evicted,
-                self.textures.len()
+    pub fn set_display_image(&self, device: &ash::Device, view: vk::ImageView) {
+        let info = vk::DescriptorImageInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        unsafe {
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(self.descriptor_set)
+                    .dst_binding(0)
+                    .dst_array_element(DISPLAY_SLOT)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(std::slice::from_ref(&info))],
+                &[],
             );
         }
     }
@@ -1306,7 +1474,9 @@ impl TextureCache {
         }
         unsafe {
             device.destroy_fence(self.upload_fence, None);
-            device.destroy_sampler(self.sampler, None);
+            for sampler in &self.samplers {
+                device.destroy_sampler(*sampler, None);
+            }
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
         }
@@ -1318,132 +1488,81 @@ pub fn convert_to_rgba8(texture: &TextureData, palette: Option<&PaletteTable>) -
     let pixel_count = (texture.width * texture.height) as usize;
     let mut rgba = vec![0u8; pixel_count * 4];
 
-    match texture.format {
-        TextureFormat::P8 => {
-            // 8-bit paletted texture
-            if let Some(pal) = palette {
-                for i in 0..pixel_count.min(texture.data.len()) {
-                    let index = texture.data[i] as usize;
-                    let argb = pal.entries.get(index).copied().unwrap_or(0xFF00FF00); // Magenta for missing
-                                                                                      // ARGB -> RGBA
-                    rgba[i * 4] = ((argb >> 16) & 0xFF) as u8; // R
-                    rgba[i * 4 + 1] = ((argb >> 8) & 0xFF) as u8; // G
-                    rgba[i * 4 + 2] = (argb & 0xFF) as u8; // B
-                    rgba[i * 4 + 3] = ((argb >> 24) & 0xFF) as u8; // A
-                }
-            } else {
-                // No palette - show grayscale based on index
-                for i in 0..pixel_count.min(texture.data.len()) {
-                    let gray = texture.data[i];
-                    rgba[i * 4] = gray;
-                    rgba[i * 4 + 1] = gray;
-                    rgba[i * 4 + 2] = gray;
-                    rgba[i * 4 + 3] = 255;
-                }
-            }
+    let expand = |value: u16, bits: u32| -> u8 {
+        let v = value as u32;
+        match bits {
+            2 => (v * 85) as u8,
+            3 => ((v << 5) | (v << 2) | (v >> 1)) as u8,
+            4 => (v * 17) as u8,
+            5 => ((v << 3) | (v >> 2)) as u8,
+            6 => ((v << 2) | (v >> 4)) as u8,
+            _ => v as u8,
         }
-        TextureFormat::Rgb565 => {
-            // 16-bit RGB565
-            for i in 0..pixel_count {
-                let offset = i * 2;
-                if offset + 1 < texture.data.len() {
-                    let pixel =
-                        u16::from_le_bytes([texture.data[offset], texture.data[offset + 1]]);
-                    let r = ((pixel >> 11) & 0x1F) as u8;
-                    let g = ((pixel >> 5) & 0x3F) as u8;
-                    let b = (pixel & 0x1F) as u8;
-                    // Expand to 8-bit
-                    rgba[i * 4] = (r << 3) | (r >> 2);
-                    rgba[i * 4 + 1] = (g << 2) | (g >> 4);
-                    rgba[i * 4 + 2] = (b << 3) | (b >> 2);
-                    rgba[i * 4 + 3] = 255;
-                }
-            }
-        }
-        TextureFormat::Argb1555 => {
-            // 16-bit ARGB1555
-            for i in 0..pixel_count {
-                let offset = i * 2;
-                if offset + 1 < texture.data.len() {
-                    let pixel =
-                        u16::from_le_bytes([texture.data[offset], texture.data[offset + 1]]);
-                    let a = if (pixel & 0x8000) != 0 { 255u8 } else { 0u8 };
-                    let r = ((pixel >> 10) & 0x1F) as u8;
-                    let g = ((pixel >> 5) & 0x1F) as u8;
-                    let b = (pixel & 0x1F) as u8;
-                    rgba[i * 4] = (r << 3) | (r >> 2);
-                    rgba[i * 4 + 1] = (g << 3) | (g >> 2);
-                    rgba[i * 4 + 2] = (b << 3) | (b >> 2);
-                    rgba[i * 4 + 3] = a;
-                }
-            }
-        }
-        TextureFormat::Argb4444 => {
-            // 16-bit ARGB4444
-            for i in 0..pixel_count {
-                let offset = i * 2;
-                if offset + 1 < texture.data.len() {
-                    let pixel =
-                        u16::from_le_bytes([texture.data[offset], texture.data[offset + 1]]);
-                    let a = ((pixel >> 12) & 0xF) as u8;
-                    let r = ((pixel >> 8) & 0xF) as u8;
-                    let g = ((pixel >> 4) & 0xF) as u8;
-                    let b = (pixel & 0xF) as u8;
-                    rgba[i * 4] = (r << 4) | r;
-                    rgba[i * 4 + 1] = (g << 4) | g;
-                    rgba[i * 4 + 2] = (b << 4) | b;
-                    rgba[i * 4 + 3] = (a << 4) | a;
-                }
-            }
-        }
-        TextureFormat::Intensity8 | TextureFormat::Alpha8 => {
-            // 8-bit intensity or alpha
-            for i in 0..pixel_count.min(texture.data.len()) {
-                let v = texture.data[i];
-                rgba[i * 4] = v;
-                rgba[i * 4 + 1] = v;
-                rgba[i * 4 + 2] = v;
-                rgba[i * 4 + 3] = v;
-            }
-        }
-        TextureFormat::AlphaIntensity44 => {
-            // 8-bit alpha + intensity (4 bits each)
-            for i in 0..pixel_count.min(texture.data.len()) {
-                let v = texture.data[i];
-                let a = (v >> 4) & 0xF;
-                let intensity = v & 0xF;
-                let i8 = (intensity << 4) | intensity;
-                let a8 = (a << 4) | a;
-                rgba[i * 4] = i8;
-                rgba[i * 4 + 1] = i8;
-                rgba[i * 4 + 2] = i8;
-                rgba[i * 4 + 3] = a8;
-            }
-        }
-        TextureFormat::AlphaIntensity88 => {
-            // 16-bit alpha + intensity (8 bits each)
-            for i in 0..pixel_count {
-                let offset = i * 2;
-                if offset + 1 < texture.data.len() {
-                    let intensity = texture.data[offset];
-                    let alpha = texture.data[offset + 1];
-                    rgba[i * 4] = intensity;
-                    rgba[i * 4 + 1] = intensity;
-                    rgba[i * 4 + 2] = intensity;
-                    rgba[i * 4 + 3] = alpha;
-                }
-            }
-        }
-        _ => {
-            // Unsupported format - fill with magenta for debugging
-            log::warn!("Unsupported texture format: {:?}", texture.format);
-            for i in 0..pixel_count {
-                rgba[i * 4] = 255;
-                rgba[i * 4 + 1] = 0;
-                rgba[i * 4 + 2] = 255;
-                rgba[i * 4 + 3] = 255;
-            }
-        }
+    };
+    let bpp = texture.format.bytes_per_pixel();
+    for (i, bytes) in texture.data.chunks_exact(bpp).take(pixel_count).enumerate() {
+        let p = if bpp == 2 {
+            u16::from_le_bytes([bytes[0], bytes[1]])
+        } else {
+            bytes[0] as u16
+        };
+        let indexed = |alpha: Option<u8>| {
+            let color = palette
+                .and_then(|p| p.entries.get(bytes[0] as usize))
+                .copied()
+                .unwrap_or(0xff000000 | (bytes[0] as u32 * 0x010101));
+            [
+                (color >> 16) as u8,
+                (color >> 8) as u8,
+                color as u8,
+                alpha.unwrap_or_else(|| {
+                    if palette.is_some_and(|p| p.extended_alpha) {
+                        (color >> 24) as u8
+                    } else {
+                        255
+                    }
+                }),
+            ]
+        };
+        let color = match texture.format {
+            TextureFormat::P8 | TextureFormat::Yiq422 => indexed(None),
+            TextureFormat::Ap88 | TextureFormat::Ayiq8422 => indexed(Some(bytes[1])),
+            TextureFormat::Rgb332 | TextureFormat::Argb8332 => [
+                expand((p >> 5) & 7, 3),
+                expand((p >> 2) & 7, 3),
+                expand(p & 3, 2),
+                if bpp == 2 { bytes[1] } else { 255 },
+            ],
+            TextureFormat::Rgb565 => [
+                expand((p >> 11) & 31, 5),
+                expand((p >> 5) & 63, 6),
+                expand(p & 31, 5),
+                255,
+            ],
+            TextureFormat::Argb1555 => [
+                expand((p >> 10) & 31, 5),
+                expand((p >> 5) & 31, 5),
+                expand(p & 31, 5),
+                if p & 0x8000 != 0 { 255 } else { 0 },
+            ],
+            TextureFormat::Argb4444 => [
+                expand((p >> 8) & 15, 4),
+                expand((p >> 4) & 15, 4),
+                expand(p & 15, 4),
+                expand((p >> 12) & 15, 4),
+            ],
+            TextureFormat::Intensity8 => [bytes[0], bytes[0], bytes[0], 255],
+            TextureFormat::Alpha8 => [bytes[0]; 4],
+            TextureFormat::AlphaIntensity44 => [
+                expand(p & 15, 4),
+                expand(p & 15, 4),
+                expand(p & 15, 4),
+                expand(p >> 4, 4),
+            ],
+            TextureFormat::AlphaIntensity88 => [bytes[0], bytes[0], bytes[0], bytes[1]],
+            _ => [0, 0, 0, 255],
+        };
+        rgba[i * 4..i * 4 + 4].copy_from_slice(&color);
     }
 
     rgba
@@ -1452,6 +1571,46 @@ pub fn convert_to_rgba8(texture: &TextureData, palette: Option<&PaletteTable>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_formats_and_palette_alpha() {
+        let mut palette = PaletteTable::new();
+        palette.entries[7] = 0x00123456;
+        for (format, bytes, expected) in [
+            (TextureFormat::Rgb332, vec![0xe3], [255, 0, 255, 255]),
+            (TextureFormat::Argb8332, vec![0x1c, 128], [0, 255, 0, 128]),
+            (TextureFormat::Ap88, vec![7, 99], [0x12, 0x34, 0x56, 99]),
+            (TextureFormat::P8, vec![7], [0x12, 0x34, 0x56, 255]),
+            (TextureFormat::Intensity8, vec![50], [50, 50, 50, 255]),
+            (TextureFormat::Alpha8, vec![50], [50, 50, 50, 50]),
+        ] {
+            assert_eq!(
+                convert_to_rgba8(&TextureData::new(1, 1, format, bytes), Some(&palette)),
+                expected
+            );
+        }
+        palette.extended_alpha = true;
+        assert_eq!(
+            convert_to_rgba8(
+                &TextureData::new(1, 1, TextureFormat::P8, vec![7]),
+                Some(&palette)
+            )[3],
+            0
+        );
+        let mut memory = TextureMemory::new(1024);
+        let mut ncc = [0u8; 64];
+        ncc[15] = 100;
+        ncc[16..18].copy_from_slice(&50i16.to_le_bytes());
+        ncc[42..44].copy_from_slice(&(-25i16).to_le_bytes());
+        memory.store_ncc(0, &ncc);
+        assert_eq!(
+            convert_to_rgba8(
+                &TextureData::new(1, 1, TextureFormat::Yiq422, vec![0xf0]),
+                Some(memory.ncc(0))
+            ),
+            [150, 75, 100, 255]
+        );
+    }
 
     #[test]
     fn test_texture_memory_new() {

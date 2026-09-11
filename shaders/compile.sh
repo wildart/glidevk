@@ -1,3 +1,5 @@
 #!/bin/sh
-glslc glide.vert -o glide_vert.spv
-glslc glide.frag -o glide_frag.spv
+set -eu
+cd "$(dirname "$0")"
+"${GLSLC:-glslc}" glide.vert -o glide_vert.spv
+"${GLSLC:-glslc}" glide.frag -o glide_frag.spv

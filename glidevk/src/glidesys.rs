@@ -2,11 +2,16 @@ use std::fmt;
 use std::os::raw::c_void;
 use std::ptr::null_mut;
 
-#[derive(Clone, Copy, PartialEq)]
-#[repr(i32)]
-pub enum FxBool {
-    False = 0,
-    True = 1,
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct FxBool(pub i32);
+#[allow(non_upper_case_globals)]
+impl FxBool {
+    pub const False: Self = Self(0);
+    pub const True: Self = Self(1);
+    pub fn is_true(self) -> bool {
+        self.0 != 0
+    }
 }
 
 impl Default for FxBool {
@@ -286,10 +291,10 @@ impl TextureFormat {
 #[derive(Debug)]
 #[repr(C)]
 pub struct TexInfo {
-    smallLod: LOD,
-    largeLod: LOD,
-    aspectRatio: AspectRatio,
-    format: TextureFormat,
+    smallLod: i32,
+    largeLod: i32,
+    aspectRatio: i32,
+    format: i32,
     data: *mut c_void,
 }
 
@@ -301,10 +306,10 @@ impl TexInfo {
         format: TextureFormat,
     ) -> TexInfo {
         TexInfo {
-            smallLod,
-            largeLod,
-            aspectRatio,
-            format,
+            smallLod: smallLod as i32,
+            largeLod: largeLod as i32,
+            aspectRatio: aspectRatio as i32,
+            format: format as i32,
             data: null_mut(),
         }
     }
@@ -326,24 +331,103 @@ impl TexInfo {
     }
 
     pub fn get_dimensions(&self) -> (usize, usize) {
-        // We ignore mipmaps here.
-        self.largeLod.to_texture_size(self.aspectRatio)
+        self.levels()
+            .first()
+            .map(|(_, w, h)| (*w, *h))
+            .unwrap_or((0, 0))
+    }
+
+    pub fn levels(&self) -> Vec<(LOD, usize, usize)> {
+        if !self.is_valid() {
+            return Vec::new();
+        }
+        let lods = [
+            LOD::L1,
+            LOD::L2,
+            LOD::L4,
+            LOD::L8,
+            LOD::L16,
+            LOD::L32,
+            LOD::L64,
+            LOD::L128,
+            LOD::L256,
+        ];
+        (self.smallLod as usize..=self.largeLod as usize)
+            .rev()
+            .map(|i| {
+                let (w, h) = lods[i].to_texture_size(self.aspect_ratio());
+                (lods[i], w, h)
+            })
+            .collect()
     }
 
     pub fn get_size(&self) -> usize {
-        // TODO: maybe don’t ignore mipmaps?
-        let (width, height) = self.largeLod.to_texture_size(self.aspectRatio);
-        width * height * self.format.bytes_per_pixel()
+        self.levels()
+            .iter()
+            .map(|(_, w, h)| w * h * self.format().bytes_per_pixel())
+            .sum()
+    }
+
+    pub fn get_size_mask(&self, even_odd: u32) -> usize {
+        let size: usize = self
+            .levels()
+            .iter()
+            .filter(|(lod, _, _)| even_odd & (1 << (*lod as u32 & 1)) != 0)
+            .map(|(_, w, h)| w * h * self.format().bytes_per_pixel())
+            .sum();
+        (size + 7) & !7
+    }
+
+    pub fn is_valid(&self) -> bool {
+        (0..=8).contains(&self.smallLod)
+            && (self.smallLod..=8).contains(&self.largeLod)
+            && (-3..=3).contains(&self.aspectRatio)
+            && (0..=15).contains(&self.format)
+    }
+    pub fn aspect_ratio(&self) -> AspectRatio {
+        match self.aspectRatio {
+            -3 => AspectRatio::A1x8,
+            -2 => AspectRatio::A1x4,
+            -1 => AspectRatio::A1x2,
+            1 => AspectRatio::A2x1,
+            2 => AspectRatio::A4x1,
+            3 => AspectRatio::A8x1,
+            _ => AspectRatio::A1x1,
+        }
     }
 
     pub fn format(&self) -> TextureFormat {
-        self.format
+        const FORMATS: [TextureFormat; 16] = [
+            TextureFormat::Rgb332,
+            TextureFormat::Yiq422,
+            TextureFormat::Alpha8,
+            TextureFormat::Intensity8,
+            TextureFormat::AlphaIntensity44,
+            TextureFormat::P8,
+            TextureFormat::Rsvd0,
+            TextureFormat::Rsvd1,
+            TextureFormat::Argb8332,
+            TextureFormat::Ayiq8422,
+            TextureFormat::Rgb565,
+            TextureFormat::Argb1555,
+            TextureFormat::Argb4444,
+            TextureFormat::AlphaIntensity88,
+            TextureFormat::Ap88,
+            TextureFormat::Rsvd2,
+        ];
+        FORMATS
+            .get(self.format as usize)
+            .copied()
+            .unwrap_or(TextureFormat::Rsvd0)
     }
 
     /// # Safety
     /// `self.data` must point to a valid buffer of `self.get_size()` bytes.
     pub unsafe fn get_data(&self) -> &[u8] {
         let size = self.get_size();
+        if self.data.is_null() {
+            return &[];
+        }
         unsafe { std::slice::from_raw_parts(self.data as *const u8, size) }
     }
 }
@@ -360,34 +444,46 @@ pub enum Buffer {
 }
 
 /// Lock type for LFB access
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(u32)]
-pub enum LfbLock {
-    ReadOnly = 0x00,
-    WriteOnly = 0x01,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct LfbLock(pub u32);
+#[allow(non_upper_case_globals)]
+impl LfbLock {
+    pub const ReadOnly: Self = Self(0);
+    pub const WriteOnly: Self = Self(1);
+    pub const NoIdle: Self = Self(0x10);
+}
+impl std::ops::BitOr for LfbLock {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 }
 
 /// LFB write mode (pixel format)
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(i32)]
-pub enum LfbWriteMode {
-    Rgb565 = 0x0,
-    Rgb555 = 0x1,
-    Argb1555 = 0x2,
-    Reserved1 = 0x3,
-    Rgb888 = 0x4,
-    Argb8888 = 0x5,
-    Reserved2 = 0x6,
-    Reserved3 = 0x7,
-    Reserved4 = 0x8,
-    Reserved5 = 0x9,
-    Reserved6 = 0xa,
-    Reserved7 = 0xb,
-    Rgb565Depth = 0xc,
-    Rgb555Depth = 0xd,
-    Argb1555Depth = 0xe,
-    Za16 = 0xf,
-    Any = 0xff,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct LfbWriteMode(pub i32);
+#[allow(non_upper_case_globals)]
+impl LfbWriteMode {
+    pub const Rgb565: Self = Self(0x0);
+    pub const Rgb555: Self = Self(0x1);
+    pub const Argb1555: Self = Self(0x2);
+    pub const Reserved1: Self = Self(0x3);
+    pub const Rgb888: Self = Self(0x4);
+    pub const Argb8888: Self = Self(0x5);
+    pub const Reserved2: Self = Self(0x6);
+    pub const Reserved3: Self = Self(0x7);
+    pub const Reserved4: Self = Self(0x8);
+    pub const Reserved5: Self = Self(0x9);
+    pub const Reserved6: Self = Self(0xa);
+    pub const Reserved7: Self = Self(0xb);
+    pub const Rgb565Depth: Self = Self(0xc);
+    pub const Rgb555Depth: Self = Self(0xd);
+    pub const Argb1555Depth: Self = Self(0xe);
+    pub const Za16: Self = Self(0xf);
+    pub const Any: Self = Self(0xff);
+    pub const Rle16: Self = Self(0x80);
 }
 
 /// LFB info structure returned by grLfbLock
@@ -420,47 +516,49 @@ pub enum MipMapMode {
     NearestDither = 2,
 }
 
-#[derive(Clone, Copy, Debug)]
-#[repr(i32)]
-pub enum AlphaBlendFnc {
-    Zero = 0,
-    SrcAlpha = 1,
-    SrcColor = 2,
-    //DstColor = SrcColor,
-    DstAlpha = 3,
-    One = 4,
-    OneMinusSrcAlpha = 5,
-    OneMinusSrcColor = 6,
-    //OneMinusDstColor = OneMinusSrcColor,
-    OneMinusDstAlpha = 7,
-    AlphaSaturate = 15,
-    //PrefogColor = AlphaSaturate,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct AlphaBlendFnc(pub i32);
+#[allow(non_upper_case_globals)]
+impl AlphaBlendFnc {
+    pub const Zero: Self = Self(0);
+    pub const SrcAlpha: Self = Self(1);
+    pub const SrcColor: Self = Self(2);
+    pub const DstAlpha: Self = Self(3);
+    pub const One: Self = Self(4);
+    pub const OneMinusSrcAlpha: Self = Self(5);
+    pub const OneMinusSrcColor: Self = Self(6);
+    pub const OneMinusDstAlpha: Self = Self(7);
+    pub const AlphaSaturate: Self = Self(15);
 }
 
-#[derive(Clone, Copy, Debug)]
-#[repr(i32)]
-pub enum ChipID {
-    Tmu0 = 0,
-    Tmu1 = 1,
-    Tmu2 = 2,
-    Fbi = 3,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct ChipID(pub i32);
+#[allow(non_upper_case_globals)]
+impl ChipID {
+    pub const Tmu0: Self = Self(0);
+    pub const Tmu1: Self = Self(1);
+    pub const Tmu2: Self = Self(2);
+    pub const Fbi: Self = Self(0);
 }
 
-#[derive(Clone, Copy, Debug)]
-#[repr(i32)]
-pub enum CombineFunction {
-    Zero = 0,
-    Local = 1,
-    LocalAlpha = 2,
-    ScaleOther = 3,
-    ScaleOtherAddLocal = 4,
-    ScaleOtherAddLocalAlpha = 5,
-    ScaleOtherMinusLocal = 6,
-    ScaleOtherMinusLocalAddLocal = 7,
-    ScaleOtherMinusLocalAddLocalAlpha = 8,
-    ScaleMinusLocalAddLocal = 9,
-    // TODO: Is it really 0x10 and not 10?
-    ScaleMinusLocalAddLocalAlpha = 16,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct CombineFunction(pub i32);
+#[allow(non_upper_case_globals)]
+impl CombineFunction {
+    pub const Zero: Self = Self(0);
+    pub const Local: Self = Self(1);
+    pub const LocalAlpha: Self = Self(2);
+    pub const ScaleOther: Self = Self(3);
+    pub const ScaleOtherAddLocal: Self = Self(4);
+    pub const ScaleOtherAddLocalAlpha: Self = Self(5);
+    pub const ScaleOtherMinusLocal: Self = Self(6);
+    pub const ScaleOtherMinusLocalAddLocal: Self = Self(7);
+    pub const ScaleOtherMinusLocalAddLocalAlpha: Self = Self(8);
+    pub const ScaleMinusLocalAddLocal: Self = Self(9);
+    pub const ScaleMinusLocalAddLocalAlpha: Self = Self(16);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -513,16 +611,20 @@ pub enum DitherMode {
 }
 
 /// Primitive types for grDrawVertexArray
-#[derive(Clone, Copy, Debug)]
-#[repr(u32)]
-pub enum PrimitiveType {
-    Points = 0,
-    LineStrip = 1,
-    Lines = 2,
-    Polygon = 3,
-    TriangleStrip = 4,
-    TriangleFan = 5,
-    Triangles = 6,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct PrimitiveType(pub u32);
+#[allow(non_upper_case_globals)]
+impl PrimitiveType {
+    pub const Points: Self = Self(0);
+    pub const LineStrip: Self = Self(1);
+    pub const Lines: Self = Self(2);
+    pub const Polygon: Self = Self(3);
+    pub const TriangleStrip: Self = Self(4);
+    pub const TriangleFan: Self = Self(5);
+    pub const Triangles: Self = Self(6);
+    pub const TriangleStripContinue: Self = Self(7);
+    pub const TriangleFanContinue: Self = Self(8);
 }
 
 /// Texture table types for grTexDownloadTable
@@ -668,12 +770,14 @@ impl Default for CullMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(i32)]
-pub enum OriginLocation {
-    UpperLeft = 0,
-    LowerLeft = 1,
-    Any = 0xff,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct OriginLocation(pub i32);
+#[allow(non_upper_case_globals)]
+impl OriginLocation {
+    pub const UpperLeft: Self = Self(0);
+    pub const LowerLeft: Self = Self(1);
+    pub const Any: Self = Self(0xff);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -870,20 +974,26 @@ pub enum EnvironmentInfo {
 /*
 ** Fog modes
 */
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(i32)]
-pub enum FogMode {
-    Disable = 0,
-    WithTable = 1,
-    WithTableOnFogCoordExt = 2,
-    WithTableOnW = 3,
-    Add2 = 4,
-    Mult2 = 5,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct FogMode(pub i32);
+#[allow(non_upper_case_globals)]
+impl FogMode {
+    pub const Disable: Self = Self(0);
+    pub const WithTableOnFogCoordExt: Self = Self(1);
+    pub const WithTable: Self = Self(2);
+    pub const WithTableOnQ: Self = Self(2);
+    pub const WithTableOnW: Self = Self(2);
+    pub const WithIteratedZ: Self = Self(3);
+    pub const WithIteratedAlphaExt: Self = Self(4);
+    pub const Mult2: Self = Self(0x100);
+    pub const Add2: Self = Self(0x200);
 }
 
-impl Default for FogMode {
-    fn default() -> FogMode {
-        FogMode::Disable
+impl std::ops::BitOr for FogMode {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
     }
 }
 
@@ -1048,7 +1158,9 @@ impl VertexLayout {
         let y = Self::read_f32(data, 4);
 
         // Color - either float RGB + A or packed ARGB
-        let (r, g, b, a) = if self.pargb.mode == VertexLayoutMode::Enable {
+        let (r, g, b, a) = if self.color_type == VertexColorType::U8
+            && self.pargb.mode == VertexLayoutMode::Enable
+        {
             // Packed ARGB (u32 with bytes: ARGB or BGRA depending on format)
             let packed = Self::read_u32(data, self.pargb.offset);
             // Standard ARGB: A in high byte, R, G, B in lower bytes
@@ -1105,6 +1217,41 @@ impl VertexLayout {
         (x, y, r, g, b, a, s, t, oow)
     }
 
+    pub fn decode(&self, data: &[u8]) -> (Vertex, f32) {
+        let (x, y, r, g, b, a, s, t, tq) = self.extract_vertex(data);
+        let read = |field: &VertexComponentInfo, default| {
+            if field.mode == VertexLayoutMode::Enable {
+                Self::read_f32(data, field.offset)
+            } else {
+                default
+            }
+        };
+        let w = read(&self.w, 1.0);
+        let q = read(&self.q, if w == 0.0 { 1.0 } else { 1.0 / w });
+        let mut vertex = Vertex::new(x, y);
+        vertex.r = r;
+        vertex.g = g;
+        vertex.b = b;
+        vertex.a = a;
+        vertex.ooz = read(&self.z, 0.0);
+        vertex.oow = q;
+        vertex.tmuvtx[0] = TmuVertex {
+            sow: s,
+            tow: t,
+            oow: tq,
+        };
+        vertex.tmuvtx[1] = TmuVertex {
+            sow: read(&self.st1, 0.0),
+            tow: if self.st1.mode == VertexLayoutMode::Enable {
+                Self::read_f32(data, self.st1.offset + 4)
+            } else {
+                0.0
+            },
+            oow: read(&self.q1, q),
+        };
+        (vertex, read(&self.fog, q))
+    }
+
     /// Calculate the minimum vertex size needed based on enabled components
     pub fn vertex_size(&self) -> usize {
         let mut max_end = 8; // Minimum: XY (2 floats at offset 0)
@@ -1112,7 +1259,7 @@ impl VertexLayout {
         // Check each component and track the maximum end position
         let check = |info: &VertexComponentInfo, size: i32, max_end: &mut usize| {
             if info.mode == VertexLayoutMode::Enable && info.offset >= 0 {
-                let end = (info.offset + size) as usize;
+                let end = info.offset as usize + size as usize;
                 if end > *max_end {
                     *max_end = end;
                 }
@@ -1141,3 +1288,62 @@ pub type GrStipplePattern = FxU32;
 pub type GrFog = FxU8;
 pub type GrContext = FxU32;
 pub type GrTmuMemRange = FxU32;
+
+#[cfg(test)]
+mod layout_regressions {
+    use super::*;
+    #[test]
+    fn texinfo_and_noncanonical_abi_values() {
+        let mut info = TexInfo::empty(LOD::L1, LOD::L4, AspectRatio::A1x1, TextureFormat::Rgb565);
+        assert_eq!(info.get_size(), 42);
+        assert_eq!(info.get_size_mask(1), 40);
+        assert_eq!(info.get_size_mask(2), 8);
+        info.format = 0x80;
+        assert!(!info.is_valid());
+        assert_eq!(info.get_size(), 0);
+        info.smallLod = -1;
+        assert!(info.levels().is_empty());
+        assert!(FxBool(255).is_true());
+        assert!(!FxBool(0).is_true());
+        assert_eq!(ChipID::Fbi, ChipID::Tmu0);
+    }
+
+    #[test]
+    fn short_layout_color_switch_and_separate_z() {
+        let enabled = |offset| VertexComponentInfo {
+            offset,
+            mode: VertexLayoutMode::Enable,
+        };
+        let mut layout = VertexLayout {
+            pargb: enabled(8),
+            color_type: VertexColorType::U8,
+            ..Default::default()
+        };
+        let bytes: Vec<u8> = [1.0f32.to_bits(), 2.0f32.to_bits(), 0xff123456]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        assert_eq!(layout.vertex_size(), 12);
+        let (vertex, _) = layout.decode(&bytes);
+        assert_eq!(
+            (vertex.x, vertex.y, vertex.r, vertex.g, vertex.b),
+            (1.0, 2.0, 18.0, 52.0, 86.0)
+        );
+        layout.rgb = enabled(12);
+        layout.a = enabled(24);
+        layout.z = enabled(28);
+        layout.q = enabled(32);
+        layout.color_type = VertexColorType::Float;
+        let mut bytes = bytes;
+        for value in [64.0f32, 128.0, 192.0, 99.0, 12345.0, 0.5] {
+            bytes.extend(value.to_le_bytes());
+        }
+        let (vertex, _) = layout.decode(&bytes);
+        assert_eq!(
+            (vertex.r, vertex.g, vertex.b, vertex.a, vertex.ooz, vertex.oow),
+            (64.0, 128.0, 192.0, 99.0, 12345.0, 0.5)
+        );
+        assert_eq!((FogMode::WithTable | FogMode::Mult2).0, 0x102);
+        assert_eq!((LfbLock::WriteOnly | LfbLock::NoIdle).0, 0x11);
+    }
+}

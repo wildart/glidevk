@@ -1,4 +1,4 @@
-use memoffset::offset_of;
+use std::mem::offset_of;
 use std::os::raw::c_char;
 
 use ash::vk;

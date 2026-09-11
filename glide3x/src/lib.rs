@@ -1,8 +1,7 @@
 #![allow(non_snake_case, dead_code, clippy::not_unsafe_ptr_arg_deref)]
 
-use lazy_static::lazy_static;
 use log::{debug, trace};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use glidevk::Gr;
 
@@ -86,13 +85,16 @@ macro_rules! define_function {
 
 // Macro for functions that take vertex pointers (needs unsafe dereference)
 macro_rules! define_draw_function {
-    ($func:ident => $api:ident($($arg:ident: &Vertex),+)) => {
+    ($mode:ident => $api:ident($($arg:ident: &Vertex),+)) => {
         #[no_mangle]
         pub extern "system" fn $api($($arg: *const Vertex),+) {
             let mut gr = GR.lock().unwrap();
             if let Some(gr) = (*gr).as_mut() {
                 unsafe {
-                    gr.$func($(&*$arg),+);
+                    let pointers = [$($arg),+];
+                    if pointers.iter().all(|ptr| !ptr.is_null()) {
+                        gr.draw_vertex_array(PrimitiveType::$mode, pointers.len() as u32, pointers.as_ptr());
+                    }
                 }
             } else {
                 debug!(concat!(stringify!($api), "() called before grGlideInit!"));
@@ -110,6 +112,7 @@ macro_rules! define_ptr_function {
             let mut gr = GR.lock().unwrap();
             if let Some(gr) = (*gr).as_mut() {
                 trace!(concat!(stringify!($api), "(", $(stringify!($arg), "={:?}, ",)+ ")"), $($arg),+);
+                if $ptr.is_null() { return; }
                 unsafe {
                     gr.$func($($arg,)* &*$ptr);
                 }
@@ -125,6 +128,7 @@ macro_rules! define_ptr_function {
             let gr = GR.lock().unwrap();
             if let Some(gr) = (*gr).as_ref() {
                 trace!(concat!(stringify!($api), "(", $(stringify!($arg), "={:?}, ",)+ ")"), $($arg),+);
+                if $ptr.is_null() { return Default::default(); }
                 unsafe {
                     gr.$func($($arg,)* &*$ptr)
                 }
@@ -141,9 +145,11 @@ macro_rules! define_ptr_function {
             let mut gr = GR.lock().unwrap();
             if let Some(gr) = (*gr).as_mut() {
                 trace!(concat!(stringify!($api), "(", $(stringify!($arg), "={:?}, ",)+ ")"), $($arg),+);
-                unsafe {
-                    gr.$func($($arg,)* &mut *$ptr)
-                }
+                if $ptr.is_null() { return Default::default(); }
+                let mut value: $ptr_type = Default::default();
+                let result = gr.$func($($arg,)* &mut value);
+                unsafe { $ptr.write(value); }
+                result
             } else {
                 debug!(concat!(stringify!($api), "() called before grGlideInit!"));
                 Default::default()
@@ -154,8 +160,8 @@ macro_rules! define_ptr_function {
     ($func:ident => $api:ident($($arg:ident: $arg_type:ty),* ; $ptr:ident: *mut $ptr_type:ty) -> $ret:ty) => {
         #[no_mangle]
         pub extern "system" fn $api($($arg: $arg_type,)* $ptr: *mut $ptr_type) -> $ret {
-            let gr = GR.lock().unwrap();
-            if let Some(gr) = (*gr).as_ref() {
+            let mut gr = GR.lock().unwrap();
+            if let Some(gr) = (*gr).as_mut() {
                 trace!(concat!(stringify!($api), "(", $(stringify!($arg), "={:?}, ",)+ ")"), $($arg),+);
                 gr.$func($($arg,)* $ptr)
             } else {
@@ -182,7 +188,9 @@ macro_rules! define_vertex_array_function {
                     concat!(stringify!($api), "(mode={:?}, count={:?})"),
                     mode, count
                 );
-                unsafe { gr.$func(mode, count, pointers); }
+                unsafe {
+                    gr.$func(mode, count, pointers);
+                }
             } else {
                 debug!(concat!(stringify!($api), "() called before grGlideInit!"));
             }
@@ -250,10 +258,7 @@ macro_rules! define_standalone {
 }
 
 // glide management functions
-lazy_static! {
-    static ref GR: Arc<Mutex<Option<Gr>>> = Arc::new(Mutex::new(None));
-}
-// static mut GR: Lazy<Arc<Mutex<Option<Gr>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
+static GR: Mutex<Option<Gr>> = Mutex::new(None);
 
 // FX_ENTRY void FX_CALL grGlideInit( void );
 #[no_mangle]
@@ -334,9 +339,9 @@ define_function!(enable => grEnable(mode: EnableMode));
 define_function!(disable => grDisable(mode: EnableMode));
 
 // Drawing functions
-define_draw_function!(draw_triangle => grDrawTriangle(a: &Vertex, b: &Vertex, c: &Vertex));
-define_draw_function!(draw_point => grDrawPoint(a: &Vertex));
-define_draw_function!(draw_line => grDrawLine(a: &Vertex, b: &Vertex));
+define_draw_function!(Triangles => grDrawTriangle(a: &Vertex, b: &Vertex, c: &Vertex));
+define_draw_function!(Points => grDrawPoint(a: &Vertex));
+define_draw_function!(Lines => grDrawLine(a: &Vertex, b: &Vertex));
 
 // Vertex array drawing functions
 define_vertex_array_function!(draw_vertex_array => grDrawVertexArray(mode: PrimitiveType, count: FxU32, pointers: *const *const Vertex));
@@ -349,9 +354,9 @@ define_function!(tex_mipmap_mode => grTexMipMapMode(tmu: ChipID, mode: MipMapMod
 define_function!(tex_lod_bias_value => grTexLodBiasValue(tmu: ChipID, bias: f32));
 define_function!(tex_min_address => grTexMinAddress(tmu: ChipID) -> FxU32);
 define_function!(tex_max_address => grTexMaxAddress(tmu: ChipID) -> FxU32);
-define_function!(tex_combine => grTexCombine(tmu: ChipID, rgb_function: TextureCombineFnc, rgb_factor: CombineFactor, alpha_function: TextureCombineFnc, alpha_factor: CombineFactor, rgb_invert: FxBool, alpha_invert: FxBool));
+define_function!(tex_combine => grTexCombine(tmu: ChipID, rgb_function: CombineFunction, rgb_factor: CombineFactor, alpha_function: CombineFunction, alpha_factor: CombineFactor, rgb_invert: FxBool, alpha_invert: FxBool));
 define_function!(tex_download_mipmap_level => grTexDownloadMipMapLevel(tmu: ChipID, start_address: FxU32, this_lod: LOD, large_lod: LOD, aspect_ratio: AspectRatio, format: TextureFormat, even_odd: FxU32, data: *const std::ffi::c_void));
-define_function!(tex_download_mipmap_level_partial => grTexDownloadMipMapLevelPartial(tmu: ChipID, start_address: FxU32, this_lod: LOD, large_lod: LOD, aspect_ratio: AspectRatio, format: TextureFormat, even_odd: FxU32, data: *const std::ffi::c_void, start_row: i32, end_row: i32));
+define_function!(tex_download_mipmap_level_partial => grTexDownloadMipMapLevelPartial(tmu: ChipID, start_address: FxU32, this_lod: LOD, large_lod: LOD, aspect_ratio: AspectRatio, format: TextureFormat, even_odd: FxU32, data: *const std::ffi::c_void, start_row: i32, end_row: i32) -> FxBool);
 define_function!(tex_download_table => grTexDownloadTable(table_type: TextureTableType, data: *const std::ffi::c_void));
 
 // Texture pointer functions
@@ -366,11 +371,28 @@ define_function!(reset => grReset(what: FxU32) -> FxBool);
 define_function!(alpha_combine => grAlphaCombine(function: CombineFunction, factor: CombineFactor, local: CombineLocal, other: CombineOther, invert: FxBool));
 define_standalone!(glidevk::api::coordinate_space => grCoordinateSpace(mode: CoordinateSpaceMode));
 define_function!(dither_mode => grDitherMode(mode: DitherMode), trace);
-define_standalone!(glidevk::api::finish => grFinish());
+define_function!(finish => grFinish());
 define_standalone!(glidevk::api::get_string => grGetString(pname: EnvironmentInfo) -> *const std::ffi::c_char);
 // Explicit grGet implementation to log return values
 #[no_mangle]
 pub extern "system" fn grGet(pname: GrGetParam, plength: FxU32, params: *mut FxI32) -> FxU32 {
+    if matches!(pname, GrGetParam::Viewport) {
+        if plength < 16 || params.is_null() {
+            return 0;
+        }
+        if let Some(gr) = GR.lock().unwrap().as_ref() {
+            let viewport = [
+                0,
+                0,
+                gr.sst_screen_width() as i32,
+                gr.sst_screen_height() as i32,
+            ];
+            unsafe {
+                std::ptr::copy_nonoverlapping(viewport.as_ptr(), params, 4);
+            }
+            return 16;
+        }
+    }
     let result = unsafe { glidevk::api::get(pname, plength, params) };
     let value = if !params.is_null() && result >= 4 {
         unsafe { *params }
@@ -391,3 +413,37 @@ pub extern "system" fn grGetProcAddress(proc_name: *const std::ffi::c_char) -> G
 }
 define_standalone!(glidevk::api::load_gamma_table => grLoadGammaTable(num_entries: FxU32, red: *const FxU32, green: *const FxU32, blue: *const FxU32));
 define_standalone!(glidevk::api::gamma_correction_rgb => guGammaCorrectionRGB(gamma_red: f32, gamma_green: f32, gamma_blue: f32));
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    #[test]
+    fn exported_queries_and_short_buffers() {
+        for (name, expected) in [
+            (EnvironmentInfo::Renderer, "Glide"),
+            (EnvironmentInfo::Vendor, "3Dfx Interactive"),
+            (EnvironmentInfo::Version, "3.0"),
+            (EnvironmentInfo::Hardware, "Voodoo2"),
+            (EnvironmentInfo::Extension, " "),
+        ] {
+            assert_eq!(
+                unsafe { std::ffi::CStr::from_ptr(grGetString(name)) }
+                    .to_str()
+                    .unwrap(),
+                expected
+            );
+        }
+        for (name, expected) in [
+            (GrGetParam::NumBoards, 1),
+            (GrGetParam::MaxTextureSize, 256),
+            (GrGetParam::NumFb, 1),
+        ] {
+            let mut values = [1234, 5678];
+            assert_eq!(grGet(name, 3, values.as_mut_ptr()), 0);
+            assert_eq!(values, [1234, 5678]);
+            assert_eq!(grGet(name, 4, values.as_mut_ptr()), 4);
+            assert_eq!(values, [expected, 5678]);
+            assert_eq!(grGet(name, 4, std::ptr::null_mut()), 0);
+        }
+    }
+}

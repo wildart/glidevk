@@ -6,13 +6,19 @@ use std::mem::offset_of;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuVertex {
-    pub position: [f32; 2],        // Screen-space x, y
-    pub color: [f32; 4],           // RGBA color (iterated vertex color, normalized)
-    pub tex_coord: [f32; 2],       // Texture S, T coordinates
-    pub oow: f32,                  // Reciprocal W (1/w) for depth
-    pub constant_color: [f32; 4],  // Constant color from grConstantColorValue (per-vertex)
-    pub combine_flags: u32,        // Packed combine state (per-vertex, avoids draw call breaks)
-    pub texture_index: u32,        // Index into descriptor array (per-vertex, avoids draw call breaks)
+    pub position: [f32; 2],       // Screen-space x, y
+    pub color: [f32; 4],          // RGBA color (iterated vertex color, normalized)
+    pub tex_coord: [f32; 2],      // Texture S, T coordinates
+    pub oow: f32,                 // Reciprocal W (1/w) for depth
+    pub constant_color: [f32; 4], // Constant color from grConstantColorValue (per-vertex)
+    pub combine_flags: u32,       // Packed combine state (per-vertex, avoids draw call breaks)
+    pub texture_index: u32,
+    pub depth: f32,
+    pub tex_q: f32,
+    pub tex_coord1: [f32; 2],
+    pub tex_q1: f32,
+    pub texture_index1: u32,
+    pub fog: f32, // Index into descriptor array (per-vertex, avoids draw call breaks)
 }
 
 impl GpuVertex {
@@ -25,22 +31,18 @@ impl GpuVertex {
             constant_color: [1.0, 1.0, 1.0, 1.0],
             combine_flags: 0,
             texture_index: 0,
+            depth: 0.0,
+            tex_q: 1.0,
+            fog: 0.0,
+            tex_coord1: [0.0; 2],
+            tex_q1: 1.0,
+            texture_index1: 0,
         }
     }
 
     /// Create vertex from Glide vertex using per-vertex colors
     pub fn from_glide_vertex(v: &crate::glidesys::Vertex) -> Self {
-        // Get perspective-divided texture coords (sow = s/w, tow = t/w)
-        // and convert to actual texel space if needed
-        let tmu = &v.tmuvtx[0];
-        let (s, t) = if tmu.oow > 0.0 && tmu.oow != 1.0 {
-            // Perspective-divided coords: s = sow / oow, t = tow / oow
-            // (since oow = 1/w, dividing by oow gives us s*w and t*w = s and t)
-            (tmu.sow / tmu.oow, tmu.tow / tmu.oow)
-        } else {
-            // oow is 0 (undefined) or 1 (no perspective): use coords as-is
-            (tmu.sow, tmu.tow)
-        };
+        let (s, t) = (v.tmuvtx[0].sow, v.tmuvtx[0].tow);
         // Use ooz if set, otherwise fall back to oow
         // Normalize depth: Glide uses ooz = 65535/z, we need 0-1 range
         let depth = if v.ooz != 0.0 {
@@ -52,14 +54,28 @@ impl GpuVertex {
             position: [v.x, v.y],
             color: [v.r / 255.0, v.g / 255.0, v.b / 255.0, v.a / 255.0],
             tex_coord: [s, t],
-            oow: depth,
+            oow: v.oow,
             constant_color: [1.0, 1.0, 1.0, 1.0],
             combine_flags: 0,
             texture_index: 0,
+            depth: depth,
+            tex_q: if v.tmuvtx[0].oow == 0.0 {
+                1.0
+            } else {
+                v.tmuvtx[0].oow
+            },
+            fog: 0.0,
+            tex_coord1: [v.tmuvtx[1].sow, v.tmuvtx[1].tow],
+            tex_q1: if v.tmuvtx[1].oow == 0.0 {
+                1.0
+            } else {
+                v.tmuvtx[1].oow
+            },
+            texture_index1: 0,
         }
     }
 
-    /// Create vertex from Glide vertex with explicit RGBA color (normalized 0.0-1.0)
+    /// Create a vertex with explicit normalized RGBA color.
     pub fn from_glide_vertex_with_color(
         v: &crate::glidesys::Vertex,
         r: f32,
@@ -67,31 +83,9 @@ impl GpuVertex {
         b: f32,
         a: f32,
     ) -> Self {
-        // Get perspective-divided texture coords (sow = s/w, tow = t/w)
-        // and convert to actual texel space if needed
-        let tmu = &v.tmuvtx[0];
-        let (s, t) = if tmu.oow > 0.0 && tmu.oow != 1.0 {
-            // Perspective-divided coords: s = sow / oow, t = tow / oow
-            (tmu.sow / tmu.oow, tmu.tow / tmu.oow)
-        } else {
-            // oow is 0 (undefined) or 1 (no perspective): use coords as-is
-            (tmu.sow, tmu.tow)
-        };
-        // Use ooz if set, otherwise fall back to oow
-        // Normalize depth: Glide uses ooz = 65535/z, we need 0-1 range
-        let depth = if v.ooz != 0.0 {
-            (v.ooz / 65535.0).clamp(0.0, 1.0)
-        } else {
-            v.oow.clamp(0.0, 1.0)
-        };
-        GpuVertex {
-            position: [v.x, v.y],
+        Self {
             color: [r, g, b, a],
-            tex_coord: [s, t],
-            oow: depth,
-            constant_color: [1.0, 1.0, 1.0, 1.0],
-            combine_flags: 0,
-            texture_index: 0,
+            ..Self::from_glide_vertex(v)
         }
     }
 
@@ -110,21 +104,20 @@ impl GpuVertex {
         t: f32,
         oow: f32,
     ) -> Self {
-        // Apply perspective correction if oow is not 0 or 1
-        // s_actual = (s/w) / (1/w) = s
-        let (s_corrected, t_corrected) = if oow > 0.0 && oow != 1.0 {
-            (s / oow, t / oow)
-        } else {
-            (s, t)
-        };
         GpuVertex {
             position: [x, y],
             color: [r / 255.0, g / 255.0, b / 255.0, a / 255.0],
-            tex_coord: [s_corrected, t_corrected],
-            oow: oow.clamp(0.0, 1.0),
+            tex_coord: [s, t],
+            oow,
             constant_color: [1.0, 1.0, 1.0, 1.0],
             combine_flags: 0,
             texture_index: 0,
+            depth: 0.0,
+            tex_q: if oow == 0.0 { 1.0 } else { oow },
+            fog: 0.0,
+            tex_coord1: [0.0; 2],
+            tex_q1: 1.0,
+            texture_index1: 0,
         }
     }
 
@@ -135,7 +128,7 @@ impl GpuVertex {
             .input_rate(vk::VertexInputRate::VERTEX)
     }
 
-    pub fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 7] {
+    pub fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 13] {
         [
             // Position attribute
             vk::VertexInputAttributeDescription::default()
@@ -179,6 +172,36 @@ impl GpuVertex {
                 .location(6)
                 .format(vk::Format::R32_UINT)
                 .offset(offset_of!(GpuVertex, texture_index) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(7)
+                .format(vk::Format::R32_SFLOAT)
+                .offset(offset_of!(GpuVertex, depth) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(8)
+                .format(vk::Format::R32_SFLOAT)
+                .offset(offset_of!(GpuVertex, tex_q) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(9)
+                .format(vk::Format::R32_SFLOAT)
+                .offset(offset_of!(GpuVertex, fog) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(10)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(offset_of!(GpuVertex, tex_coord1) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(11)
+                .format(vk::Format::R32_SFLOAT)
+                .offset(offset_of!(GpuVertex, tex_q1) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(12)
+                .format(vk::Format::R32_UINT)
+                .offset(offset_of!(GpuVertex, texture_index1) as u32),
         ]
     }
 }
@@ -187,7 +210,7 @@ impl GpuVertex {
 /// Constant color moved to vertex attribute to avoid draw call breaks.
 /// texture_size removed: computed per-vertex in the shader via textureSize().
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PushConstants {
     pub screen_size: [f32; 2],
     pub chromakey_r: f32,
@@ -200,6 +223,29 @@ pub struct PushConstants {
     pub gamma_r: f32,
     pub gamma_g: f32,
     pub gamma_b: f32,
+    pub fog_table: [u32; 16],
+    pub tex_combine: [u32; 2],
+    pub alpha_test: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PipelineState {
+    pub blend: [i32; 4],
+    pub depth_test: bool,
+    pub depth_write: bool,
+    pub depth_compare: i32,
+    pub color_mask: u32,
+}
+impl Default for PipelineState {
+    fn default() -> Self {
+        Self {
+            blend: [1, 0, 1, 0],
+            depth_test: false,
+            depth_write: false,
+            depth_compare: vk::CompareOp::LESS_OR_EQUAL.as_raw(),
+            color_mask: vk::ColorComponentFlags::RGBA.as_raw(),
+        }
+    }
 }
 
 /// Blend mode for a draw call — maps Glide's grAlphaBlendFunction to a pipeline variant
@@ -215,6 +261,13 @@ pub enum BlendMode {
     Multiplicative,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawState {
+    pub pipeline: PipelineState,
+    pub push: PushConstants,
+    pub clip: vk::Rect2D,
+}
+
 /// A single draw call with render state that requires a pipeline/descriptor change.
 /// Texture selection is per-vertex (via texture_index), not per-draw-call.
 /// Combine state is per-vertex (in combine_flags), not per-draw-call.
@@ -223,17 +276,18 @@ pub struct DrawCall {
     pub start_vertex: u32,
     pub vertex_count: u32,
     pub blend_mode: BlendMode,
+    pub state: Option<DrawState>,
 }
 
 /// Vertex batch for collecting draw calls.
-/// Draw calls only break on blend_mode or chromakey changes.
+/// Draw calls break when captured pipeline, scissor, or push-constant state changes.
 /// Texture selection is per-vertex via texture_index.
 pub struct VertexBatch {
     pub vertices: Vec<GpuVertex>,
     pub draw_calls: Vec<DrawCall>,
-    max_vertices: usize,
     current_start: u32,
     current_blend_mode: BlendMode,
+    current_state: Option<DrawState>,
 }
 
 impl VertexBatch {
@@ -241,13 +295,11 @@ impl VertexBatch {
         VertexBatch {
             vertices: Vec::with_capacity(max_vertices),
             draw_calls: Vec::with_capacity(256),
-            max_vertices,
             current_start: 0,
             current_blend_mode: BlendMode::Opaque,
+            current_state: None,
         }
     }
-
-
 
     /// Set the blend mode for subsequent vertices
     pub fn set_blend_mode(&mut self, mode: BlendMode) {
@@ -258,6 +310,7 @@ impl VertexBatch {
                     start_vertex: self.current_start,
                     vertex_count: current_count,
                     blend_mode: self.current_blend_mode,
+                    state: self.current_state,
                 });
                 self.current_start = self.vertices.len() as u32;
             }
@@ -265,10 +318,14 @@ impl VertexBatch {
         self.current_blend_mode = mode;
     }
 
-    pub fn push_triangle(&mut self, v0: GpuVertex, v1: GpuVertex, v2: GpuVertex) -> bool {
-        if self.vertices.len() + 3 > self.max_vertices {
-            return false;
+    pub fn set_state(&mut self, state: DrawState) {
+        if self.current_state != Some(state) {
+            self.finalize();
+            self.current_state = Some(state);
         }
+    }
+
+    pub fn push_triangle(&mut self, v0: GpuVertex, v1: GpuVertex, v2: GpuVertex) -> bool {
         self.vertices.push(v0);
         self.vertices.push(v1);
         self.vertices.push(v2);
@@ -283,6 +340,7 @@ impl VertexBatch {
                 start_vertex: self.current_start,
                 vertex_count: current_count,
                 blend_mode: self.current_blend_mode,
+                state: self.current_state,
             });
             self.current_start = self.vertices.len() as u32;
         }
@@ -442,13 +500,13 @@ mod tests {
     #[test]
     fn test_gpu_vertex_size() {
         // 2+4+2+1 (position,color,texcoord,oow) + 4 (constant_color) + 1 (combine_flags) + 1 (texture_index) = 60 bytes
-        assert_eq!(std::mem::size_of::<GpuVertex>(), 60);
+        assert_eq!(std::mem::size_of::<GpuVertex>(), 88);
     }
 
     #[test]
     fn test_push_constants_size() {
         // screen_size(8) + chromakey_rgb(12) + fog(16) + gamma_rgb(12) = 48
-        assert_eq!(std::mem::size_of::<PushConstants>(), 48);
+        assert_eq!(std::mem::size_of::<PushConstants>(), 124);
     }
 
     #[test]
@@ -484,15 +542,18 @@ mod tests {
     }
 
     #[test]
-    fn test_vertex_batch_overflow() {
-        let mut batch = VertexBatch::new(6); // Only room for 2 triangles
+    fn batch_grows_past_old_frame_limit_and_preserves_perspective() {
+        let mut batch = VertexBatch::new(6);
         let v = GpuVertex::default();
-
-        assert!(batch.push_triangle(v, v, v)); // 3 vertices
-        assert!(batch.push_triangle(v, v, v)); // 6 vertices
-        assert!(!batch.push_triangle(v, v, v)); // Would be 9, should fail
-
-        assert_eq!(batch.vertex_count(), 6);
+        for _ in 0..21846 {
+            assert!(batch.push_triangle(v, v, v));
+        }
+        assert_eq!(batch.vertex_count(), 65538);
+        let near = GpuVertex::from_layout_data(0.0, 0.0, 255.0, 255.0, 255.0, 255.0, 0.0, 0.0, 1.0);
+        let far =
+            GpuVertex::from_layout_data(1.0, 0.0, 255.0, 255.0, 255.0, 255.0, 64.0, 0.0, 0.25);
+        let midpoint = (near.tex_coord[0] + far.tex_coord[0]) / (near.tex_q + far.tex_q);
+        assert!((midpoint - 51.2).abs() < 0.001);
     }
 
     #[test]
@@ -517,20 +578,20 @@ mod tests {
 
         let bytes = batch.as_bytes();
         // 3 vertices * 60 bytes each = 180 bytes
-        assert_eq!(bytes.len(), 180);
+        assert_eq!(bytes.len(), 3 * std::mem::size_of::<GpuVertex>());
     }
 
     #[test]
     fn test_binding_description() {
         let binding = GpuVertex::get_binding_description();
         assert_eq!(binding.binding, 0);
-        assert_eq!(binding.stride, 60); // size of GpuVertex
+        assert_eq!(binding.stride, std::mem::size_of::<GpuVertex>() as u32); // size of GpuVertex
     }
 
     #[test]
     fn test_attribute_descriptions() {
         let attrs = GpuVertex::get_attribute_descriptions();
-        assert_eq!(attrs.len(), 7);
+        assert_eq!(attrs.len(), 13);
 
         assert_eq!(attrs[0].location, 0); // position at 0
         assert_eq!(attrs[0].offset, 0);
