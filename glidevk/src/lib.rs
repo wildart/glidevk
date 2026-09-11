@@ -697,6 +697,14 @@ impl Gr {
         num_buffers: i32,
         num_aux_buffers: i32,
     ) -> GrContext {
+        #[cfg(target_os = "windows")]
+        let hwnd = match (hwnd, self.window.as_ref()) {
+            (0, Some(window)) => match window.window_handle().expect("Window has no handle").as_raw() {
+                winit::raw_window_handle::RawWindowHandle::Win32(handle) => handle.hwnd.get() as u32,
+                _ => panic!("Expected a Win32 window"),
+            },
+            _ => hwnd,
+        };
         unsafe {
             assert_eq!(refresh, ScreenRefresh::R60Hz);
             self.native_window_handle = hwnd;

@@ -103,12 +103,13 @@ pub fn get_resolution_list() -> &'static str {
 /// Print usage information for a test program
 pub fn print_usage(name: &str) {
     println!(
-        "Usage: {} [-n <frames>] [-r <resolution>] [-d <filename>]",
+        "Usage: {} [-n <frames>] [-r <resolution>] [-d <filename>] [--visible]",
         name
     );
     println!("  -n <frames>     Number of frames to render (-1 for infinite)");
     println!("  -r <resolution> Screen resolution");
     println!("  -d <filename>   Dump screen buffer to file (PPM format, renders 1 frame)");
+    println!("  --visible       Keep the window visible while dumping (needed by Wine on macOS)");
     println!("\nAvailable resolutions:\n  {}", get_resolution_list());
 }
 
@@ -158,6 +159,7 @@ pub fn parse_args() -> Option<TestConfig> {
                     return None;
                 }
             }
+            "--visible" => i += 1,
             "-h" | "--help" => {
                 print_usage(&args[0]);
                 return None;
@@ -170,6 +172,9 @@ pub fn parse_args() -> Option<TestConfig> {
         }
     }
 
+    if args.iter().any(|arg| arg == "--visible") {
+        config.headless = false;
+    }
     Some(config)
 }
 
