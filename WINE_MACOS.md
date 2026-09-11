@@ -4,6 +4,21 @@ Keep the Windows build as `i686-pc-windows-gnu`: legacy 32-bit Windows games
 load a 32-bit `glide3x.dll`. Tested with Wine 11.0 and MoltenVK 1.4.1 on Apple
 silicon.
 
+## Build locally
+
+Run from this repository's root:
+
+```sh
+make build-win
+```
+
+The release DLL is `target/i686-pc-windows-gnu/release/glide3x.dll`.
+Cross-compiling requires Rust's `i686-pc-windows-gnu` target, `glslc`, and a
+MinGW toolchain. Homebrew's default i686 MinGW uses SJLJ exceptions, while Rust
+requires a GNU DWARF2 exception runtime; configure Cargo's
+`[target.i686-pc-windows-gnu]` linker in `.cargo/config.toml` accordingly when
+building on macOS.
+
 ## Remove animation stalls
 
 Close the game and run this against a **copy** of its installation:
