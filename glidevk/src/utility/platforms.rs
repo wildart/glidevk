@@ -181,3 +181,135 @@ pub unsafe fn native_monitor_info(hwnd: u32) -> Option<winapi::um::winuser::MONI
         Some(info)
     }
 }
+
+/// Client rect of `hwnd` in screen coordinates.
+#[cfg(target_os = "windows")]
+unsafe fn client_rect_on_screen(
+    hwnd: winapi::shared::windef::HWND,
+) -> Option<winapi::shared::windef::RECT> {
+    use winapi::shared::windef::{POINT, RECT};
+    use winapi::um::errhandlingapi::{GetLastError, SetLastError};
+    use winapi::um::winuser::{GetClientRect, MapWindowPoints};
+
+    let mut rect: RECT = std::mem::zeroed();
+    if GetClientRect(hwnd, &mut rect) == 0 || rect.right <= rect.left || rect.bottom <= rect.top {
+        return None;
+    }
+
+    SetLastError(0);
+    if MapWindowPoints(
+        hwnd,
+        std::ptr::null_mut(),
+        &mut rect as *mut RECT as *mut POINT,
+        2,
+    ) == 0
+        && GetLastError() != 0
+    {
+        return None;
+    }
+    Some(rect)
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn clip_cursor(hwnd: winapi::shared::windef::HWND) {
+    use winapi::um::winuser::{ClipCursor, GetForegroundWindow, IsIconic, IsWindowVisible};
+
+    if hwnd.is_null()
+        || GetForegroundWindow() != hwnd
+        || IsIconic(hwnd) != 0
+        || IsWindowVisible(hwnd) == 0
+    {
+        return;
+    }
+
+    match client_rect_on_screen(hwnd) {
+        Some(rect) => {
+            ClipCursor(&rect);
+        }
+        None => {
+            ClipCursor(std::ptr::null());
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn unclip_cursor() {
+    winapi::um::winuser::ClipCursor(std::ptr::null());
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn cursor_clip_subclass_proc(
+    hwnd: winapi::shared::windef::HWND,
+    message: winapi::shared::minwindef::UINT,
+    wparam: winapi::shared::minwindef::WPARAM,
+    lparam: winapi::shared::minwindef::LPARAM,
+    _subclass_id: winapi::shared::basetsd::UINT_PTR,
+    _ref_data: winapi::shared::basetsd::DWORD_PTR,
+) -> winapi::shared::minwindef::LRESULT {
+    use winapi::um::commctrl::{DefSubclassProc, RemoveWindowSubclass};
+    use winapi::um::winuser::{
+        SIZE_MINIMIZED, WA_INACTIVE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_CLOSE, WM_DESTROY,
+        WM_KILLFOCUS, WM_MOVE, WM_NCDESTROY, WM_SETFOCUS, WM_SIZE,
+    };
+
+    match message {
+        WM_ACTIVATEAPP if wparam == 0 => unclip_cursor(),
+        WM_ACTIVATE if (wparam & 0xffff) == WA_INACTIVE as usize => unclip_cursor(),
+        WM_KILLFOCUS | WM_CLOSE | WM_DESTROY | WM_NCDESTROY => unclip_cursor(),
+        WM_SIZE if wparam == SIZE_MINIMIZED => unclip_cursor(),
+        WM_ACTIVATEAPP | WM_ACTIVATE | WM_SETFOCUS | WM_MOVE | WM_SIZE => clip_cursor(hwnd),
+        _ => {}
+    }
+
+    if message == WM_NCDESTROY {
+        RemoveWindowSubclass(
+            hwnd,
+            Some(cursor_clip_subclass_proc),
+            CURSOR_CLIP_SUBCLASS_ID,
+        );
+    }
+
+    DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+#[cfg(target_os = "windows")]
+const CURSOR_CLIP_SUBCLASS_ID: usize = 0x474c_564b;
+
+/// Confine the cursor to this game-owned window while it is active.
+#[cfg(target_os = "windows")]
+pub unsafe fn install_cursor_clip(hwnd: u32) -> bool {
+    use winapi::shared::windef::HWND;
+    use winapi::um::commctrl::SetWindowSubclass;
+
+    let hwnd = hwnd as usize as HWND;
+    if hwnd.is_null()
+        || SetWindowSubclass(
+            hwnd,
+            Some(cursor_clip_subclass_proc),
+            CURSOR_CLIP_SUBCLASS_ID,
+            0,
+        ) == 0
+    {
+        return false;
+    }
+
+    clip_cursor(hwnd);
+    true
+}
+
+/// Remove cursor confinement and the game window subclass.
+#[cfg(target_os = "windows")]
+pub unsafe fn remove_cursor_clip(hwnd: u32) {
+    use winapi::shared::windef::HWND;
+    use winapi::um::commctrl::RemoveWindowSubclass;
+
+    let hwnd = hwnd as usize as HWND;
+    if !hwnd.is_null() {
+        RemoveWindowSubclass(
+            hwnd,
+            Some(cursor_clip_subclass_proc),
+            CURSOR_CLIP_SUBCLASS_ID,
+        );
+    }
+    unclip_cursor();
+}

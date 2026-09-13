@@ -849,6 +849,15 @@ impl Gr {
             },
             _ => hwnd,
         };
+        #[cfg(target_os = "windows")]
+        if self.config.window.windowed
+            && self.config.window.clip_cursor
+            && self.native_window_handle != 0
+        {
+            unsafe {
+                utility::platforms::remove_cursor_clip(self.native_window_handle);
+            }
+        }
         unsafe {
             log::debug!("Requested refresh: {:?}", refresh);
             self.state.origin = origin;
@@ -1248,6 +1257,14 @@ impl Gr {
             log::debug!("Vulkan app initialized successfully");
         }
 
+        #[cfg(target_os = "windows")]
+        if self.config.window.windowed
+            && self.config.window.clip_cursor
+            && !unsafe { utility::platforms::install_cursor_clip(self.native_window_handle) }
+        {
+            log::warn!("Failed to install Win32 cursor clipping");
+        }
+
         log::debug!("sst_win_open completed");
         return FxBool::True.0 as u32; // context
     }
@@ -1293,6 +1310,12 @@ impl Gr {
 
         // Reset state to post-grGlideInit (as per Glide spec)
         self.state = State::default();
+        #[cfg(target_os = "windows")]
+        if self.config.window.windowed && self.config.window.clip_cursor {
+            unsafe {
+                utility::platforms::remove_cursor_clip(self.native_window_handle);
+            }
+        }
         self.native_window_handle = 0;
         self.is_framebuffer_resized = false;
 
@@ -2922,6 +2945,13 @@ impl WindowInteraction for Gr {
 impl Drop for Gr {
     fn drop(&mut self) {
         log::debug!("Dropping Gr");
+
+        #[cfg(target_os = "windows")]
+        if self.config.window.windowed && self.config.window.clip_cursor {
+            unsafe {
+                utility::platforms::remove_cursor_clip(self.native_window_handle);
+            }
+        }
 
         // Clean up Vulkan resources if they exist
         self.vulkan_app = None;

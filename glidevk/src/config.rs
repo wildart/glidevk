@@ -161,6 +161,10 @@ pub struct WindowConfig {
 
     /// Center the window on the desktop (only in windowed mode)
     pub centered: bool,
+
+    /// Confine the mouse cursor to the window while it has focus (only in windowed mode)
+    /// Disabled by the "-dxnoclipcursor" command-line parameter
+    pub clip_cursor: bool,
 }
 
 impl Default for WindowConfig {
@@ -171,6 +175,7 @@ impl Default for WindowConfig {
             static_size: StaticSize::None,
             resizable: false,
             centered: true,
+            clip_cursor: true,
         }
     }
 }
@@ -264,10 +269,28 @@ impl Config {
     /// Default configuration file name
     pub const DEFAULT_FILENAME: &'static str = "glidevk.toml";
 
-    /// Load configuration from the default file (glidevk.toml)
-    /// Returns default config if file doesn't exist
+    /// Load configuration from the default file (glidevk.toml) and apply
+    /// command-line overrides. Returns default config if file doesn't exist
     pub fn load() -> Self {
-        Self::load_from(Self::DEFAULT_FILENAME)
+        let mut config = Self::load_from(Self::DEFAULT_FILENAME);
+        config
+            .apply_command_line(std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()));
+        config
+    }
+
+    /// Apply overrides from the game's command line.
+    /// "-dxnoclipcursor" (case-insensitive) disables cursor clipping.
+    pub fn apply_command_line<I, S>(&mut self, args: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        if args
+            .into_iter()
+            .any(|arg| arg.as_ref().eq_ignore_ascii_case("-dxnoclipcursor"))
+        {
+            self.window.clip_cursor = false;
+        }
     }
 
     /// Load configuration from a specific file path
@@ -350,9 +373,24 @@ mod tests {
         let config = Config::default();
         assert!(!config.window.windowed);
         assert!(config.window.keep_aspect_ratio);
+        assert!(config.window.clip_cursor);
         assert_eq!(config.texture.memory.bytes(), 8 * 1024 * 1024);
         assert_eq!(config.texture.buffer_size.pixels(), 1024);
         assert!(config.render.wine_host_memory_workaround);
+    }
+
+    #[test]
+    fn test_clip_cursor_config_and_command_line() {
+        let config: Config = toml::from_str("[window]\nclip_cursor = false\n").unwrap();
+        assert!(!config.window.clip_cursor);
+
+        let mut config = Config::default();
+        config.apply_command_line(["-w", "-DXNoClipCursor"]);
+        assert!(!config.window.clip_cursor);
+
+        let mut config = Config::default();
+        config.apply_command_line(["-w", "-dxnoclipcursorx"]);
+        assert!(config.window.clip_cursor);
     }
 
     #[test]

@@ -25,6 +25,10 @@ resizable = false
 # Center the window on the desktop (only in windowed mode)
 centered = true
 
+# Confine the mouse cursor to the game window while it has focus (only in windowed mode)
+# Disable with the "-dxnoclipcursor" command-line parameter
+clip_cursor = true
+
 [texture]
 # Amount of texture memory to report to the game
 # Options: "mb2", "mb4", "mb8", "mb16", "mb32", "mb64", "mb128", "mb256"
