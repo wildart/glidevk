@@ -7,18 +7,30 @@ fn main() {
         |_| {
             let pixels = [0xf800u16, 0x07e0, 0x001f, 0xffff];
             grTexDownloadMipMapLevel(
-                ChipID::Tmu0, 0x1000, LOD::L2, LOD::L2, AspectRatio::A1x1,
-                TextureFormat::Rgb565, 3, pixels.as_ptr().cast(),
+                ChipID::Tmu0,
+                0x1000,
+                LOD::L2,
+                LOD::L2,
+                AspectRatio::A1x1,
+                TextureFormat::Rgb565,
+                3,
+                pixels.as_ptr().cast(),
             );
             let info = TexInfo::empty(LOD::L2, LOD::L2, AspectRatio::A1x1, TextureFormat::Rgb565);
             grTexSource(ChipID::Tmu0, 0x1000, 3, &info);
             grColorCombine(
-                CombineFunction::ScaleOther, CombineFactor::One,
-                CombineLocal::Iterated, CombineOther::Texture, FxBool::False,
+                CombineFunction::ScaleOther,
+                CombineFactor::One,
+                CombineLocal::Iterated,
+                CombineOther::Texture,
+                FxBool::False,
             );
             grAlphaCombine(
-                CombineFunction::ScaleOther, CombineFactor::One,
-                CombineLocal::Iterated, CombineOther::Texture, FxBool::False,
+                CombineFunction::ScaleOther,
+                CombineFactor::One,
+                CombineLocal::Iterated,
+                CombineOther::Texture,
+                FxBool::False,
             );
         },
         |config| {
@@ -46,10 +58,18 @@ fn main() {
                 (0.625, 0.625, 0xffff),
             ] {
                 let mut pixel = 0u16;
-                assert_eq!(grLfbReadRegion(
-                    Buffer::Front, config.scale_x(x) as u32, config.scale_y(y) as u32,
-                    1, 1, 2, (&mut pixel as *mut u16).cast(),
-                ), FxBool::True);
+                assert_eq!(
+                    grLfbReadRegion(
+                        Buffer::Front,
+                        config.scale_x(x) as u32,
+                        config.scale_y(y) as u32,
+                        1,
+                        1,
+                        2,
+                        (&mut pixel as *mut u16).cast(),
+                    ),
+                    FxBool::True
+                );
                 assert_eq!(pixel, expected, "Wrong texture color at ({x}, {y})");
             }
         },

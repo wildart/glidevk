@@ -596,14 +596,7 @@ impl Gr {
         // Load configuration from glidevk.toml (or use defaults)
         let config = config::Config::load();
         let texture_memory_bytes = config.texture.memory.bytes() as usize;
-        log::info!(
-            "GlideVK config: windowed={}, resizable={}, static_size={:?}, keep_aspect_ratio={}, texture_memory={}MB",
-            config.window.windowed,
-            config.window.resizable,
-            config.window.static_size,
-            config.window.keep_aspect_ratio,
-            texture_memory_bytes / (1024 * 1024)
-        );
+        log::info!("GlideVK config: {:?}", config);
 
         let vulkan_instance = VulkanInstance::new(cfg!(target_os = "linux"));
         Gr {
@@ -979,12 +972,18 @@ impl Gr {
             let physical_device =
                 vulkan::pick_physical_device(instance, surface_loader, &self.surface);
             log::debug!("Physical device selected, creating logical device...");
+            let host_memory = utility::hostmem::HostMemory::new(
+                instance,
+                physical_device,
+                self.config.render.wine_host_memory_workaround,
+            );
             // Select logical device
             let (logical_device, family_indices) = vulkan::create_logical_device(
                 instance,
                 surface_loader,
                 &self.surface,
                 physical_device,
+                &host_memory,
             );
             log::debug!("Logical device created");
             // and get its queues
@@ -1084,6 +1083,7 @@ impl Gr {
             let (depth_image, depth_image_memory, depth_image_view) =
                 utility::create_depth_resources(
                     &logical_device,
+                    &host_memory,
                     instance,
                     physical_device,
                     extent,
@@ -1174,6 +1174,7 @@ impl Gr {
             for _ in 0..MAX_FRAMES_IN_FLIGHT {
                 vertex_buffers.push(utility::vertex::VertexBuffer::new(
                     &logical_device,
+                    &host_memory,
                     instance,
                     physical_device,
                     vertex_buffer_size,
@@ -1190,6 +1191,7 @@ impl Gr {
             // Create placeholder texture for the texture cache
             texture_cache.create_placeholder(
                 &logical_device,
+                &host_memory,
                 instance,
                 physical_device,
                 command_pool,
@@ -1199,6 +1201,7 @@ impl Gr {
 
             self.vulkan_app = Some(VulkanApp {
                 device: logical_device,
+                host_memory,
                 framebuffer: None,
                 state_pipelines: std::collections::HashMap::new(),
                 graphics_queue,

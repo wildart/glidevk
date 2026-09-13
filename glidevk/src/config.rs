@@ -229,6 +229,9 @@ pub struct RenderConfig {
     /// Show FPS counter
     /// Options: "off", "top-left", "top-right", "bottom-left", "bottom-right"
     pub fps: FpsPosition,
+
+    /// Work around Wine's WoW64 host-visible Vulkan memory leak
+    pub wine_host_memory_workaround: bool,
 }
 
 impl Default for RenderConfig {
@@ -238,6 +241,7 @@ impl Default for RenderConfig {
             vsync: true,
             supersampling: 1,
             fps: FpsPosition::Off,
+            wine_host_memory_workaround: true,
         }
     }
 }
@@ -348,6 +352,7 @@ mod tests {
         assert!(config.window.keep_aspect_ratio);
         assert_eq!(config.texture.memory.bytes(), 8 * 1024 * 1024);
         assert_eq!(config.texture.buffer_size.pixels(), 1024);
+        assert!(config.render.wine_host_memory_workaround);
     }
 
     #[test]

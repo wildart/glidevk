@@ -75,24 +75,13 @@ impl Framebuffer {
                     )
                     .expect("Create logical framebuffer");
                 let requirements = device.get_image_memory_requirements(images[i]);
-                let properties =
-                    instance.get_physical_device_memory_properties(app.physical_device);
-                let index = (0..properties.memory_type_count)
-                    .find(|&i| {
-                        requirements.memory_type_bits & (1 << i) != 0
-                            && properties.memory_types[i as usize]
-                                .property_flags
-                                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-                    })
-                    .expect("Framebuffer memory type");
-                memory[i] = device
-                    .allocate_memory(
-                        &vk::MemoryAllocateInfo::default()
-                            .allocation_size(requirements.size)
-                            .memory_type_index(index),
-                        None,
-                    )
-                    .expect("Allocate framebuffer");
+                memory[i] = app.host_memory.allocate_image(
+                    device,
+                    instance,
+                    app.physical_device,
+                    requirements,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                );
                 device
                     .bind_image_memory(images[i], memory[i], 0)
                     .expect("Bind framebuffer");
@@ -106,6 +95,7 @@ impl Framebuffer {
             }
             let (depth, depth_memory, depth_view) = super::create_depth_resources(
                 device,
+                &app.host_memory,
                 instance,
                 app.physical_device,
                 extent,
@@ -211,6 +201,7 @@ impl Framebuffer {
         let size = self.extent.width as u64 * self.extent.height as u64 * 4;
         let staging = VertexBuffer::new(
             &app.device,
+            &app.host_memory,
             instance,
             app.physical_device,
             size,
@@ -247,7 +238,7 @@ impl Framebuffer {
                 .expect("Read framebuffer");
             let pixels = std::slice::from_raw_parts(ptr as *const u8, size as usize).to_vec();
             app.device.unmap_memory(staging.memory);
-            staging.destroy(&app.device);
+            staging.destroy(&app.device, &app.host_memory);
             pixels
         }
     }
@@ -278,6 +269,7 @@ impl Framebuffer {
     ) {
         let staging = VertexBuffer::new(
             &app.device,
+            &app.host_memory,
             instance,
             app.physical_device,
             pixels.len() as u64,
@@ -314,7 +306,7 @@ impl Framebuffer {
                 app.graphics_queue,
                 cmd,
             );
-            staging.destroy(&app.device);
+            staging.destroy(&app.device, &app.host_memory);
         }
     }
 
@@ -348,7 +340,7 @@ impl Framebuffer {
         }
     }
 
-    pub fn destroy(&self, device: &ash::Device) {
+    pub fn destroy(&self, device: &ash::Device, host_memory: &super::hostmem::HostMemory) {
         unsafe {
             for &frame in &self.frames {
                 device.destroy_framebuffer(frame, None);
@@ -356,11 +348,11 @@ impl Framebuffer {
             device.destroy_render_pass(self.render_pass, None);
             device.destroy_image_view(self.depth_view, None);
             device.destroy_image(self.depth, None);
-            device.free_memory(self.depth_memory, None);
+            host_memory.free(device, self.depth_memory);
             for i in 0..2 {
                 device.destroy_image_view(self.views[i], None);
                 device.destroy_image(self.images[i], None);
-                device.free_memory(self.memory[i], None);
+                host_memory.free(device, self.memory[i]);
             }
         }
     }

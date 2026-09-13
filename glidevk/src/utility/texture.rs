@@ -247,6 +247,7 @@ pub struct VulkanTexture {
 impl VulkanTexture {
     pub fn new(
         device: &ash::Device,
+        host_memory: &super::hostmem::HostMemory,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         command_pool: vk::CommandPool,
@@ -259,14 +260,16 @@ impl VulkanTexture {
         let image_size = (width * height * 4) as vk::DeviceSize;
 
         // Create staging buffer
-        let (staging_buffer, staging_memory) = Self::create_buffer(
+        let staging = super::vertex::VertexBuffer::new(
             device,
+            host_memory,
             instance,
             physical_device,
             image_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         );
+        let (staging_buffer, staging_memory) = (staging.buffer, staging.memory);
 
         // Copy data to staging buffer
         unsafe {
@@ -302,21 +305,14 @@ impl VulkanTexture {
 
         // Allocate image memory
         let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
-        let memory_type = Self::find_memory_type(
-            instance,
-            physical_device,
-            mem_requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_requirements.size)
-            .memory_type_index(memory_type);
-
         let memory = unsafe {
-            device
-                .allocate_memory(&alloc_info, None)
-                .expect("Failed to allocate texture memory")
+            host_memory.allocate_image(
+                device,
+                instance,
+                physical_device,
+                mem_requirements,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
         };
 
         unsafe {
@@ -430,10 +426,7 @@ impl VulkanTexture {
         }
 
         // Cleanup staging buffer
-        unsafe {
-            device.destroy_buffer(staging_buffer, None);
-            device.free_memory(staging_memory, None);
-        }
+        staging.destroy(device, host_memory);
 
         // Create image view
         let view_create_info = vk::ImageViewCreateInfo::default()
@@ -466,6 +459,7 @@ impl VulkanTexture {
     /// Compatibility entrypoint for a single RGBA level.
     pub fn new_into_cmd(
         device: &ash::Device,
+        host_memory: &super::hostmem::HostMemory,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         cmd: vk::CommandBuffer,
@@ -475,6 +469,7 @@ impl VulkanTexture {
     ) -> (Self, vk::Buffer, vk::DeviceMemory) {
         Self::new_mips_into_cmd(
             device,
+            host_memory,
             instance,
             physical_device,
             cmd,
@@ -488,6 +483,7 @@ impl VulkanTexture {
     /// Returns the texture and staging resources to be cleaned up after the cmd buffer completes.
     pub fn new_mips_into_cmd(
         device: &ash::Device,
+        host_memory: &super::hostmem::HostMemory,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         cmd: vk::CommandBuffer,
@@ -498,14 +494,16 @@ impl VulkanTexture {
         let rgba_data: Vec<u8> = levels.iter().flatten().copied().collect();
         let image_size = rgba_data.len() as vk::DeviceSize;
 
-        let (staging_buffer, staging_memory) = Self::create_buffer(
+        let staging = super::vertex::VertexBuffer::new(
             device,
+            host_memory,
             instance,
             physical_device,
             image_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         );
+        let (staging_buffer, staging_memory) = (staging.buffer, staging.memory);
 
         unsafe {
             let data_ptr = device
@@ -538,21 +536,14 @@ impl VulkanTexture {
         };
 
         let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
-        let memory_type = Self::find_memory_type(
-            instance,
-            physical_device,
-            mem_requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_requirements.size)
-            .memory_type_index(memory_type);
-
         let memory = unsafe {
-            device
-                .allocate_memory(&alloc_info, None)
-                .expect("Failed to allocate texture memory")
+            host_memory.allocate_image(
+                device,
+                instance,
+                physical_device,
+                mem_requirements,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
         };
 
         unsafe {
@@ -661,73 +652,6 @@ impl VulkanTexture {
             height,
         };
         (texture, staging_buffer, staging_memory)
-    }
-
-    fn create_buffer(
-        device: &ash::Device,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        size: vk::DeviceSize,
-        usage: vk::BufferUsageFlags,
-        properties: vk::MemoryPropertyFlags,
-    ) -> (vk::Buffer, vk::DeviceMemory) {
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-        let buffer = unsafe {
-            device
-                .create_buffer(&buffer_info, None)
-                .expect("Failed to create buffer")
-        };
-
-        let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let memory_type = Self::find_memory_type(
-            instance,
-            physical_device,
-            mem_requirements.memory_type_bits,
-            properties,
-        );
-
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_requirements.size)
-            .memory_type_index(memory_type);
-
-        let memory = unsafe {
-            device
-                .allocate_memory(&alloc_info, None)
-                .expect("Failed to allocate buffer memory")
-        };
-
-        unsafe {
-            device
-                .bind_buffer_memory(buffer, memory, 0)
-                .expect("Failed to bind buffer memory");
-        }
-
-        (buffer, memory)
-    }
-
-    fn find_memory_type(
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        type_filter: u32,
-        properties: vk::MemoryPropertyFlags,
-    ) -> u32 {
-        let mem_properties =
-            unsafe { instance.get_physical_device_memory_properties(physical_device) };
-
-        for i in 0..mem_properties.memory_type_count {
-            if (type_filter & (1 << i)) != 0
-                && mem_properties.memory_types[i as usize]
-                    .property_flags
-                    .contains(properties)
-            {
-                return i;
-            }
-        }
-        panic!("Failed to find suitable memory type!");
     }
 
     fn transition_image_layout(
@@ -916,11 +840,11 @@ impl VulkanTexture {
         }
     }
 
-    pub fn destroy(&self, device: &ash::Device) {
+    pub fn destroy(&self, device: &ash::Device, host_memory: &super::hostmem::HostMemory) {
         unsafe {
             device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
-            device.free_memory(self.memory, None);
+            host_memory.free(device, self.memory);
         }
     }
 }
@@ -1097,6 +1021,7 @@ impl TextureCache {
     pub fn create_placeholder(
         &mut self,
         device: &ash::Device,
+        host_memory: &super::hostmem::HostMemory,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         command_pool: vk::CommandPool,
@@ -1107,6 +1032,7 @@ impl TextureCache {
 
         let texture = VulkanTexture::new(
             device,
+            host_memory,
             instance,
             physical_device,
             command_pool,
@@ -1140,6 +1066,7 @@ impl TextureCache {
     pub fn upload_rgba8(
         &mut self,
         device: &ash::Device,
+        host_memory: &super::hostmem::HostMemory,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         command_pool: vk::CommandPool,
@@ -1151,6 +1078,7 @@ impl TextureCache {
     ) {
         self.batch_upload_rgba(
             device,
+            host_memory,
             instance,
             physical_device,
             command_pool,
@@ -1162,6 +1090,7 @@ impl TextureCache {
     pub fn upload_texture(
         &mut self,
         device: &ash::Device,
+        host_memory: &super::hostmem::HostMemory,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         command_pool: vk::CommandPool,
@@ -1172,6 +1101,7 @@ impl TextureCache {
     ) {
         self.batch_upload(
             device,
+            host_memory,
             instance,
             physical_device,
             command_pool,
@@ -1188,6 +1118,7 @@ impl TextureCache {
     pub fn evict_if_needed(
         &mut self,
         device: &ash::Device,
+        host_memory: &super::hostmem::HostMemory,
         protected: &std::collections::HashSet<u32>,
     ) {
         if self.needs_eviction() {
@@ -1198,10 +1129,10 @@ impl TextureCache {
                 .find(|a| !protected.contains(a))
             {
                 self.invalidate_texture(device, address);
-                self.flush_pending_destroy(device);
+                self.flush_pending_destroy(device, host_memory);
             }
         }
-        self.make_room(device, protected);
+        self.make_room(device, host_memory, protected);
     }
 
     /// Batch-upload multiple textures in a single command buffer submission.
@@ -1209,6 +1140,7 @@ impl TextureCache {
     pub fn batch_upload(
         &mut self,
         device: &ash::Device,
+        host_memory: &super::hostmem::HostMemory,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         command_pool: vk::CommandPool,
@@ -1248,6 +1180,7 @@ impl TextureCache {
             .collect();
         self.batch_upload_rgba(
             device,
+            host_memory,
             instance,
             physical_device,
             command_pool,
@@ -1259,6 +1192,7 @@ impl TextureCache {
     fn batch_upload_rgba(
         &mut self,
         device: &ash::Device,
+        host_memory: &super::hostmem::HostMemory,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         command_pool: vk::CommandPool,
@@ -1274,7 +1208,7 @@ impl TextureCache {
                 .expect("Wait before descriptor replacement");
         }
         let protected = textures.iter().map(|(address, _, _, _)| *address).collect();
-        self.make_room(device, &protected);
+        self.make_room(device, host_memory, &protected);
         let cmd = VulkanTexture::begin_single_time_commands(device, command_pool);
         let mut staging_resources: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
 
@@ -1298,6 +1232,7 @@ impl TextureCache {
 
             let (texture, staging_buf, staging_mem) = VulkanTexture::new_mips_into_cmd(
                 device,
+                host_memory,
                 instance,
                 physical_device,
                 cmd,
@@ -1341,7 +1276,7 @@ impl TextureCache {
         unsafe {
             for (buf, mem) in staging_resources {
                 device.destroy_buffer(buf, None);
-                device.free_memory(mem, None);
+                host_memory.free(device, mem);
             }
         }
 
@@ -1395,7 +1330,12 @@ impl TextureCache {
     }
 
     /// Reclaim space before allocation; the caller has completed previous readers.
-    pub fn make_room(&mut self, device: &ash::Device, protected: &std::collections::HashSet<u32>) {
+    pub fn make_room(
+        &mut self,
+        device: &ash::Device,
+        host_memory: &super::hostmem::HostMemory,
+        protected: &std::collections::HashSet<u32>,
+    ) {
         let required = protected
             .iter()
             .filter(|a| !self.slot_map.contains_key(a))
@@ -1409,7 +1349,7 @@ impl TextureCache {
                 self.invalidate_texture(device, address);
             }
         }
-        self.flush_pending_destroy(device);
+        self.flush_pending_destroy(device, host_memory);
     }
 
     pub fn set_display_image(&self, device: &ash::Device, view: vk::ImageView) {
@@ -1446,9 +1386,13 @@ impl TextureCache {
 
     /// Destroy textures that were previously invalidated.
     /// Must only be called after all in-flight GPU work has completed.
-    pub fn flush_pending_destroy(&mut self, device: &ash::Device) {
+    pub fn flush_pending_destroy(
+        &mut self,
+        device: &ash::Device,
+        host_memory: &super::hostmem::HostMemory,
+    ) {
         for texture in self.pending_destroy.drain(..) {
-            texture.destroy(device);
+            texture.destroy(device, host_memory);
         }
     }
 
@@ -1462,15 +1406,15 @@ impl TextureCache {
         self.descriptor_set_layout
     }
 
-    pub fn destroy(&self, device: &ash::Device) {
+    pub fn destroy(&self, device: &ash::Device, host_memory: &super::hostmem::HostMemory) {
         for texture in self.textures.values() {
-            texture.destroy(device);
+            texture.destroy(device, host_memory);
         }
         for texture in &self.pending_destroy {
-            texture.destroy(device);
+            texture.destroy(device, host_memory);
         }
         if let Some(ref placeholder) = self.placeholder {
-            placeholder.destroy(device);
+            placeholder.destroy(device, host_memory);
         }
         unsafe {
             device.destroy_fence(self.upload_fence, None);

@@ -1,5 +1,6 @@
 pub mod debug;
 pub mod framebuffer;
+pub mod hostmem;
 pub mod platforms;
 pub mod structures;
 pub mod texture;
@@ -642,6 +643,7 @@ pub fn find_depth_format(
 /// Create depth buffer resources (image, memory, view)
 pub fn create_depth_resources(
     device: &ash::Device,
+    host_memory: &hostmem::HostMemory,
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     extent: vk::Extent2D,
@@ -672,22 +674,14 @@ pub fn create_depth_resources(
 
     // Allocate memory for depth image
     let mem_requirements = unsafe { device.get_image_memory_requirements(depth_image) };
-    let mem_properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-
-    let memory_type_index = find_memory_type_index(
-        mem_requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        &mem_properties,
-    );
-
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(mem_requirements.size)
-        .memory_type_index(memory_type_index);
-
     let depth_image_memory = unsafe {
-        device
-            .allocate_memory(&alloc_info, None)
-            .expect("Failed to allocate depth image memory!")
+        host_memory.allocate_image(
+            device,
+            instance,
+            physical_device,
+            mem_requirements,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
     };
 
     unsafe {

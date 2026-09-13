@@ -381,16 +381,23 @@ pub struct VertexBuffer {
 impl VertexBuffer {
     pub fn new(
         device: &ash::Device,
+        host_memory: &super::hostmem::HostMemory,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
         properties: vk::MemoryPropertyFlags,
     ) -> Self {
-        let buffer_info = vk::BufferCreateInfo::default()
+        host_memory.validate_buffer_import(instance, physical_device, usage);
+        let mut external_info = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+        let mut buffer_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        if host_memory.requires_extension() {
+            buffer_info = buffer_info.push_next(&mut external_info);
+        }
 
         let buffer = unsafe {
             device
@@ -399,22 +406,14 @@ impl VertexBuffer {
         };
 
         let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-
-        let memory_type_index = find_memory_type(
-            instance,
-            physical_device,
-            mem_requirements.memory_type_bits,
-            properties,
-        );
-
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_requirements.size)
-            .memory_type_index(memory_type_index);
-
         let memory = unsafe {
-            device
-                .allocate_memory(&alloc_info, None)
-                .expect("Failed to allocate buffer memory")
+            host_memory.allocate_buffer(
+                device,
+                instance,
+                physical_device,
+                mem_requirements,
+                properties,
+            )
         };
 
         unsafe {
@@ -430,33 +429,12 @@ impl VertexBuffer {
         }
     }
 
-    pub fn destroy(&self, device: &ash::Device) {
+    pub fn destroy(&self, device: &ash::Device, host_memory: &super::hostmem::HostMemory) {
         unsafe {
             device.destroy_buffer(self.buffer, None);
-            device.free_memory(self.memory, None);
+            host_memory.free(device, self.memory);
         }
     }
-}
-
-fn find_memory_type(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
-    type_filter: u32,
-    properties: vk::MemoryPropertyFlags,
-) -> u32 {
-    let mem_properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-
-    for i in 0..mem_properties.memory_type_count {
-        if (type_filter & (1 << i)) != 0
-            && mem_properties.memory_types[i as usize]
-                .property_flags
-                .contains(properties)
-        {
-            return i;
-        }
-    }
-
-    panic!("Failed to find suitable memory type!");
 }
 
 /// Copy data from CPU to a host-visible buffer

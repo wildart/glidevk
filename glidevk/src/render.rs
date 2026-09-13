@@ -133,8 +133,10 @@ impl Gr {
                 .device_wait_idle()
                 .expect("Wait for texture readers");
         }
-        app.texture_cache.flush_pending_destroy(&app.device);
-        app.texture_cache.make_room(&app.device, &needed);
+        app.texture_cache
+            .flush_pending_destroy(&app.device, &app.host_memory);
+        app.texture_cache
+            .make_room(&app.device, &app.host_memory, &needed);
         for &address in &needed {
             if address == u32::MAX {
                 continue;
@@ -173,6 +175,7 @@ impl Gr {
         }
         app.texture_cache.batch_upload(
             &app.device,
+            &app.host_memory,
             &self.vulkan_instance.instance,
             app.physical_device,
             app.command_pool,
@@ -250,9 +253,10 @@ impl Gr {
                 std::mem::size_of_val(vertices),
             );
             if bytes.len() as u64 > app.vertex_buffers[0].size {
-                app.vertex_buffers[0].destroy(device);
+                app.vertex_buffers[0].destroy(device, &app.host_memory);
                 app.vertex_buffers[0] = utility::vertex::VertexBuffer::new(
                     device,
+                    &app.host_memory,
                     &self.vulkan_instance.instance,
                     app.physical_device,
                     (bytes.len() as u64).next_power_of_two(),

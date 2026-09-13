@@ -511,6 +511,7 @@ dependencies = [
  "env_logger",
  "glidevk",
  "log",
+ "winapi",
  "winit",
 ]
 

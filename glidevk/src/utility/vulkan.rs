@@ -308,6 +308,7 @@ pub fn create_logical_device(
     surface_loader: &ash::khr::surface::Instance,
     surface: &vk::SurfaceKHR,
     physical_device: vk::PhysicalDevice,
+    host_memory: &super::hostmem::HostMemory,
 ) -> (ash::Device, QueueFamilyIndices) {
     let indices = find_queue_family(&instance, physical_device, &surface_loader, surface);
 
@@ -337,7 +338,10 @@ pub fn create_logical_device(
         .shader_sampled_image_array_non_uniform_indexing(true)
         .runtime_descriptor_array(true);
 
-    let extensions_names = DEVICE_EXTENSIONS.get_extensions_raw_names();
+    let mut extensions_names = DEVICE_EXTENSIONS.get_extensions_raw_names().to_vec();
+    if host_memory.requires_extension() {
+        extensions_names.push(ash::ext::external_memory_host::NAME.as_ptr());
+    }
 
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
@@ -393,6 +397,7 @@ pub fn create_command_buffers(
 
 pub struct VulkanApp {
     pub device: ash::Device, // Logical Device
+    pub host_memory: super::hostmem::HostMemory,
     pub framebuffer: Option<super::framebuffer::Framebuffer>,
     pub state_pipelines: std::collections::HashMap<super::vertex::PipelineState, vk::Pipeline>,
 
@@ -462,7 +467,7 @@ impl VulkanApp {
             // Destroy depth resources
             self.device.destroy_image_view(self.depth_image_view, None);
             self.device.destroy_image(self.depth_image, None);
-            self.device.free_memory(self.depth_image_memory, None);
+            self.host_memory.free(&self.device, self.depth_image_memory);
 
             for &image_view in self.swapchain_imageviews.iter() {
                 self.device.destroy_image_view(image_view, None);
@@ -541,6 +546,7 @@ impl VulkanApp {
         let new_imageviews = create_image_views(&self.device, surface_format.format, &new_images);
         let (new_depth_image, new_depth_memory, new_depth_view) = create_depth_resources(
             &self.device,
+            &self.host_memory,
             instance,
             self.physical_device,
             extent,
@@ -600,7 +606,7 @@ impl VulkanApp {
             self.device.destroy_render_pass(self.render_pass, None);
             self.device.destroy_image_view(self.depth_image_view, None);
             self.device.destroy_image(self.depth_image, None);
-            self.device.free_memory(self.depth_image_memory, None);
+            self.host_memory.free(&self.device, self.depth_image_memory);
             for image_view in self.swapchain_imageviews.drain(..) {
                 self.device.destroy_image_view(image_view, None);
             }
@@ -707,16 +713,16 @@ impl Drop for VulkanApp {
 
             // Destroy vertex buffers
             for vb in &self.vertex_buffers {
-                vb.destroy(&self.device);
+                vb.destroy(&self.device, &self.host_memory);
             }
 
             if let Some(framebuffer) = &self.framebuffer {
-                framebuffer.destroy(&self.device);
+                framebuffer.destroy(&self.device, &self.host_memory);
             }
             for pipeline in self.state_pipelines.values() {
                 self.device.destroy_pipeline(*pipeline, None);
             }
-            self.texture_cache.destroy(&self.device);
+            self.texture_cache.destroy(&self.device, &self.host_memory);
 
             self.cleanup_swapchain();
 
