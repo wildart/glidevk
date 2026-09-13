@@ -32,6 +32,7 @@ layout(push_constant) uniform PushConstants {
     uint fogTable[16];
     uint texCombine[2];
     uint alphaTest;
+    uint filterMode;
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -161,9 +162,45 @@ vec4 sampleTmu(uint index, vec2 st, float q, uint flags) {
     return texture(sampler2D(textures[nonuniformEXT(index)], samplers[(flags >> 20) & 127u]), st / (abs(q) > 1e-20 ? q : 1.0) / baseSize);
 }
 
+// Presented game image: samplers[31] = linear/linear, clamp-to-edge (see TextureCache sampler keys).
+#define SCENE sampler2D(textures[nonuniformEXT(fragTexIndex)], samplers[31])
+vec4 sceneTap(vec2 uv) { return textureLod(SCENE, uv, 0.0); }
+
+// Catmull-Rom bicubic in 9 bilinear taps (http://vec3.ca/bicubic-filtering-in-fewer-taps/).
+vec4 catmullRom(vec2 uv, vec2 size) {
+    vec2 pos = uv * size;
+    vec2 p1 = floor(pos - 0.5) + 0.5;
+    vec2 f = pos - p1;
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2;
+    vec2 p0 = (p1 - 1.0) / size;
+    vec2 p3 = (p1 + 2.0) / size;
+    vec2 p12 = (p1 + w2 / w12) / size;
+    vec3 result = ((sceneTap(vec2(p0.x, p0.y)) * w0.x + sceneTap(vec2(p12.x, p0.y)) * w12.x + sceneTap(vec2(p3.x, p0.y)) * w3.x) * w0.y
+        + (sceneTap(vec2(p0.x, p12.y)) * w0.x + sceneTap(vec2(p12.x, p12.y)) * w12.x + sceneTap(vec2(p3.x, p12.y)) * w3.x) * w12.y
+        + (sceneTap(vec2(p0.x, p3.y)) * w0.x + sceneTap(vec2(p12.x, p3.y)) * w12.x + sceneTap(vec2(p3.x, p3.y)) * w3.x) * w3.y).rgb;
+    return vec4(result, 1.0);
+}
+
+// Presentation upscale of the game image: 0 = sharp anti-aliased nearest,
+// 1 = bilinear, 2 = Catmull-Rom bicubic. All build on linear taps; screenSize is the source image size.
+vec4 presentSample(vec2 uv) {
+    if (pc.filterMode == 1u) return texture(SCENE, uv);
+    if (pc.filterMode == 2u) return catmullRom(uv, pc.screenSize);
+    // Nearest texel, with the linear tap only within ~half a screen pixel of a texel edge.
+    vec2 texel = uv * pc.screenSize;
+    vec2 dxdy = abs(vec2(dFdx(texel.x), dFdy(texel.y)));
+    vec2 delta = fract(texel) - 0.5;
+    vec2 aa = clamp((0.5 - abs(delta)) * 2.0 / dxdy, 0.0, 1.0);
+    return texture(SCENE, uv - delta * aa / pc.screenSize);
+}
+
 void main() {
     if ((fragCombineFlags & (1u << 31)) != 0u) {
-        vec4 scene = texture(sampler2D(textures[nonuniformEXT(fragTexIndex)], samplers[4]), fragTexCoord);
+        vec4 scene = presentSample(fragTexCoord);
         outColor = vec4(pow(clamp(scene.rgb, 0.0, 1.0), vec3(1.0) / max(vec3(pc.gammaR, pc.gammaG, pc.gammaB), vec3(0.001))), scene.a);
         // During display, alphaTest marks automatic sRGB target encoding.
         if (pc.alphaTest != 0u) {

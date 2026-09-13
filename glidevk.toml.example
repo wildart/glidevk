@@ -47,8 +47,16 @@ memory = "mb8"
 # FPS counter position: "off", "top-left", "top-right", "bottom-left", "bottom-right"
 fps = "off"
 
+# Filter used when the game image is scaled to the window:
+#   "linear"   - sharp pixels, anti-aliased only at pixel edges (recommended)
+#   "bilinear" - hardware bilinear, smooth but blurry
+#   "cubic"    - Catmull-Rom bicubic, smooth but sharper than bilinear
+filtering = "linear"
+
 # Work around Wine's 32-bit host-visible Vulkan memory leak
 wine_host_memory_workaround = true
 
-# buffer_size, bilinear_filtering, vsync, and supersampling are reserved settings.
+# bilinear_filtering is deprecated: it maps to filtering = "bilinear" (true) or "linear" (false)
+# and is ignored once filtering is set.
+# buffer_size, vsync, and supersampling are reserved settings.
 # They are not implemented and are intentionally omitted from this example.

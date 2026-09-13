@@ -115,6 +115,7 @@ impl Gr {
                         << 20)
             }),
             alpha_test: s.alpha_test_function as u32 | ((s.alpha_test_reference.0 as u32) << 8),
+            filter_mode: 0,
         }
     }
 
@@ -456,6 +457,7 @@ impl Gr {
         push.gamma_r = gamma[0];
         push.gamma_g = gamma[1];
         push.gamma_b = gamma[2];
+        push.filter_mode = self.config.render.filtering() as u32;
         let app = self.vulkan_app.as_mut()?;
         // The display branch uses this otherwise-unused word to mark an sRGB target.
         push.alpha_test = matches!(
