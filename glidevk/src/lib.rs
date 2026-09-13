@@ -596,15 +596,7 @@ impl Gr {
         // Load configuration from glidevk.toml (or use defaults)
         let config = config::Config::load();
         let texture_memory_bytes = config.texture.memory.bytes() as usize;
-        log::info!(
-            "GlideVK config: windowed={}, resizable={}, static_size={:?}, keep_aspect_ratio={}, texture_memory={}MB, filtering={:?}",
-            config.window.windowed,
-            config.window.resizable,
-            config.window.static_size,
-            config.window.keep_aspect_ratio,
-            texture_memory_bytes / (1024 * 1024),
-            config.render.filtering()
-        );
+        log::info!("GlideVK config: {:?}", config);
 
         let vulkan_instance = VulkanInstance::new(cfg!(target_os = "linux"));
         Gr {
