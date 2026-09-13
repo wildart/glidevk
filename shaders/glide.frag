@@ -179,9 +179,10 @@ vec4 catmullRom(vec2 uv, vec2 size) {
     vec2 p0 = (p1 - 1.0) / size;
     vec2 p3 = (p1 + 2.0) / size;
     vec2 p12 = (p1 + w2 / w12) / size;
-    return (sceneTap(vec2(p0.x, p0.y)) * w0.x + sceneTap(vec2(p12.x, p0.y)) * w12.x + sceneTap(vec2(p3.x, p0.y)) * w3.x) * w0.y
+    vec3 result = ((sceneTap(vec2(p0.x, p0.y)) * w0.x + sceneTap(vec2(p12.x, p0.y)) * w12.x + sceneTap(vec2(p3.x, p0.y)) * w3.x) * w0.y
         + (sceneTap(vec2(p0.x, p12.y)) * w0.x + sceneTap(vec2(p12.x, p12.y)) * w12.x + sceneTap(vec2(p3.x, p12.y)) * w3.x) * w12.y
-        + (sceneTap(vec2(p0.x, p3.y)) * w0.x + sceneTap(vec2(p12.x, p3.y)) * w12.x + sceneTap(vec2(p3.x, p3.y)) * w3.x) * w3.y;
+        + (sceneTap(vec2(p0.x, p3.y)) * w0.x + sceneTap(vec2(p12.x, p3.y)) * w12.x + sceneTap(vec2(p3.x, p3.y)) * w3.x) * w3.y).rgb;
+    return vec4(result, 1.0);
 }
 
 // Presentation upscale of the game image: 0 = sharp anti-aliased nearest,
