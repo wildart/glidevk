@@ -1,6 +1,26 @@
 use ash::khr::surface;
 use ash::vk;
 
+/// Shared by presentation and mouse input so letterboxing uses the same coordinates.
+pub(crate) fn viewport(
+    (game_width, game_height): (u32, u32),
+    (window_width, window_height): (u32, u32),
+    keep_aspect_ratio: bool,
+) -> (u32, u32, u32, u32) {
+    if !keep_aspect_ratio || (window_width == game_width && window_height == game_height) {
+        return (0, 0, window_width, window_height);
+    }
+    let game_aspect = game_width as f32 / game_height as f32;
+    let window_aspect = window_width as f32 / window_height as f32;
+    if window_aspect > game_aspect {
+        let width = (window_height as f32 * game_aspect) as u32;
+        ((window_width - width) / 2, 0, width, window_height)
+    } else {
+        let height = (window_width as f32 / game_aspect) as u32;
+        (0, (window_height - height) / 2, window_width, height)
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 use ash::ext::debug_utils;
 
@@ -238,78 +258,157 @@ unsafe fn unclip_cursor() {
 }
 
 #[cfg(target_os = "windows")]
-unsafe extern "system" fn cursor_clip_subclass_proc(
+#[derive(Clone, Copy)]
+struct WindowInput {
+    game_size: (u32, u32),
+    keep_aspect_ratio: bool,
+    clip_cursor: bool,
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn window_input_subclass_proc(
     hwnd: winapi::shared::windef::HWND,
     message: winapi::shared::minwindef::UINT,
     wparam: winapi::shared::minwindef::WPARAM,
-    lparam: winapi::shared::minwindef::LPARAM,
+    mut lparam: winapi::shared::minwindef::LPARAM,
     _subclass_id: winapi::shared::basetsd::UINT_PTR,
-    _ref_data: winapi::shared::basetsd::DWORD_PTR,
+    ref_data: winapi::shared::basetsd::DWORD_PTR,
 ) -> winapi::shared::minwindef::LRESULT {
-    use winapi::um::commctrl::{DefSubclassProc, RemoveWindowSubclass};
+    use winapi::um::commctrl::DefSubclassProc;
     use winapi::um::winuser::{
         SIZE_MINIMIZED, WA_INACTIVE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_CLOSE, WM_DESTROY,
-        WM_KILLFOCUS, WM_MOVE, WM_NCDESTROY, WM_SETFOCUS, WM_SIZE,
+        WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK,
+        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_NCDESTROY, WM_RBUTTONDBLCLK,
+        WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN,
+        WM_XBUTTONUP,
     };
 
-    match message {
-        WM_ACTIVATEAPP if wparam == 0 => unclip_cursor(),
-        WM_ACTIVATE if (wparam & 0xffff) == WA_INACTIVE as usize => unclip_cursor(),
-        WM_KILLFOCUS | WM_CLOSE | WM_DESTROY | WM_NCDESTROY => unclip_cursor(),
-        WM_SIZE if wparam == SIZE_MINIMIZED => unclip_cursor(),
-        WM_ACTIVATEAPP | WM_ACTIVATE | WM_SETFOCUS | WM_MOVE | WM_SIZE => clip_cursor(hwnd),
-        _ => {}
-    }
-
+    // Copy before calling the game: its handler may close the Glide context and remove us.
+    let input = *(ref_data as *const WindowInput);
     if message == WM_NCDESTROY {
-        RemoveWindowSubclass(
-            hwnd,
-            Some(cursor_clip_subclass_proc),
-            CURSOR_CLIP_SUBCLASS_ID,
-        );
+        remove_window_input(hwnd as usize as u32);
+        return DefSubclassProc(hwnd, message, wparam, lparam);
     }
 
-    DefSubclassProc(hwnd, message, wparam, lparam)
+    // Wheel messages use screen coordinates; only these messages carry client coordinates.
+    if matches!(
+        message,
+        WM_MOUSEMOVE
+            | WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_LBUTTONDBLCLK
+            | WM_RBUTTONDOWN
+            | WM_RBUTTONUP
+            | WM_RBUTTONDBLCLK
+            | WM_MBUTTONDOWN
+            | WM_MBUTTONUP
+            | WM_MBUTTONDBLCLK
+            | WM_XBUTTONDOWN
+            | WM_XBUTTONUP
+            | WM_XBUTTONDBLCLK
+    ) {
+        if let Some(size) = native_window_client_size(hwnd as usize as u32) {
+            let (left, top, width, height) =
+                viewport(input.game_size, size, input.keep_aspect_ratio);
+            if width != 0 && height != 0 {
+                let x = lparam as u16 as i16 as i64;
+                let y = (lparam >> 16) as u16 as i16 as i64;
+                let x = ((x - left as i64) * input.game_size.0 as i64 / width as i64)
+                    .clamp(0, input.game_size.0 as i64 - 1);
+                let y = ((y - top as i64) * input.game_size.1 as i64 / height as i64)
+                    .clamp(0, input.game_size.1 as i64 - 1);
+                lparam = (x | (y << 16)) as _;
+            }
+        }
+    }
+
+    let result = DefSubclassProc(hwnd, message, wparam, lparam);
+    if input.clip_cursor {
+        // The game can change window geometry during its handler.
+        match message {
+            WM_ACTIVATEAPP if wparam == 0 => unclip_cursor(),
+            WM_ACTIVATE if (wparam & 0xffff) == WA_INACTIVE as usize => unclip_cursor(),
+            WM_KILLFOCUS | WM_CLOSE | WM_DESTROY => unclip_cursor(),
+            WM_SIZE if wparam == SIZE_MINIMIZED => unclip_cursor(),
+            WM_ACTIVATEAPP | WM_ACTIVATE | WM_SETFOCUS | WM_MOVE | WM_SIZE => clip_cursor(hwnd),
+            _ => {}
+        }
+    }
+    result
 }
 
 #[cfg(target_os = "windows")]
-const CURSOR_CLIP_SUBCLASS_ID: usize = 0x474c_564b;
-
-/// Confine the cursor to this game-owned window while it is active.
+const WINDOW_INPUT_SUBCLASS_ID: usize = 0x474c_564b;
 #[cfg(target_os = "windows")]
-pub unsafe fn install_cursor_clip(hwnd: u32) -> bool {
+const WINDOW_INPUT_PROPERTY: &[u8] = b"glidevk.window_input\0";
+
+/// Translate input to game coordinates and optionally confine it to the active client area.
+#[cfg(target_os = "windows")]
+pub unsafe fn install_window_input(
+    hwnd: u32,
+    game_size: (u32, u32),
+    keep_aspect_ratio: bool,
+    clip: bool,
+) -> bool {
     use winapi::shared::windef::HWND;
     use winapi::um::commctrl::SetWindowSubclass;
+    use winapi::um::winuser::{GetPropA, RemovePropA, SetPropA};
 
+    remove_window_input(hwnd);
     let hwnd = hwnd as usize as HWND;
-    if hwnd.is_null()
-        || SetWindowSubclass(
-            hwnd,
-            Some(cursor_clip_subclass_proc),
-            CURSOR_CLIP_SUBCLASS_ID,
-            0,
-        ) == 0
+    let property = WINDOW_INPUT_PROPERTY.as_ptr().cast();
+    if hwnd.is_null() || game_size.0 == 0 || game_size.1 == 0 || !GetPropA(hwnd, property).is_null()
     {
         return false;
     }
-
-    clip_cursor(hwnd);
+    let input = Box::into_raw(Box::new(WindowInput {
+        game_size,
+        keep_aspect_ratio,
+        clip_cursor: clip,
+    }));
+    // Wine's comctl32 v5 lacks GetWindowSubclass; a window property owns the allocation.
+    if SetPropA(hwnd, property, input.cast()) == 0 {
+        drop(Box::from_raw(input));
+        return false;
+    }
+    if SetWindowSubclass(
+        hwnd,
+        Some(window_input_subclass_proc),
+        WINDOW_INPUT_SUBCLASS_ID,
+        input as usize,
+    ) == 0
+    {
+        RemovePropA(hwnd, property);
+        drop(Box::from_raw(input));
+        return false;
+    }
+    if clip {
+        clip_cursor(hwnd);
+    }
     true
 }
 
-/// Remove cursor confinement and the game window subclass.
+/// Remove mouse translation and release any cursor confinement owned by this subclass.
 #[cfg(target_os = "windows")]
-pub unsafe fn remove_cursor_clip(hwnd: u32) {
+pub unsafe fn remove_window_input(hwnd: u32) {
     use winapi::shared::windef::HWND;
     use winapi::um::commctrl::RemoveWindowSubclass;
+    use winapi::um::winuser::{GetPropA, RemovePropA};
 
     let hwnd = hwnd as usize as HWND;
-    if !hwnd.is_null() {
-        RemoveWindowSubclass(
+    let property = WINDOW_INPUT_PROPERTY.as_ptr().cast();
+    let data = GetPropA(hwnd, property);
+    if !data.is_null()
+        && RemoveWindowSubclass(
             hwnd,
-            Some(cursor_clip_subclass_proc),
-            CURSOR_CLIP_SUBCLASS_ID,
-        );
+            Some(window_input_subclass_proc),
+            WINDOW_INPUT_SUBCLASS_ID,
+        ) != 0
+    {
+        RemovePropA(hwnd, property);
+        let input = Box::from_raw(data as *mut WindowInput);
+        if input.clip_cursor {
+            unclip_cursor();
+        }
     }
-    unclip_cursor();
 }

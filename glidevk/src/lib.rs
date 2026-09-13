@@ -677,35 +677,11 @@ impl Gr {
 
     /// Calculate the viewport for letterboxing (maintains 4:3 aspect ratio if configured)
     fn calculate_viewport(&self) -> (u32, u32, u32, u32) {
-        let game_width = self.state.screen_width;
-        let game_height = self.state.screen_height;
-        let window_width = self.state.window_width;
-        let window_height = self.state.window_height;
-
-        // If window matches game size or keep_aspect_ratio is disabled, use full window
-        if !self.config.window.keep_aspect_ratio
-            || (window_width == game_width && window_height == game_height)
-        {
-            return (0, 0, window_width, window_height);
-        }
-
-        // Calculate letterbox to maintain game's aspect ratio
-        let game_aspect = game_width as f32 / game_height as f32;
-        let window_aspect = window_width as f32 / window_height as f32;
-
-        if window_aspect > game_aspect {
-            // Window is wider than game - pillarbox (black bars on sides)
-            let viewport_height = window_height;
-            let viewport_width = (window_height as f32 * game_aspect) as u32;
-            let viewport_x = (window_width - viewport_width) / 2;
-            (viewport_x, 0, viewport_width, viewport_height)
-        } else {
-            // Window is taller than game - letterbox (black bars on top/bottom)
-            let viewport_width = window_width;
-            let viewport_height = (window_width as f32 / game_aspect) as u32;
-            let viewport_y = (window_height - viewport_height) / 2;
-            (0, viewport_y, viewport_width, viewport_height)
-        }
+        utility::platforms::viewport(
+            (self.state.screen_width, self.state.screen_height),
+            (self.state.window_width, self.state.window_height),
+            self.config.window.keep_aspect_ratio,
+        )
     }
 
     #[cfg(target_os = "windows")]
@@ -850,12 +826,9 @@ impl Gr {
             _ => hwnd,
         };
         #[cfg(target_os = "windows")]
-        if self.config.window.windowed
-            && self.config.window.clip_cursor
-            && self.native_window_handle != 0
-        {
+        if self.config.window.windowed && self.native_window_handle != 0 {
             unsafe {
-                utility::platforms::remove_cursor_clip(self.native_window_handle);
+                utility::platforms::remove_window_input(self.native_window_handle);
             }
         }
         unsafe {
@@ -1259,10 +1232,16 @@ impl Gr {
 
         #[cfg(target_os = "windows")]
         if self.config.window.windowed
-            && self.config.window.clip_cursor
-            && !unsafe { utility::platforms::install_cursor_clip(self.native_window_handle) }
+            && !unsafe {
+                utility::platforms::install_window_input(
+                    self.native_window_handle,
+                    (self.state.screen_width, self.state.screen_height),
+                    self.config.window.keep_aspect_ratio,
+                    self.config.window.clip_cursor,
+                )
+            }
         {
-            log::warn!("Failed to install Win32 cursor clipping");
+            log::warn!("Failed to install Win32 mouse handling");
         }
 
         log::debug!("sst_win_open completed");
@@ -1311,9 +1290,9 @@ impl Gr {
         // Reset state to post-grGlideInit (as per Glide spec)
         self.state = State::default();
         #[cfg(target_os = "windows")]
-        if self.config.window.windowed && self.config.window.clip_cursor {
+        if self.config.window.windowed {
             unsafe {
-                utility::platforms::remove_cursor_clip(self.native_window_handle);
+                utility::platforms::remove_window_input(self.native_window_handle);
             }
         }
         self.native_window_handle = 0;
@@ -2947,9 +2926,9 @@ impl Drop for Gr {
         log::debug!("Dropping Gr");
 
         #[cfg(target_os = "windows")]
-        if self.config.window.windowed && self.config.window.clip_cursor {
+        if self.config.window.windowed {
             unsafe {
-                utility::platforms::remove_cursor_clip(self.native_window_handle);
+                utility::platforms::remove_window_input(self.native_window_handle);
             }
         }
 
