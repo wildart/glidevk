@@ -181,3 +181,73 @@ pub unsafe fn native_monitor_info(hwnd: u32) -> Option<winapi::um::winuser::MONI
         Some(info)
     }
 }
+
+/// Client rect of `hwnd` in screen coordinates as [left, top, right, bottom].
+#[cfg(target_os = "windows")]
+unsafe fn client_rect_on_screen(hwnd: winapi::shared::windef::HWND) -> Option<[i32; 4]> {
+    use winapi::shared::windef::{POINT, RECT};
+    use winapi::um::winuser::{ClientToScreen, GetClientRect};
+
+    let mut rect: RECT = std::mem::zeroed();
+    if GetClientRect(hwnd, &mut rect) == 0 || rect.right <= rect.left || rect.bottom <= rect.top {
+        return None;
+    }
+    let mut corners = [
+        POINT {
+            x: rect.left,
+            y: rect.top,
+        },
+        POINT {
+            x: rect.right,
+            y: rect.bottom,
+        },
+    ];
+    for corner in &mut corners {
+        if ClientToScreen(hwnd, corner) == 0 {
+            return None;
+        }
+    }
+    Some([corners[0].x, corners[0].y, corners[1].x, corners[1].y])
+}
+
+/// Confine the OS cursor to the client area of `hwnd` while it is the foreground
+/// window; release it otherwise (or when `enabled` is false / `hwnd` is 0).
+///
+/// glide3x does not own the window procedure, so this is polled once per
+/// presented frame. ClipCursor is only issued when the clip rect changes.
+#[cfg(target_os = "windows")]
+pub unsafe fn update_cursor_clip(hwnd: u32, enabled: bool) {
+    use std::sync::Mutex;
+    use winapi::shared::windef::{HWND, RECT};
+    use winapi::um::winuser::{ClipCursor, GetForegroundWindow};
+
+    /// Rect last passed to ClipCursor; None while the cursor is unclipped.
+    static LAST_CLIP: Mutex<Option<[i32; 4]>> = Mutex::new(None);
+
+    let hwnd = hwnd as usize as HWND;
+    let wanted = if enabled && !hwnd.is_null() && GetForegroundWindow() == hwnd {
+        client_rect_on_screen(hwnd)
+    } else {
+        None
+    };
+
+    let mut last = LAST_CLIP.lock().unwrap();
+    if *last == wanted {
+        return;
+    }
+    match wanted {
+        Some([left, top, right, bottom]) => {
+            let rect = RECT {
+                left,
+                top,
+                right,
+                bottom,
+            };
+            ClipCursor(&rect);
+        }
+        None => {
+            ClipCursor(std::ptr::null());
+        }
+    }
+    *last = wanted;
+}

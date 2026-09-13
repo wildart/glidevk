@@ -597,11 +597,12 @@ impl Gr {
         let config = config::Config::load();
         let texture_memory_bytes = config.texture.memory.bytes() as usize;
         log::info!(
-            "GlideVK config: windowed={}, resizable={}, static_size={:?}, keep_aspect_ratio={}, texture_memory={}MB",
+            "GlideVK config: windowed={}, resizable={}, static_size={:?}, keep_aspect_ratio={}, clip_cursor={}, texture_memory={}MB",
             config.window.windowed,
             config.window.resizable,
             config.window.static_size,
             config.window.keep_aspect_ratio,
+            config.window.clip_cursor,
             texture_memory_bytes / (1024 * 1024)
         );
 
@@ -1290,6 +1291,10 @@ impl Gr {
 
         // Reset state to post-grGlideInit (as per Glide spec)
         self.state = State::default();
+        #[cfg(target_os = "windows")]
+        unsafe {
+            utility::platforms::update_cursor_clip(self.native_window_handle, false);
+        }
         self.native_window_handle = 0;
         self.is_framebuffer_resized = false;
 
@@ -1338,6 +1343,13 @@ impl Gr {
     }
 
     pub fn buffer_swap(&mut self, _interval: i32) -> Option<()> {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            utility::platforms::update_cursor_clip(
+                self.native_window_handle,
+                self.config.window.windowed && self.config.window.clip_cursor,
+            );
+        }
         self.finish();
         self.draw_fps_overlay();
         let app = self.vulkan_app.as_ref()?;
@@ -2919,6 +2931,11 @@ impl WindowInteraction for Gr {
 impl Drop for Gr {
     fn drop(&mut self) {
         log::debug!("Dropping Gr");
+
+        #[cfg(target_os = "windows")]
+        unsafe {
+            utility::platforms::update_cursor_clip(self.native_window_handle, false);
+        }
 
         // Clean up Vulkan resources if they exist
         self.vulkan_app = None;
