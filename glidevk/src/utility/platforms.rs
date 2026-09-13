@@ -182,37 +182,36 @@ pub unsafe fn native_monitor_info(hwnd: u32) -> Option<winapi::um::winuser::MONI
     }
 }
 
-/// Client rect of `hwnd` in screen coordinates as [left, top, right, bottom].
+/// Client rect of `hwnd` in screen coordinates.
 #[cfg(target_os = "windows")]
-unsafe fn client_rect_on_screen(hwnd: winapi::shared::windef::HWND) -> Option<[i32; 4]> {
+unsafe fn client_rect_on_screen(
+    hwnd: winapi::shared::windef::HWND,
+) -> Option<winapi::shared::windef::RECT> {
     use winapi::shared::windef::{POINT, RECT};
-    use winapi::um::winuser::{ClientToScreen, GetClientRect};
+    use winapi::um::errhandlingapi::{GetLastError, SetLastError};
+    use winapi::um::winuser::{GetClientRect, MapWindowPoints};
 
     let mut rect: RECT = std::mem::zeroed();
     if GetClientRect(hwnd, &mut rect) == 0 || rect.right <= rect.left || rect.bottom <= rect.top {
         return None;
     }
-    let mut corners = [
-        POINT {
-            x: rect.left,
-            y: rect.top,
-        },
-        POINT {
-            x: rect.right,
-            y: rect.bottom,
-        },
-    ];
-    for corner in &mut corners {
-        if ClientToScreen(hwnd, corner) == 0 {
-            return None;
-        }
+
+    SetLastError(0);
+    if MapWindowPoints(
+        hwnd,
+        std::ptr::null_mut(),
+        &mut rect as *mut RECT as *mut POINT,
+        2,
+    ) == 0
+        && GetLastError() != 0
+    {
+        return None;
     }
-    Some([corners[0].x, corners[0].y, corners[1].x, corners[1].y])
+    Some(rect)
 }
 
 #[cfg(target_os = "windows")]
 unsafe fn clip_cursor(hwnd: winapi::shared::windef::HWND) {
-    use winapi::shared::windef::RECT;
     use winapi::um::winuser::{ClipCursor, GetForegroundWindow, IsIconic, IsWindowVisible};
 
     if hwnd.is_null()
@@ -224,13 +223,7 @@ unsafe fn clip_cursor(hwnd: winapi::shared::windef::HWND) {
     }
 
     match client_rect_on_screen(hwnd) {
-        Some([left, top, right, bottom]) => {
-            let rect = RECT {
-                left,
-                top,
-                right,
-                bottom,
-            };
+        Some(rect) => {
             ClipCursor(&rect);
         }
         None => {
