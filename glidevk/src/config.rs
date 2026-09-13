@@ -213,12 +213,33 @@ pub enum FpsPosition {
     BottomRight,
 }
 
+/// Presentation filter used when the game image is scaled to the window.
+/// Discriminants are the shader's `filterMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Filtering {
+    /// Sharp: nearest-neighbour pixels, anti-aliased only at pixel edges
+    #[default]
+    Linear = 0,
+    /// Hardware bilinear: smooth but blurry
+    Bilinear = 1,
+    /// Catmull-Rom bicubic: smooth, sharper than bilinear
+    Cubic = 2,
+}
+
 /// Rendering quality settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RenderConfig {
-    /// Reserved for configuration compatibility; use grTexFilterMode instead.
-    pub bilinear_filtering: bool,
+    /// Deprecated: use `filtering` (true = "bilinear", false = "linear").
+    /// Only honoured when `filtering` is not set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bilinear_filtering: Option<bool>,
+
+    /// Presentation filter: "linear" (default), "bilinear", or "cubic".
+    /// `None` when the file did not set it; resolve with [`RenderConfig::filtering`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filtering: Option<Filtering>,
 
     /// Reserved for configuration compatibility; currently ignored.
     pub vsync: bool,
@@ -234,10 +255,22 @@ pub struct RenderConfig {
 impl Default for RenderConfig {
     fn default() -> Self {
         Self {
-            bilinear_filtering: true,
+            bilinear_filtering: None,
+            filtering: None,
             vsync: true,
             supersampling: 1,
             fps: FpsPosition::Off,
+        }
+    }
+}
+
+impl RenderConfig {
+    /// Effective presentation filter, mapping the deprecated `bilinear_filtering` when `filtering` is unset.
+    pub fn filtering(&self) -> Filtering {
+        match (self.filtering, self.bilinear_filtering) {
+            (Some(filtering), _) => filtering,
+            (None, Some(true)) => Filtering::Bilinear,
+            (None, _) => Filtering::Linear,
         }
     }
 }
@@ -370,6 +403,34 @@ mod tests {
             .dimensions(),
             Some((1920, 1080))
         );
+    }
+
+    #[test]
+    fn test_filtering_values() {
+        for (value, expected) in [
+            ("linear", Filtering::Linear),
+            ("bilinear", Filtering::Bilinear),
+            ("cubic", Filtering::Cubic),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[render]\nfiltering = \"{value}\"")).unwrap();
+            assert_eq!(config.render.filtering, Some(expected));
+            assert_eq!(config.render.filtering(), expected);
+        }
+        assert!(toml::from_str::<Config>("[render]\nfiltering = \"nearest\"").is_err());
+        assert_eq!(Config::default().render.filtering(), Filtering::Linear);
+    }
+
+    #[test]
+    fn test_bilinear_filtering_compatibility() {
+        let config: Config = toml::from_str("[render]\nbilinear_filtering = true").unwrap();
+        assert_eq!(config.render.filtering(), Filtering::Bilinear);
+        let config: Config = toml::from_str("[render]\nbilinear_filtering = false").unwrap();
+        assert_eq!(config.render.filtering(), Filtering::Linear);
+        // An explicit `filtering` wins over the deprecated key.
+        let config: Config =
+            toml::from_str("[render]\nbilinear_filtering = true\nfiltering = \"cubic\"").unwrap();
+        assert_eq!(config.render.filtering(), Filtering::Cubic);
     }
 
     #[test]

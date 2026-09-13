@@ -226,6 +226,8 @@ pub struct PushConstants {
     pub fog_table: [u32; 16],
     pub tex_combine: [u32; 2],
     pub alpha_test: u32,
+    /// Presentation filter (config::Filtering discriminant); only read by the display branch.
+    pub filter_mode: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -506,7 +508,7 @@ mod tests {
     #[test]
     fn test_push_constants_size() {
         // screen_size(8) + chromakey_rgb(12) + fog(16) + gamma_rgb(12) = 48
-        assert_eq!(std::mem::size_of::<PushConstants>(), 124);
+        assert_eq!(std::mem::size_of::<PushConstants>(), 128);
     }
 
     #[test]

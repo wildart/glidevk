@@ -29,6 +29,7 @@ layout(push_constant) uniform PushConstants {
     uint fogTable[16];
     uint texCombine[2];
     uint alphaTest;
+    uint filterMode;
 } pc;
 
 layout(location = 0) out vec4 fragColor;
