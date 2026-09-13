@@ -210,32 +210,20 @@ unsafe fn client_rect_on_screen(hwnd: winapi::shared::windef::HWND) -> Option<[i
     Some([corners[0].x, corners[0].y, corners[1].x, corners[1].y])
 }
 
-/// Confine the OS cursor to the client area of `hwnd` while it is the foreground
-/// window; release it otherwise (or when `enabled` is false / `hwnd` is 0).
-///
-/// glide3x does not own the window procedure, so this is polled once per
-/// presented frame. ClipCursor is only issued when the clip rect changes.
 #[cfg(target_os = "windows")]
-pub unsafe fn update_cursor_clip(hwnd: u32, enabled: bool) {
-    use std::sync::Mutex;
-    use winapi::shared::windef::{HWND, RECT};
-    use winapi::um::winuser::{ClipCursor, GetForegroundWindow};
+unsafe fn clip_cursor(hwnd: winapi::shared::windef::HWND) {
+    use winapi::shared::windef::RECT;
+    use winapi::um::winuser::{ClipCursor, GetForegroundWindow, IsIconic, IsWindowVisible};
 
-    /// Rect last passed to ClipCursor; None while the cursor is unclipped.
-    static LAST_CLIP: Mutex<Option<[i32; 4]>> = Mutex::new(None);
-
-    let hwnd = hwnd as usize as HWND;
-    let wanted = if enabled && !hwnd.is_null() && GetForegroundWindow() == hwnd {
-        client_rect_on_screen(hwnd)
-    } else {
-        None
-    };
-
-    let mut last = LAST_CLIP.lock().unwrap();
-    if *last == wanted {
+    if hwnd.is_null()
+        || GetForegroundWindow() != hwnd
+        || IsIconic(hwnd) != 0
+        || IsWindowVisible(hwnd) == 0
+    {
         return;
     }
-    match wanted {
+
+    match client_rect_on_screen(hwnd) {
         Some([left, top, right, bottom]) => {
             let rect = RECT {
                 left,
@@ -249,5 +237,86 @@ pub unsafe fn update_cursor_clip(hwnd: u32, enabled: bool) {
             ClipCursor(std::ptr::null());
         }
     }
-    *last = wanted;
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn unclip_cursor() {
+    winapi::um::winuser::ClipCursor(std::ptr::null());
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn cursor_clip_subclass_proc(
+    hwnd: winapi::shared::windef::HWND,
+    message: winapi::shared::minwindef::UINT,
+    wparam: winapi::shared::minwindef::WPARAM,
+    lparam: winapi::shared::minwindef::LPARAM,
+    _subclass_id: winapi::shared::basetsd::UINT_PTR,
+    _ref_data: winapi::shared::basetsd::DWORD_PTR,
+) -> winapi::shared::minwindef::LRESULT {
+    use winapi::um::commctrl::{DefSubclassProc, RemoveWindowSubclass};
+    use winapi::um::winuser::{
+        SIZE_MINIMIZED, WA_INACTIVE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_CLOSE, WM_DESTROY,
+        WM_KILLFOCUS, WM_MOVE, WM_NCDESTROY, WM_SETFOCUS, WM_SIZE,
+    };
+
+    match message {
+        WM_ACTIVATEAPP if wparam == 0 => unclip_cursor(),
+        WM_ACTIVATE if (wparam & 0xffff) == WA_INACTIVE as usize => unclip_cursor(),
+        WM_KILLFOCUS | WM_CLOSE | WM_DESTROY | WM_NCDESTROY => unclip_cursor(),
+        WM_SIZE if wparam == SIZE_MINIMIZED => unclip_cursor(),
+        WM_ACTIVATEAPP | WM_ACTIVATE | WM_SETFOCUS | WM_MOVE | WM_SIZE => clip_cursor(hwnd),
+        _ => {}
+    }
+
+    if message == WM_NCDESTROY {
+        RemoveWindowSubclass(
+            hwnd,
+            Some(cursor_clip_subclass_proc),
+            CURSOR_CLIP_SUBCLASS_ID,
+        );
+    }
+
+    DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+#[cfg(target_os = "windows")]
+const CURSOR_CLIP_SUBCLASS_ID: usize = 0x474c_564b;
+
+/// Confine the cursor to this game-owned window while it is active.
+#[cfg(target_os = "windows")]
+pub unsafe fn install_cursor_clip(hwnd: u32) -> bool {
+    use winapi::shared::windef::HWND;
+    use winapi::um::commctrl::SetWindowSubclass;
+
+    let hwnd = hwnd as usize as HWND;
+    if hwnd.is_null()
+        || SetWindowSubclass(
+            hwnd,
+            Some(cursor_clip_subclass_proc),
+            CURSOR_CLIP_SUBCLASS_ID,
+            0,
+        ) == 0
+    {
+        return false;
+    }
+
+    clip_cursor(hwnd);
+    true
+}
+
+/// Remove cursor confinement and the game window subclass.
+#[cfg(target_os = "windows")]
+pub unsafe fn remove_cursor_clip(hwnd: u32) {
+    use winapi::shared::windef::HWND;
+    use winapi::um::commctrl::RemoveWindowSubclass;
+
+    let hwnd = hwnd as usize as HWND;
+    if !hwnd.is_null() {
+        RemoveWindowSubclass(
+            hwnd,
+            Some(cursor_clip_subclass_proc),
+            CURSOR_CLIP_SUBCLASS_ID,
+        );
+    }
+    unclip_cursor();
 }
