@@ -575,6 +575,9 @@ pub struct Gr {
     continuation: Vec<utility::vertex::GpuVertex>,
     continuation_mode: PrimitiveType,
     continuation_odd: bool,
+    /// Ctrl+Shift+F12 toggles this to stop GPU work while the game keeps running.
+    render_paused: bool,
+    pause_hotkey_down: bool,
 }
 
 struct FpsCounter {
@@ -624,6 +627,8 @@ impl Gr {
             continuation: Vec::new(),
             continuation_mode: PrimitiveType::Triangles,
             continuation_odd: false,
+            render_paused: false,
+            pause_hotkey_down: false,
         }
     }
 
@@ -1343,6 +1348,22 @@ impl Gr {
     }
 
     pub fn buffer_swap(&mut self, _interval: i32) -> Option<()> {
+        #[cfg(target_os = "windows")]
+        {
+            let down = unsafe { utility::platforms::pause_hotkey_down(self.native_window_handle) };
+            if down && !self.pause_hotkey_down {
+                self.render_paused = !self.render_paused;
+                log::info!("Rendering paused: {}", self.render_paused);
+            }
+            self.pause_hotkey_down = down;
+        }
+        if self.render_paused {
+            self.finish();
+            // Without presentation there is no vsync, so throttle the game loop instead.
+            // Fixed 25 Hz throttle; make configurable if a game needs another rate.
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            return Some(());
+        }
         self.finish();
         self.draw_fps_overlay();
         let app = self.vulkan_app.as_ref()?;
@@ -3352,6 +3373,16 @@ mod tests {
     }
 
     // ==================== Draw Triangle Tests ====================
+
+    #[test]
+    fn test_paused_rendering_drops_draws() {
+        let mut gr = create_test_gr();
+        gr.render_paused = true;
+        let v = Vertex::new(0.0, 0.0);
+        gr.draw_triangle(&v, &Vertex::new(100.0, 0.0), &Vertex::new(50.0, 100.0));
+        gr.finish();
+        assert!(gr.vertex_batch.is_empty());
+    }
 
     #[test]
     fn test_draw_triangle_adds_to_batch() {

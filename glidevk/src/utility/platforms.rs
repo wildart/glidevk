@@ -337,6 +337,24 @@ unsafe extern "system" fn window_input_subclass_proc(
     result
 }
 
+/// Ctrl+Shift+F12 is held while the game window has focus.
+#[cfg(target_os = "windows")]
+pub unsafe fn pause_hotkey_down(hwnd: u32) -> bool {
+    use winapi::shared::windef::HWND;
+    use winapi::um::winuser::{
+        GetAncestor, GetAsyncKeyState, GetForegroundWindow, GA_ROOT, VK_CONTROL, VK_F12, VK_SHIFT,
+    };
+
+    let down = |key| GetAsyncKeyState(key) as u16 & 0x8000 != 0;
+    let hwnd = hwnd as usize as HWND;
+    // The game may hand Glide a child window; focus belongs to its top-level window.
+    !hwnd.is_null()
+        && GetForegroundWindow() == GetAncestor(hwnd, GA_ROOT)
+        && down(VK_CONTROL)
+        && down(VK_SHIFT)
+        && down(VK_F12)
+}
+
 #[cfg(target_os = "windows")]
 const WINDOW_INPUT_SUBCLASS_ID: usize = 0x474c_564b;
 #[cfg(target_os = "windows")]

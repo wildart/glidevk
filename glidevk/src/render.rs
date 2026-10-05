@@ -122,6 +122,11 @@ impl Gr {
     /// Submit the accumulated draws before resource mutation, readback, or presentation.
     /// Synchronous submissions keep descriptors/resources stable; use fence-owned generations if profiling warrants it.
     pub fn finish(&mut self) {
+        if self.render_paused {
+            self.vertex_batch.clear();
+            self.frame_textures.clear();
+            return;
+        }
         if self.vertex_batch.is_empty() || self.vulkan_app.is_none() {
             return;
         }
@@ -221,6 +226,9 @@ impl Gr {
         draws: &[DrawCall],
         clear: Option<(Color, Alpha, u32)>,
     ) {
+        if self.render_paused {
+            return;
+        }
         let target = if self.state.render_buffer == Buffer::Front {
             0
         } else {
@@ -450,6 +458,9 @@ impl Gr {
     }
 
     pub(super) fn present_front(&mut self) -> Option<()> {
+        if self.render_paused {
+            return Some(());
+        }
         #[cfg(target_os = "windows")]
         self.refresh_native_window_size();
         let mut push = self.push_constants();
