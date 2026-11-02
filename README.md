@@ -229,5 +229,3 @@ python3 tools/enable_wine_dep.py --self-test
 - **Mipmapping & LOD**: Mipmap chains are sampled with nearest-mip filtering up to the first missing level; trilinear LOD blending, `grTexLodBiasValue` application, and source-only LOD range remapping are not yet implemented.
 - **W-Buffer Clears**: Near and far W-buffer clear extremes map accurately; intermediate clear values use a normalized linear approximation rather than 3Dfx's 16-bit floating-point depth encoding.
 - **LFB Targets**: `grLfbLock` supports front and back color buffers in standard 16-bit and 32-bit RGB/ARGB formats; auxiliary/depth buffer locks and RLE-compressed LFB writes return `FXFALSE`.
-
-Additional implementation notes and validation details are documented in [`REVIEW_FIXES.md`](REVIEW_FIXES.md).
